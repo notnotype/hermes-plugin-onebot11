@@ -44,15 +44,28 @@
 
 ## 验证结果
 
-- 本地单元测试：49 passed（worktree venv）+ 12 passed（adapter,hermes venv + PYTHONPATH）
+- 本地单元测试：49 passed（worktree venv）+ 15 passed（adapter,hermes venv + PYTHONPATH,需干净环境）
 - ruff check 全过
 - `hermes plugins list` 能看到 onebot11-platform 0.1.0（symlink 到 ~/.hermes/plugins/）
-- CI 尚未跑（仓库未推送）
-- 与 LLBot 联调未做（等 GitHub 授权 + 用户许可改 LLBot 配置）
+- CI 待跑（PR #2 创建后 CI 曾 pending,仓库有 3000 端口联调改动未合并）
+- **与 LLBot 联调已通**：
+  - LLBot ob11 开启 ws-reverse（ws://host.docker.internal:18880）+ HTTP 3000,compose 映射 3000 端口
+  - Hermes 侧 3 平台在线,反向 WS 连接成功,事件上报正常
+  - 群白名单（ONEBOT11_ALLOWED_GROUPS）功能测试验证：白名单外群消息被拦、白名单内群放行
+  - 网关日志可见白名单加载状态（INFO）
+- **联调踩坑记录**：
+  - 插件模块在 register() 前被 import → Platform() 不能模块级调用,惰性解析
+  - 内部子包导入需双上下文兼容（网关包加载 + 测试顶层加载）,用 try/except 桥
+  - 内层包内部 import 必须相对导入
+  - 插件目录必须有根 __init__.py（否则 "No __init__.py" 加载失败）
+  - 网关重启后 LLBot 会重放积压消息 + 旧会话恢复 → 白名单部署前建立的会话仍可能被续跑;清理非白名单群旧会话可消除
+  - 测试环境注意：shell 里若导出了 ONEBOT11_* 变量会影响测试,用 env -i 跑
+  - hermes venv 补装了 pytest + pytest-asyncio（仅开发用）
 
 ## 后续 TODO
 
-- [ ] GitHub 授权（device flow）后：gh repo create + push + issue #1 + PR
-- [ ] LLBot 联调：ob11 开 ws-reverse（ws://host.docker.internal:18880）+ http 3000,compose 映射 3000 端口
+- [ ] 用户重启 LLBot 后真机验证：3 个白名单群正常对话,非白名单群零响应
+- [ ] 在常用群 /sethome 设置 home channel（消除 📬 提示）
+- [ ] 设置 ONEBOT11_ADMINS（管理员 QQ 列表,收紧工具权限）
 - [ ] 群角色权限（v1.1,get_group_member_info）
 - [ ] 图片下载在真实 LLBot 上的 URL 形态验证
