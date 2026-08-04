@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from onebot11.message import ParsedMessage, parse_message_segments
+from .message import ParsedMessage, parse_message_segments
 
 
 @dataclass

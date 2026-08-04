@@ -19,23 +19,31 @@ from typing import Any
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 
-from onebot11.events import InboundEvent, build_inbound_event
-from onebot11.http_api import OneBotApiError, OneBotHttpApi, chunk_text
-from onebot11.permissions import ToolContext, parse_admin_list, validate_tool_call
-from onebot11.tools import TOOL_SCHEMAS
-from onebot11.ws_server import ReverseWsServer
+# 内部子包导入桥: 网关把插件目录当包加载(相对导入), 测试/独立脚本按顶层模块导入
+try:
+    from . import onebot11 as _proto
+except ImportError:
+    import onebot11 as _proto
+
+InboundEvent = _proto.events.InboundEvent
+build_inbound_event = _proto.events.build_inbound_event
+OneBotApiError = _proto.http_api.OneBotApiError
+OneBotHttpApi = _proto.http_api.OneBotHttpApi
+chunk_text = _proto.http_api.chunk_text
+ToolContext = _proto.permissions.ToolContext
+parse_admin_list = _proto.permissions.parse_admin_list
+validate_tool_call = _proto.permissions.validate_tool_call
+TOOL_SCHEMAS = _proto.tools.TOOL_SCHEMAS
+handle_get_friend_msg_history = _proto.tools.handle_get_friend_msg_history
+handle_get_group_msg_history = _proto.tools.handle_get_group_msg_history
+handle_get_message = _proto.tools.handle_get_message
+ReverseWsServer = _proto.ws_server.ReverseWsServer
 
 logger = logging.getLogger(__name__)
 
-_PLATFORM = Platform("onebot11")
+_PLATFORM_NAME = "onebot11"
 
 # 工具 handler 表：名称 → (onebot11/tools 里的 handler)
-from onebot11.tools import (  # noqa: E402  (循环导入规避: tools 不依赖 adapter)
-    handle_get_friend_msg_history,
-    handle_get_group_msg_history,
-    handle_get_message,
-)
-
 _TOOL_HANDLERS: dict[str, Any] = {
     "qq_get_message": handle_get_message,
     "qq_get_group_msg_history": handle_get_group_msg_history,
@@ -50,7 +58,7 @@ def _platform() -> Platform:
     已注册的平台名——所以不能在模块级调用 Platform("onebot11")（irc 插件
     同样是在 __init__ 里才解析）。
     """
-    return Platform("onebot11")
+    return Platform(_PLATFORM_NAME)
 
 
 class OneBot11Adapter(BasePlatformAdapter):

@@ -10,8 +10,8 @@ ToolContext（user_id / chat_type / chat_id）。
 
 from __future__ import annotations
 
-from onebot11.http_api import OneBotHttpApi
-from onebot11.permissions import ToolContext
+from .http_api import OneBotHttpApi
+from .permissions import ToolContext
 
 # 工具 schema（JSON Schema,供 LLM 调用;不含群号/QQ 号——由会话注入）
 TOOL_SCHEMAS: dict[str, dict] = {
