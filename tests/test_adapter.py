@@ -184,6 +184,70 @@ async def test_私聊策略allowlist白名单外拒绝(monkeypatch):
     assert recorded == []
 
 
+def _group_raw(group_id: int, text: str = "在吗") -> dict:
+    return {
+        "post_type": "message",
+        "message_type": "group",
+        "message_id": 1,
+        "group_id": group_id,
+        "user_id": 123,
+        "message": [{"type": "text", "data": {"text": text}}],
+        "sender": {"card": "小明", "nickname": "真名"},
+    }
+
+
+async def test_群白名单内群放行(monkeypatch):
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_ALLOWED_GROUPS="888,999",
+    )
+    recorded: list = []
+
+    async def fake_handle(event):
+        recorded.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    await adapter._on_ws_event(_group_raw(888))
+    assert len(recorded) == 1
+    assert recorded[0].source.chat_id == "888"
+
+
+async def test_群白名单外群被过滤(monkeypatch):
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_ALLOWED_GROUPS="888,999",
+    )
+    recorded: list = []
+
+    async def fake_handle(event):
+        recorded.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    await adapter._on_ws_event(_group_raw(777))
+    assert recorded == []
+
+
+async def test_群白名单为空不限制(monkeypatch):
+    """ONEBOT11_ALLOWED_GROUPS 未设置时,所有群都放行。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    recorded: list = []
+
+    async def fake_handle(event):
+        recorded.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    await adapter._on_ws_event(_group_raw(777))
+    assert len(recorded) == 1
+
+
 async def test_send走HTTP并返回SendResult(monkeypatch, fake_http_server):
     base, calls = fake_http_server
     adapter = _make_adapter(monkeypatch, ONEBOT11_HTTP_API=base, ONEBOT11_SELF_ID="1")

@@ -64,6 +64,7 @@ hermes plugins install notnotype/hermes-plugin-onebot11
 | `ONEBOT11_SELF_ID` | 空 | 机器人 QQ 号（识别群里的 @） |
 | `ONEBOT11_DM_POLICY` | open | 私聊策略：`open` / `allowlist` / `disabled` |
 | `ONEBOT11_ALLOWED_USERS` | 空 | 私聊白名单（逗号分隔的 QQ 号） |
+| `ONEBOT11_ALLOWED_GROUPS` | 空 | 群白名单（逗号分隔的群号;空 = 所有群可用） |
 | `ONEBOT11_ADMINS` | 空 | 管理员 QQ 列表（空 = 所有已授权用户同权） |
 | `ONEBOT11_HOME_CHANNEL` | 空 | 定时任务默认投递目标（群号或 QQ 号） |
 

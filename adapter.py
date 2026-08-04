@@ -79,6 +79,10 @@ class OneBot11Adapter(BasePlatformAdapter):
         raw_allowed = os.getenv("ONEBOT11_ALLOWED_USERS") or extra.get("allowed_users", "")
         self.allowed_users = {u.strip() for u in str(raw_allowed).split(",") if u.strip()}
 
+        # 群白名单（空 = 不限制,所有群可用）
+        raw_groups = os.getenv("ONEBOT11_ALLOWED_GROUPS") or extra.get("allowed_groups", "")
+        self._allowed_groups = {g.strip() for g in str(raw_groups).split(",") if g.strip()}
+
         # 工具权限（管理员列表）
         raw_admins = os.getenv("ONEBOT11_ADMINS") or extra.get("admins", "")
         self._admins = parse_admin_list(str(raw_admins))
@@ -132,6 +136,10 @@ class OneBot11Adapter(BasePlatformAdapter):
                 return
             if self.dm_policy == "allowlist" and event.user_id not in self.allowed_users:
                 return
+        # 群白名单（空 = 不限制）
+        if event.chat_type == "group" and self._allowed_groups and event.chat_id not in self._allowed_groups:
+            logger.debug("群 %s 不在白名单,忽略", event.chat_id)
+            return
         self._chat_types[event.chat_id] = event.chat_type
         await self.handle_message(await self._build_message_event(event))
 
@@ -296,7 +304,7 @@ def _env_enablement() -> dict | None:
         return None
     seed: dict[str, Any] = {"http_api": http_api, "self_id": self_id}
     for key in ("ONEBOT11_ACCESS_TOKEN", "ONEBOT11_WS_PORT", "ONEBOT11_DM_POLICY",
-                "ONEBOT11_ALLOWED_USERS", "ONEBOT11_ADMINS"):
+                "ONEBOT11_ALLOWED_USERS", "ONEBOT11_ALLOWED_GROUPS", "ONEBOT11_ADMINS"):
         value = os.getenv(key, "").strip()
         if value:
             seed[key.removeprefix("ONEBOT11_").lower()] = value

@@ -9,6 +9,7 @@ OneBot 11 主要跑在群聊里,权限按三层设计。核心原则：**群聊�
 | 场景 | 默认 | 配置 |
 |---|---|---|
 | 群聊 | 群里任何人都能 @ 机器人 | `ONEBOT11_ALLOW_ALL_USERS=true`（配合 gateway 的 require_mention） |
+| 群白名单 | 所有群可用 | `ONEBOT11_ALLOWED_GROUPS=群号,群号`（空 = 不限制） |
 | 私聊 | 全部放开 | `ONEBOT11_DM_POLICY=open` |
 | 私聊白名单 | — | `ONEBOT11_DM_POLICY=allowlist` + `ONEBOT11_ALLOWED_USERS=QQ,QQ` |
 | 私聊关闭 | — | `ONEBOT11_DM_POLICY=disabled` |
