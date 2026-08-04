@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import tempfile
+import time
 import uuid
 from typing import Any
 
@@ -33,6 +34,11 @@ chunk_text = _proto.http_api.chunk_text
 ToolContext = _proto.permissions.ToolContext
 parse_admin_list = _proto.permissions.parse_admin_list
 validate_tool_call = _proto.permissions.validate_tool_call
+role_of = _proto.permissions.role_of
+check_role_tool_call = _proto.permissions.check_role_tool_call
+GroupMessageQueue = _proto.queue.GroupMessageQueue
+build_group_context = _proto.context.build_group_context
+TriggerPolicy = _proto.triggers.TriggerPolicy
 TOOL_SCHEMAS = _proto.tools.TOOL_SCHEMAS
 handle_get_friend_msg_history = _proto.tools.handle_get_friend_msg_history
 handle_get_group_msg_history = _proto.tools.handle_get_group_msg_history
@@ -103,6 +109,19 @@ class OneBot11Adapter(BasePlatformAdapter):
         # base.handle_message 直接读 config.extra;必须是真布尔("false" 字符串是 truthy)
         self.config.extra["group_sessions_per_user"] = self._group_sessions_per_user
 
+        # v2: 消息队列 + 触发策略 + 上下文参数
+        self._queue = GroupMessageQueue(
+            max_entries=int(os.getenv("ONEBOT11_QUEUE_MAX_ENTRIES") or extra.get("queue_max_entries", 100)),
+            max_chars_per_entry=int(
+                os.getenv("ONEBOT11_QUEUE_MAX_CHARS_PER_ENTRY") or extra.get("queue_max_chars_per_entry", 2000)
+            ),
+        )
+        raw_kw = os.getenv("ONEBOT11_KEYWORD_TRIGGERS") or extra.get("keyword_triggers", "")
+        self._trigger = TriggerPolicy(keywords=[k.strip() for k in str(raw_kw).split(",") if k.strip()])
+        self._ctx_keep_raw = int(os.getenv("ONEBOT11_QUEUE_KEEP_RAW") or extra.get("queue_keep_raw", 5))
+        self._ctx_max_chars = int(os.getenv("ONEBOT11_QUEUE_CONTEXT_CHARS") or extra.get("queue_context_chars", 1500))
+        self._ctx_summarizer = None  # Task 8: LLM 摘要回调
+
         logger.info(
             "OneBot11: 群白名单=%s 私聊策略=%s 管理员=%s 群聊@触发=%s",
             sorted(self._allowed_groups) or "全部群",
@@ -160,25 +179,41 @@ class OneBot11Adapter(BasePlatformAdapter):
                 return
             if self.dm_policy == "allowlist" and event.user_id not in self.allowed_users:
                 return
-        # 群白名单（空 = 不限制）
-        if event.chat_type == "group" and self._allowed_groups and event.chat_id not in self._allowed_groups:
-            logger.info("OneBot11: 群 %s 不在白名单,忽略消息", event.chat_id)
-            return
-        # 群聊 @ 触发（未 @ 机器人直接忽略）
-        if event.chat_type == "group" and self.require_mention and not event.mentioned_self:
-            logger.info("OneBot11: 群 %s 消息未 @ 机器人,忽略", event.chat_id)
+        # 群聊:v2 队列 + 触发
+        if event.chat_type == "group":
+            if self._allowed_groups and event.chat_id not in self._allowed_groups:
+                logger.info("OneBot11: 群 %s 不在白名单,忽略消息", event.chat_id)
+                return
+            # 先判定再入队:当前触发消息不进队列(避免上下文重复)
+            if not await self._trigger.decide(event, self._queue):
+                self._queue.push(
+                    event.chat_id, event.text, event.user_id,
+                    event.user_name or event.user_id, time.time(),
+                )
+                logger.info("OneBot11: 群 %s 消息未触发,入队忽略", event.chat_id)
+                return
+            group_context = await build_group_context(
+                self._queue, event.chat_id,
+                keep_raw=self._ctx_keep_raw, max_chars=self._ctx_max_chars,
+                summarizer=self._ctx_summarizer,
+            )
+            self._queue.clear(event.chat_id)
+            self._chat_types[event.chat_id] = "group"
+            await self.handle_message(await self._build_message_event(event, group_context=group_context))
             return
         self._chat_types[event.chat_id] = event.chat_type
         await self.handle_message(await self._build_message_event(event))
 
-    async def _build_message_event(self, ev: InboundEvent) -> MessageEvent:
+    async def _build_message_event(self, ev: InboundEvent, group_context: str = "") -> MessageEvent:
         """InboundEvent → Hermes MessageEvent。
 
-        群聊消息加 `[昵称] ` 前缀（整群共享会话时区分发言者）。
+        群聊消息加 `[昵称] ` 前缀（共享会话时区分发言者）;触发时拼接群聊上下文。
         """
         text = ev.text
         if ev.chat_type == "group" and ev.user_name and ev.user_name != ev.user_id:
             text = f"[{ev.user_name}] {text}"
+        if group_context:
+            text = f"[群聊上下文]\n{group_context}\n[当前消息]\n{text}"
 
         media_urls: list[str] = []
         media_types: list[str] = []

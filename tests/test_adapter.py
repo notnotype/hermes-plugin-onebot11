@@ -204,8 +204,8 @@ def _group_raw(group_id: int, text: str = "在吗", at_self: bool = True) -> dic
     }
 
 
-async def test_群聊默认需要at才响应(monkeypatch):
-    """require_mention 默认开启: 未 @ 机器人的群消息被过滤。"""
+async def test_群聊未触发消息只入队不响应(monkeypatch):
+    """v2: 未 @ 未命中关键词的群消息只进队列,不进入会话。"""
     adapter = _make_adapter(
         monkeypatch,
         ONEBOT11_HTTP_API="http://127.0.0.1:3000",
@@ -219,10 +219,11 @@ async def test_群聊默认需要at才响应(monkeypatch):
     monkeypatch.setattr(adapter, "handle_message", fake_handle)
     await adapter._on_ws_event(_group_raw(888, at_self=False))
     assert recorded == []
+    assert len(adapter._queue.snapshot("888")) == 1
 
 
-async def test_群聊at机器人放行(monkeypatch):
-    """@ 了机器人的群消息正常进入会话。"""
+async def test_群聊at机器人放行并清空队列(monkeypatch):
+    """@ 了机器人的群消息触发并消费队列。"""
     adapter = _make_adapter(
         monkeypatch,
         ONEBOT11_HTTP_API="http://127.0.0.1:3000",
@@ -236,15 +237,16 @@ async def test_群聊at机器人放行(monkeypatch):
     monkeypatch.setattr(adapter, "handle_message", fake_handle)
     await adapter._on_ws_event(_group_raw(888, at_self=True))
     assert len(recorded) == 1
+    assert adapter._queue.snapshot("888") == []
 
 
-async def test_关闭require_mention后无at也放行(monkeypatch):
-    """ONEBOT11_REQUIRE_MENTION=false 时, 群里所有消息都响应。"""
+async def test_关键词触发进入会话并清空队列(monkeypatch):
+    """关键词命中触发;未命中消息积累在队列,触发后被消费。"""
     adapter = _make_adapter(
         monkeypatch,
         ONEBOT11_HTTP_API="http://127.0.0.1:3000",
         ONEBOT11_SELF_ID="1",
-        ONEBOT11_REQUIRE_MENTION="false",
+        ONEBOT11_KEYWORD_TRIGGERS="机器人",
     )
     recorded: list = []
 
@@ -252,8 +254,33 @@ async def test_关闭require_mention后无at也放行(monkeypatch):
         recorded.append(event)
 
     monkeypatch.setattr(adapter, "handle_message", fake_handle)
-    await adapter._on_ws_event(_group_raw(888, at_self=False))
+    # 第一条未触发 → 入队
+    await adapter._on_ws_event(_group_raw(888, text="今天天气不错", at_self=False))
+    assert recorded == [] and len(adapter._queue.snapshot("888")) == 1
+    # 第二条命中关键词 → 触发,队列被消费
+    await adapter._on_ws_event(_group_raw(888, text="机器人帮我查一下", at_self=False))
     assert len(recorded) == 1
+    assert adapter._queue.snapshot("888") == []
+
+
+async def test_触发消息带群聊上下文前缀(monkeypatch):
+    """触发时,触发前的队列消息拼进上下文。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_KEYWORD_TRIGGERS="机器人",
+    )
+    recorded: list = []
+
+    async def fake_handle(event):
+        recorded.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    await adapter._on_ws_event(_group_raw(888, text="第一条", at_self=False))
+    await adapter._on_ws_event(_group_raw(888, text="机器人触发", at_self=False))
+    text = recorded[0].text
+    assert "群聊上下文" in text and "第一条" in text and "当前消息" in text
 
 
 async def test_require_mention不影响私聊(monkeypatch):
