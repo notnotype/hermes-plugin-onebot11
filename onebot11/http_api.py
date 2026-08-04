@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from pathlib import Path
 
 import aiohttp
 
@@ -120,6 +121,21 @@ class OneBotHttpApi:
         else:
             data = await self.call_action("send_private_msg", {"user_id": int(chat_id), "message": message})
         return str(data.get("message_id", ""))
+
+    async def download_to_temp(self, url: str, dest_dir: str) -> str | None:
+        """下载 url 到 dest_dir,返回本地路径;失败返回 None。"""
+        session = await self._session_or_create()
+        try:
+            async with session.get(url) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.read()
+        except aiohttp.ClientError:
+            return None
+        suffix = Path(url).suffix or ".bin"
+        path = Path(dest_dir) / f"{uuid.uuid4().hex}{suffix}"
+        path.write_bytes(data)
+        return str(path)
 
     async def get_message(self, message_id: str) -> dict:
         """按 message_id 查单条消息。"""
