@@ -1,6 +1,5 @@
 """权限门禁测试：管理员列表 + 会话范围校验（群聊安全底线）。"""
 
-import pytest
 
 from onebot11.permissions import ToolContext, parse_admin_list, validate_tool_call
 

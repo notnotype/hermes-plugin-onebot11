@@ -6,7 +6,7 @@
 import pytest
 from aiohttp import web
 
-from onebot11.http_api import OneBotHttpApi, OneBotApiError, chunk_text
+from onebot11.http_api import OneBotApiError, OneBotHttpApi, chunk_text
 
 
 @pytest.fixture
