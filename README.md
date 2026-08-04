@@ -65,9 +65,20 @@ hermes plugins install notnotype/hermes-plugin-onebot11
 | `ONEBOT11_DM_POLICY` | open | 私聊策略：`open` / `allowlist` / `disabled` |
 | `ONEBOT11_ALLOWED_USERS` | 空 | 私聊白名单（逗号分隔的 QQ 号） |
 | `ONEBOT11_ALLOWED_GROUPS` | 空 | 群白名单（逗号分隔的群号;空 = 所有群可用） |
-| `ONEBOT11_REQUIRE_MENTION` | true | 群聊是否必须 @ 机器人 才响应 |
-| `ONEBOT11_ADMINS` | 空 | 管理员 QQ 列表（空 = 所有已授权用户同权） |
+| `ONEBOT11_GROUP_SESSIONS_PER_USER` | false | `true` = 群里每用户独立会话;`false` = 一群一会话 |
+| `ONEBOT11_KEYWORD_TRIGGERS` | 空 | 群聊触发关键词（正则,逗号分隔;@ 恒为触发源） |
+| `ONEBOT11_LLM_TRIGGER` | false | 未命中 @/关键词时,经宿主 LLM 判定是否触发 |
+| `ONEBOT11_QUEUE_MAX_ENTRIES` | 100 | 每群消息队列条数上限 |
+| `ONEBOT11_QUEUE_MAX_CHARS_PER_ENTRY` | 2000 | 单条消息入队截断长度（防巨型消息占预算） |
+| `ONEBOT11_QUEUE_KEEP_RAW` | 5 | 触发时保留最近原文条数 |
+| `ONEBOT11_QUEUE_CONTEXT_CHARS` | 1500 | 群聊上下文拼接总长上限 |
+| `ONEBOT11_ADMINS` | 空 | 管理员（超级管理员）QQ 列表;空 = 无 admin 角色 |
+| `ONEBOT11_ADMIN_TOOLS` | 空 | admin-only 工具名（逗号分隔;空 = 所有工具普通用户可用） |
 | `ONEBOT11_HOME_CHANNEL` | 空 | 定时任务默认投递目标（群号或 QQ 号） |
+
+> **v0.2.0 迁移**：`ONEBOT11_REQUIRE_MENTION` 已废弃删除——群聊中 @ 机器人**恒为触发源**;
+> 需要额外触发方式时用 `ONEBOT11_KEYWORD_TRIGGERS`（关键词）或 `ONEBOT11_LLM_TRIGGER`（LLM 判定）。
+> 未触发消息会进入每群消息队列,触发时拼进上下文（"自上次触发以来的群聊摘要"）。
 
 启动网关时带上环境变量即可,例如：
 
@@ -82,8 +93,8 @@ hermes gateway run
 
 群聊是 OneBot 11 的主要使用场景,权限分三层（详见 [docs/permissions.md](docs/permissions.md)）：
 
-1. **谁能对话**：群聊默认群里任何人都能 @ 机器人;私聊由 `ONEBOT11_DM_POLICY` 控制。
-2. **谁能用工具**：管理员列表（`ONEBOT11_ADMINS`）区分普通用户和管理员。
+1. **谁能对话**：群白名单 + 触发（@ 恒触发;关键词/LLM 判定可叠加）;私聊由 `ONEBOT11_DM_POLICY` 控制。
+2. **谁能用工具**：角色分超级管理员（`ONEBOT11_ADMINS`）与普通用户;`ONEBOT11_ADMIN_TOOLS` 里的工具仅管理员可用（调用侧守卫,越权返回权限错误）。
 3. **会话范围**：工具只能作用于发起会话本身——群里只能查本群消息。
 
 ## 开发

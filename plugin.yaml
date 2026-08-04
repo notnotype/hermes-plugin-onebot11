@@ -1,11 +1,11 @@
 name: onebot11-platform
 label: OneBot 11 (QQ)
 kind: platform
-version: 0.1.0
+version: 0.2.0
 description: >
   OneBot 11 (QQ) gateway adapter for Hermes Agent.
-  Reverse WebSocket + HTTP API. Group & DM chat, message query tools,
-  group-chat-first permission model.
+  Reverse WebSocket + HTTP API. Group chat with message queue &
+  multi-trigger (mention/keyword/LLM), role-based tool permissions.
 author: notnotype
 requires_env:
   - name: ONEBOT11_HTTP_API
@@ -37,13 +37,41 @@ optional_env:
     description: "群白名单（逗号分隔的群号；空 = 所有群可用）"
     prompt: "群白名单"
     password: false
-  - name: ONEBOT11_REQUIRE_MENTION
-    description: "群聊是否必须 @ 机器人 才响应（默认 true）"
-    prompt: "群聊 @ 触发"
+  - name: ONEBOT11_GROUP_SESSIONS_PER_USER
+    description: "true = 群里每用户独立会话;false = 一群一会话（默认）"
+    prompt: "群会话粒度"
+    password: false
+  - name: ONEBOT11_KEYWORD_TRIGGERS
+    description: "群聊触发关键词（正则,逗号分隔;@ 恒为触发源）"
+    prompt: "触发关键词"
+    password: false
+  - name: ONEBOT11_LLM_TRIGGER
+    description: "未命中 @/关键词时经宿主 LLM 判定是否触发（默认 false）"
+    prompt: "LLM 触发判定"
+    password: false
+  - name: ONEBOT11_QUEUE_MAX_ENTRIES
+    description: "每群消息队列条数上限（默认 100）"
+    prompt: "队列条数上限"
+    password: false
+  - name: ONEBOT11_QUEUE_MAX_CHARS_PER_ENTRY
+    description: "单条消息入队截断长度（默认 2000）"
+    prompt: "单条截断长度"
+    password: false
+  - name: ONEBOT11_QUEUE_KEEP_RAW
+    description: "触发时保留最近原文条数（默认 5）"
+    prompt: "保留原文条数"
+    password: false
+  - name: ONEBOT11_QUEUE_CONTEXT_CHARS
+    description: "群聊上下文拼接总长上限（默认 1500）"
+    prompt: "上下文总长上限"
     password: false
   - name: ONEBOT11_ADMINS
-    description: "管理员 QQ 列表（逗号分隔；空 = 所有已授权用户同权）"
+    description: "管理员 QQ 列表（逗号分隔；超级管理员,空 = 无 admin 角色）"
     prompt: "管理员 QQ 列表"
+    password: false
+  - name: ONEBOT11_ADMIN_TOOLS
+    description: "admin-only 工具名（逗号分隔；空 = 所有工具普通用户可用）"
+    prompt: "管理员专用工具"
     password: false
   - name: ONEBOT11_HOME_CHANNEL
     description: "定时任务默认投递目标（群号或 QQ 号）"

@@ -135,11 +135,12 @@ class OneBot11Adapter(BasePlatformAdapter):
             self._ctx_summarizer = self._llm_summarize
 
         logger.info(
-            "OneBot11: 群白名单=%s 私聊策略=%s 管理员=%s 群聊@触发=%s",
+            "OneBot11: 群白名单=%s 私聊策略=%s 管理员=%s 关键词触发=%s LLM触发=%s",
             sorted(self._allowed_groups) or "全部群",
             self.dm_policy,
             sorted(self._admins) or "无(开放)",
-            "开" if self.require_mention else "关",
+            self._trigger.keywords or "无",
+            "开" if self._trigger.llm_judge is not None else "关",
         )
 
         self._api = OneBotHttpApi(base_url=http_api, token=self.access_token)
@@ -425,8 +426,11 @@ def _env_enablement() -> dict | None:
         return None
     seed: dict[str, Any] = {"http_api": http_api, "self_id": self_id}
     for key in ("ONEBOT11_ACCESS_TOKEN", "ONEBOT11_WS_PORT", "ONEBOT11_DM_POLICY",
-                "ONEBOT11_ALLOWED_USERS", "ONEBOT11_ALLOWED_GROUPS", "ONEBOT11_REQUIRE_MENTION",
-                "ONEBOT11_ADMINS"):
+                "ONEBOT11_ALLOWED_USERS", "ONEBOT11_ALLOWED_GROUPS", "ONEBOT11_GROUP_SESSIONS_PER_USER",
+                "ONEBOT11_KEYWORD_TRIGGERS", "ONEBOT11_LLM_TRIGGER", "ONEBOT11_ADMINS",
+                "ONEBOT11_ADMIN_TOOLS", "ONEBOT11_QUEUE_MAX_ENTRIES",
+                "ONEBOT11_QUEUE_MAX_CHARS_PER_ENTRY", "ONEBOT11_QUEUE_KEEP_RAW",
+                "ONEBOT11_QUEUE_CONTEXT_CHARS"):
         value = os.getenv(key, "").strip()
         if value:
             seed[key.removeprefix("ONEBOT11_").lower()] = value
