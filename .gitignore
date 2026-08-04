@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# 本地环境
+.env
+.env.local
+*.log
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# Hermes 插件安装残留
+*.hermes/
+
+# Agent worktree
+.agent/

@@ -1,0 +1,43 @@
+name: onebot11-platform
+label: OneBot 11 (QQ)
+kind: platform
+version: 0.1.0
+description: >
+  OneBot 11 (QQ) gateway adapter for Hermes Agent.
+  Reverse WebSocket + HTTP API. Group & DM chat, message query tools,
+  group-chat-first permission model.
+author: notnotype
+requires_env:
+  - name: ONEBOT11_HTTP_API
+    description: "QQ 框架的 OneBot 11 HTTP API 地址 (e.g. http://127.0.0.1:3000)"
+    prompt: "OneBot 11 HTTP API 地址"
+    password: false
+  - name: ONEBOT11_SELF_ID
+    description: "机器人 QQ 号（用于识别群里的 @）"
+    prompt: "机器人 QQ 号"
+    password: false
+optional_env:
+  - name: ONEBOT11_WS_PORT
+    description: "反向 WS 监听端口 (默认 18880)"
+    prompt: "反向 WS 端口"
+    password: false
+  - name: ONEBOT11_ACCESS_TOKEN
+    description: "WS/HTTP 的 Bearer token，与 QQ 框架侧一致"
+    prompt: "访问 token"
+    password: true
+  - name: ONEBOT11_DM_POLICY
+    description: "私聊策略: open / allowlist / disabled"
+    prompt: "私聊策略"
+    password: false
+  - name: ONEBOT11_ALLOWED_USERS
+    description: "私聊白名单（逗号分隔的 QQ 号）"
+    prompt: "私聊白名单"
+    password: false
+  - name: ONEBOT11_ADMINS
+    description: "管理员 QQ 列表（逗号分隔；空 = 所有已授权用户同权）"
+    prompt: "管理员 QQ 列表"
+    password: false
+  - name: ONEBOT11_HOME_CHANNEL
+    description: "定时任务默认投递目标（群号或 QQ 号）"
+    prompt: "默认投递目标"
+    password: false
