@@ -64,8 +64,15 @@
 
 ## 后续 TODO
 
-- [ ] 用户重启 LLBot 后真机验证：3 个白名单群正常对话,非白名单群零响应
+- [ ] 用户重启 LLBot 后真机验证：3 个白名单群 @ 触发正常,非白名单群零响应
 - [ ] 在常用群 /sethome 设置 home channel（消除 📬 提示）
-- [ ] 设置 ONEBOT11_ADMINS（管理员 QQ 列表,收紧工具权限）
+- [ ] 权限系统设计（调研 Discord/Telegram 后）:群内用户不可信,不放开 shell/管理工具;工具权限基于 ONEBOT11_ADMINS
+- [ ] 出站侧白名单拦截（可选加固:send() 里丢弃非白名单群目标,防关机通知等核心出站消息漏网）
+- [ ] 回复机器人消息也触发（reply-to-bot,需跟踪自己发的 message_id）
 - [ ] 群角色权限（v1.1,get_group_member_info）
 - [ ] 图片下载在真实 LLBot 上的 URL 形态验证
+
+## 会话与触发调研结论（Telegram/Discord 对齐）
+
+- 会话模型：chat_id = 群号;`group_sessions_per_user` 默认 true → 群里每用户独立会话（Telegram/Discord 一致,base 默认即此;我们的适配器继承,无需额外配置）。设 false 则整群共享。群文本保留 [昵称] 前缀供上下文可读。
+- 触发：`ONEBOT11_REQUIRE_MENTION`（默认 true,对齐 Telegram require_mention）——群聊必须 @ 机器人才响应,未 @ 的消息在适配器层过滤（INFO 日志）。reply-to-bot 触发为后续增强。
