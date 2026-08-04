@@ -93,6 +93,16 @@ class OneBot11Adapter(BasePlatformAdapter):
         # 工具权限（管理员列表）
         raw_admins = os.getenv("ONEBOT11_ADMINS") or extra.get("admins", "")
         self._admins = parse_admin_list(str(raw_admins))
+
+        # v2: 群会话粒度（默认一群一会话;true = 群里每用户独立）
+        raw_gspu = os.getenv("ONEBOT11_GROUP_SESSIONS_PER_USER")
+        if raw_gspu is not None:
+            self._group_sessions_per_user = raw_gspu.strip().lower() in {"true", "1", "yes", "on"}
+        else:
+            self._group_sessions_per_user = bool(extra.get("group_sessions_per_user", False))
+        # base.handle_message 直接读 config.extra;必须是真布尔("false" 字符串是 truthy)
+        self.config.extra["group_sessions_per_user"] = self._group_sessions_per_user
+
         logger.info(
             "OneBot11: 群白名单=%s 私聊策略=%s 管理员=%s 群聊@触发=%s",
             sorted(self._allowed_groups) or "全部群",
