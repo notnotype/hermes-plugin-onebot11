@@ -354,7 +354,7 @@ async def test_admin工具管理员调用放行(monkeypatch, fake_http_server):
     handler = adapter._make_tool_handler("qq_get_message")
     result = await handler(args={"message_id": 1}, task_id="t", session_id="s1", user_task="u")
     assert "仅管理员可用" not in result
-    assert calls and calls[0]["path"] == "/get_message"
+    assert calls and calls[0]["path"] == "/get_msg"
 
 
 async def test_普通用户触发消息带角色提示(monkeypatch):
