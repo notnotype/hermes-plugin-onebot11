@@ -70,9 +70,11 @@ def _platform() -> Platform:
 class OneBot11Adapter(BasePlatformAdapter):
     """OneBot 11 平台适配器。"""
 
-    def __init__(self, config: PlatformConfig) -> None:
+    def __init__(self, config: PlatformConfig, llm_facade: object | None = None) -> None:
         super().__init__(config=config, platform=_platform())
         extra = config.extra or {}
+        # Any: PluginLlm 为 Hermes 外部类,无本地类型定义;仅使用其 acomplete 接口
+        self._llm: Any = llm_facade  # 宿主 LLM,用于触发判定与队列摘要
 
         # 连接配置（env 优先于 config.yaml）
         self.ws_port = int(os.getenv("ONEBOT11_WS_PORT") or extra.get("ws_port", 18880))
@@ -125,6 +127,12 @@ class OneBot11Adapter(BasePlatformAdapter):
         # v2: admin-only 工具表(调用侧角色守卫;空 = 所有工具普通用户可用)
         raw_adt = os.getenv("ONEBOT11_ADMIN_TOOLS") or extra.get("admin_tools", "")
         self._admin_tools = {t.strip() for t in str(raw_adt).split(",") if t.strip()}
+
+        # v2: LLM 触发判定与队列摘要(经宿主 LLM,失败降级为不触发/截断)
+        raw_llm = os.getenv("ONEBOT11_LLM_TRIGGER") or extra.get("llm_trigger", "false")
+        if str(raw_llm).strip().lower() in {"true", "1", "yes", "on"} and self._llm is not None:
+            self._trigger.llm_judge = self._llm_judge
+            self._ctx_summarizer = self._llm_summarize
 
         logger.info(
             "OneBot11: 群白名单=%s 私聊策略=%s 管理员=%s 群聊@触发=%s",
@@ -268,6 +276,37 @@ class OneBot11Adapter(BasePlatformAdapter):
         except Exception:
             logger.debug("图片下载失败: %s", image, exc_info=True)
             return None
+
+    # ── LLM 触发判定与摘要(经宿主 LLM)─────────────────────────────────────
+
+    async def _llm_judge(self, chat_id: str, snapshot: str, current: str) -> bool:
+        """宿主 LLM 判定是否响应这条群消息;失败按不触发处理。"""
+        if self._llm is None:
+            return False
+        prompt = (
+            "你是群聊触发判定器。判断这条消息是否需要机器人响应。"
+            "需要输出 true,不需要输出 false,只输出一个词。\n\n"
+            f"[自上次触发以来的群聊消息]\n{snapshot or '(无)'}\n\n"
+            f"[当前消息]\n{current}\n"
+        )
+        try:
+            result = await self._llm.acomplete(messages=[{"role": "user", "content": prompt}])
+            return result.text.strip().lower().startswith("true")
+        except Exception:
+            logger.warning("LLM 触发判定失败,按不触发处理", exc_info=True)
+            return False
+
+    async def _llm_summarize(self, blob: str) -> str:
+        """宿主 LLM 压缩旧消息为一句摘要;失败返回截断文本。"""
+        if self._llm is None:
+            return blob[:200] + "…" if len(blob) > 200 else blob
+        prompt = f"把以下群聊消息压缩成 50 字以内的中文摘要:\n{blob}"
+        try:
+            result = await self._llm.acomplete(messages=[{"role": "user", "content": prompt}])
+            return result.text.strip()
+        except Exception:
+            logger.warning("LLM 摘要失败,降级为截断", exc_info=True)
+            return blob[:200] + "…" if len(blob) > 200 else blob
 
     # ── 发送 ──────────────────────────────────────────────────────────────
 
@@ -425,10 +464,12 @@ async def _standalone_send(
 
 def register(ctx) -> None:
     """插件入口：注册平台 + 三个查询工具。"""
+    # 捕获宿主 LLM facade(PluginLlm)供 adapter 做触发判定/摘要;gateway adapter 场景官方支持 async
+    llm_facade = getattr(ctx, "llm", None)
     ctx.register_platform(
         name="onebot11",
         label="OneBot 11 (QQ)",
-        adapter_factory=lambda cfg: OneBot11Adapter(cfg),
+        adapter_factory=lambda cfg: OneBot11Adapter(cfg, llm_facade=llm_facade),
         check_fn=check_requirements,
         validate_config=validate_config,
         required_env=["ONEBOT11_HTTP_API", "ONEBOT11_SELF_ID"],

@@ -395,6 +395,81 @@ async def test_管理员触发消息不带角色提示(monkeypatch):
     assert "仅管理员可用工具" not in recorded[0].text
 
 
+async def test_llm触发开关接线(monkeypatch):
+    """ONEBOT11_LLM_TRIGGER=true 时 judge 回调被调用(手动替换为假 judge)。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_LLM_TRIGGER="true",
+    )
+    calls: list = []
+
+    async def fake_judge(chat_id: str, snapshot: str, current: str) -> bool:
+        calls.append((chat_id, current))
+        return current.startswith("帮我")
+
+    adapter._trigger.llm_judge = fake_judge
+    recorded: list = []
+
+    async def fake_handle(event):
+        recorded.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    await adapter._on_ws_event(_group_raw(888, text="帮我查一下", at_self=False))
+    assert len(calls) == 1 and calls[0][0] == "888"
+    assert len(recorded) == 1
+
+
+class _FakeLlm:
+    """假 PluginLlm:记录调用,返回固定文本。"""
+
+    def __init__(self, answer: str = "true") -> None:
+        self.answer = answer
+        self.calls: list = []
+
+    async def acomplete(self, **kwargs) -> object:
+        self.calls.append(kwargs)
+        from types import SimpleNamespace
+
+        return SimpleNamespace(text=self.answer)
+
+
+async def test_llm触发真实接线(monkeypatch):
+    """ONEBOT11_LLM_TRIGGER=true + llm_facade 存在时,judge 自动接上并触发。"""
+    from gateway.config import PlatformConfig
+
+    fake = _FakeLlm(answer="true")
+    monkeypatch.setenv("ONEBOT11_WS_PORT", "0")
+    monkeypatch.setenv("ONEBOT11_HTTP_API", "http://127.0.0.1:3000")
+    monkeypatch.setenv("ONEBOT11_SELF_ID", "1")
+    monkeypatch.setenv("ONEBOT11_LLM_TRIGGER", "true")
+    adapter = OneBot11Adapter(PlatformConfig(enabled=True, extra={}), llm_facade=fake)
+    assert adapter._trigger.llm_judge is not None
+    recorded: list = []
+
+    async def fake_handle(event):
+        recorded.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    await adapter._on_ws_event(_group_raw(888, text="帮我查一下", at_self=False))
+    assert fake.calls  # LLM 判定被调用
+    assert len(recorded) == 1
+
+
+async def test_llm触发false不接线(monkeypatch):
+    """ONEBOT11_LLM_TRIGGER=false 时即使有 facade 也不接 judge。"""
+    from gateway.config import PlatformConfig
+
+    fake = _FakeLlm()
+    monkeypatch.setenv("ONEBOT11_WS_PORT", "0")
+    monkeypatch.setenv("ONEBOT11_HTTP_API", "http://127.0.0.1:3000")
+    monkeypatch.setenv("ONEBOT11_SELF_ID", "1")
+    adapter = OneBot11Adapter(PlatformConfig(enabled=True, extra={}), llm_facade=fake)
+    assert adapter._trigger.llm_judge is None
+    assert adapter._ctx_summarizer is None
+
+
 async def test_群白名单内群放行(monkeypatch):
     adapter = _make_adapter(
         monkeypatch,
