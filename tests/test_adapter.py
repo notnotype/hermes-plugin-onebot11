@@ -1,0 +1,384 @@
+"""adapter.py 冒烟测试。
+
+需要 hermes gateway 可导入（本地跑：用 hermes venv + PYTHONPATH）；
+CI 环境没有 gateway 时自动跳过。
+"""
+
+import asyncio
+
+import pytest
+
+pytest.importorskip("gateway.platforms.base")
+
+from aiohttp import web  # noqa: E402
+
+# 镜像真实网关流程: register() 之前把平台注册进 registry,Platform("onebot11") 才能解析
+from gateway.platform_registry import PlatformEntry, platform_registry  # noqa: E402
+
+platform_registry.register(
+    PlatformEntry(
+        name="onebot11",
+        label="OneBot 11 (QQ)",
+        adapter_factory=lambda cfg: None,
+        check_fn=lambda: True,
+        source="plugin",
+    )
+)
+
+from gateway.config import PlatformConfig  # noqa: E402
+from gateway.platforms.base import BasePlatformAdapter, SendResult  # noqa: E402
+
+from adapter import OneBot11Adapter, check_requirements, register  # noqa: E402
+from onebot11.events import InboundEvent  # noqa: E402
+
+
+def _make_adapter(monkeypatch, **env) -> OneBot11Adapter:
+    # 默认用随机端口,避免与正在运行的网关(0.0.0.0:18880)撞端口
+    env.setdefault("ONEBOT11_WS_PORT", "0")
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    return OneBot11Adapter(PlatformConfig(enabled=True, extra={}))
+
+
+@pytest.fixture
+async def fake_http_server():
+    """记录 OneBot HTTP 请求的假服务。"""
+    calls: list[dict] = []
+
+    async def handler(request: web.Request) -> web.Response:
+        body = await request.json()
+        calls.append({"path": request.path, "params": body})
+        return web.json_response({"status": "ok", "retcode": 0, "data": {"message_id": 7}})
+
+    app = web.Application()
+    app.router.add_post("/{action}", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    base: str = f"http://127.0.0.1:{runner.addresses[0][1]}"
+    yield base, calls
+    await runner.cleanup()
+
+
+def test_继承自BasePlatformAdapter(monkeypatch):
+    adapter = _make_adapter(monkeypatch, ONEBOT11_HTTP_API="http://127.0.0.1:3000", ONEBOT11_SELF_ID="1")
+    assert isinstance(adapter, BasePlatformAdapter)
+    assert adapter.platform.value == "onebot11"
+
+
+def test_连接生命周期(monkeypatch):
+    adapter = _make_adapter(monkeypatch, ONEBOT11_HTTP_API="http://127.0.0.1:3000", ONEBOT11_SELF_ID="1")
+    assert not adapter.is_connected
+    asyncio.get_event_loop().run_until_complete(adapter.connect())
+    assert adapter.is_connected
+    asyncio.get_event_loop().run_until_complete(adapter.disconnect())
+    assert not adapter.is_connected
+
+
+def test_缺HTTP配置时connect失败(monkeypatch):
+    adapter = _make_adapter(monkeypatch)  # 没有 ONEBOT11_HTTP_API
+    assert not asyncio.get_event_loop().run_until_complete(adapter.connect())
+
+
+async def test_群聊事件转MessageEvent带前缀(monkeypatch):
+    adapter = _make_adapter(monkeypatch, ONEBOT11_HTTP_API="http://127.0.0.1:3000", ONEBOT11_SELF_ID="1")
+    event = await adapter._build_message_event(
+        InboundEvent(
+            text="大家好",
+            chat_id="888",
+            chat_type="group",
+            user_id="123",
+            user_name="小明",
+            message_id="1001",
+        )
+    )
+    assert event.text == "[小明] 大家好"
+    assert event.source.chat_id == "888"
+    assert event.source.chat_type == "group"
+    assert event.source.user_id == "123"
+    assert event.message_id == "1001"
+    assert event.metadata["mentioned_self"] is False
+
+
+async def test_私聊事件不加前缀(monkeypatch):
+    adapter = _make_adapter(monkeypatch, ONEBOT11_HTTP_API="http://127.0.0.1:3000", ONEBOT11_SELF_ID="1")
+    event = await adapter._build_message_event(
+        InboundEvent(text="在吗", chat_id="123", chat_type="dm", user_id="123", user_name="小明", message_id="1")
+    )
+    assert event.text == "在吗"
+    assert event.source.chat_type == "dm"
+
+
+async def test_入站群聊事件进入handle_message(monkeypatch):
+    adapter = _make_adapter(monkeypatch, ONEBOT11_HTTP_API="http://127.0.0.1:3000", ONEBOT11_SELF_ID="1")
+    recorded: list = []
+
+    async def fake_handle(event):
+        recorded.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    raw = {
+        "post_type": "message",
+        "message_type": "group",
+        "message_id": 1001,
+        "group_id": 888,
+        "user_id": 123,
+        "message": [
+            {"type": "at", "data": {"qq": "1"}},
+            {"type": "text", "data": {"text": "在吗"}},
+        ],
+        "sender": {"card": "小明", "nickname": "真名"},
+    }
+    await adapter._on_ws_event(raw)
+    assert len(recorded) == 1
+    assert recorded[0].source.chat_id == "888"
+    assert recorded[0].text == "[小明] 在吗"
+
+
+async def test_私聊策略disabled不进入(monkeypatch):
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_DM_POLICY="disabled",
+    )
+    recorded: list = []
+
+    async def fake_handle(event):
+        recorded.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    raw = {
+        "post_type": "message",
+        "message_type": "private",
+        "message_id": 1,
+        "user_id": 123,
+        "message": [{"type": "text", "data": {"text": "hi"}}],
+        "sender": {"nickname": "小明"},
+    }
+    await adapter._on_ws_event(raw)
+    assert recorded == []
+
+
+async def test_私聊策略allowlist白名单外拒绝(monkeypatch):
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_DM_POLICY="allowlist",
+        ONEBOT11_ALLOWED_USERS="999",
+    )
+    recorded: list = []
+
+    async def fake_handle(event):
+        recorded.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    raw = {
+        "post_type": "message",
+        "message_type": "private",
+        "message_id": 1,
+        "user_id": 123,
+        "message": [{"type": "text", "data": {"text": "hi"}}],
+        "sender": {"nickname": "小明"},
+    }
+    await adapter._on_ws_event(raw)
+    assert recorded == []
+
+
+def _group_raw(group_id: int, text: str = "在吗", at_self: bool = True) -> dict:
+    """构造群消息事件;at_self=True 时附带 @ 机器人段（测试用 SELF_ID=1）。"""
+    message: list[dict] = []
+    if at_self:
+        message.append({"type": "at", "data": {"qq": "1"}})
+    message.append({"type": "text", "data": {"text": text}})
+    return {
+        "post_type": "message",
+        "message_type": "group",
+        "message_id": 1,
+        "group_id": group_id,
+        "user_id": 123,
+        "message": message,
+        "sender": {"card": "小明", "nickname": "真名"},
+    }
+
+
+async def test_群聊默认需要at才响应(monkeypatch):
+    """require_mention 默认开启: 未 @ 机器人的群消息被过滤。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    recorded: list = []
+
+    async def fake_handle(event):
+        recorded.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    await adapter._on_ws_event(_group_raw(888, at_self=False))
+    assert recorded == []
+
+
+async def test_群聊at机器人放行(monkeypatch):
+    """@ 了机器人的群消息正常进入会话。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    recorded: list = []
+
+    async def fake_handle(event):
+        recorded.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    await adapter._on_ws_event(_group_raw(888, at_self=True))
+    assert len(recorded) == 1
+
+
+async def test_关闭require_mention后无at也放行(monkeypatch):
+    """ONEBOT11_REQUIRE_MENTION=false 时, 群里所有消息都响应。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_REQUIRE_MENTION="false",
+    )
+    recorded: list = []
+
+    async def fake_handle(event):
+        recorded.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    await adapter._on_ws_event(_group_raw(888, at_self=False))
+    assert len(recorded) == 1
+
+
+async def test_require_mention不影响私聊(monkeypatch):
+    """私聊消息不受 require_mention 限制。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    recorded: list = []
+
+    async def fake_handle(event):
+        recorded.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    raw = {
+        "post_type": "message",
+        "message_type": "private",
+        "message_id": 1,
+        "user_id": 123,
+        "message": [{"type": "text", "data": {"text": "hi"}}],
+        "sender": {"nickname": "小明"},
+    }
+    await adapter._on_ws_event(raw)
+    assert len(recorded) == 1
+
+
+async def test_群白名单内群放行(monkeypatch):
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_ALLOWED_GROUPS="888,999",
+    )
+    recorded: list = []
+
+    async def fake_handle(event):
+        recorded.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    await adapter._on_ws_event(_group_raw(888))
+    assert len(recorded) == 1
+    assert recorded[0].source.chat_id == "888"
+
+
+async def test_群白名单外群被过滤(monkeypatch):
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_ALLOWED_GROUPS="888,999",
+    )
+    recorded: list = []
+
+    async def fake_handle(event):
+        recorded.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    await adapter._on_ws_event(_group_raw(777))
+    assert recorded == []
+
+
+async def test_群白名单为空不限制(monkeypatch):
+    """ONEBOT11_ALLOWED_GROUPS 未设置时,所有群都放行。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    recorded: list = []
+
+    async def fake_handle(event):
+        recorded.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    await adapter._on_ws_event(_group_raw(777))
+    assert len(recorded) == 1
+
+
+async def test_send走HTTP并返回SendResult(monkeypatch, fake_http_server):
+    base, calls = fake_http_server
+    adapter = _make_adapter(monkeypatch, ONEBOT11_HTTP_API=base, ONEBOT11_SELF_ID="1")
+    await adapter.connect()
+    try:
+        adapter._chat_types["888"] = "group"
+        result = await adapter.send("888", "你好")
+        assert isinstance(result, SendResult)
+        assert result.success
+        assert calls[0]["path"] == "/send_group_msg"
+        assert calls[0]["params"]["group_id"] == 888
+    finally:
+        await adapter.disconnect()
+
+
+async def test_send未连接返回失败(monkeypatch):
+    adapter = _make_adapter(monkeypatch, ONEBOT11_HTTP_API="http://127.0.0.1:3000", ONEBOT11_SELF_ID="1")
+    result = await adapter.send("888", "你好")
+    assert not result.success
+
+
+def test_check_requirements(monkeypatch):
+    assert not check_requirements()
+    monkeypatch.setenv("ONEBOT11_HTTP_API", "http://127.0.0.1:3000")
+    monkeypatch.setenv("ONEBOT11_SELF_ID", "1")
+    assert check_requirements()
+
+
+def test_register注册平台与工具():
+    class FakeCtx:
+        def __init__(self):
+            self.platform_kwargs = None
+            self.tools: list[dict] = []
+
+        def register_platform(self, **kwargs):
+            self.platform_kwargs = kwargs
+
+        def register_tool(self, **kwargs):
+            self.tools.append(kwargs)
+
+    ctx = FakeCtx()
+    register(ctx)
+    assert ctx.platform_kwargs["name"] == "onebot11"
+    assert ctx.platform_kwargs["cron_deliver_env_var"] == "ONEBOT11_HOME_CHANNEL"
+    names = {t["name"] for t in ctx.tools}
+    assert names == {"qq_get_message", "qq_get_group_msg_history", "qq_get_friend_msg_history"}
+    for t in ctx.tools:
+        assert t["toolset"] == "onebot11"
+        assert t["is_async"] is True

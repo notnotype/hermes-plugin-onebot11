@@ -20,6 +20,10 @@ dev = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+pythonpath = ["."]
+# 仓库根即插件目录(含 __init__.py);importlib 模式按文件路径导入测试,
+# 避免 pytest 按目录名把根包当测试模块导入(CI 检出目录名含连字符会炸)
+addopts = "--import-mode=importlib"
 
 [tool.ruff]
 line-length = 100
