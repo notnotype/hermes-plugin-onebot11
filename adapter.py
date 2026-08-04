@@ -83,14 +83,22 @@ class OneBot11Adapter(BasePlatformAdapter):
         raw_groups = os.getenv("ONEBOT11_ALLOWED_GROUPS") or extra.get("allowed_groups", "")
         self._allowed_groups = {g.strip() for g in str(raw_groups).split(",") if g.strip()}
 
+        # 群聊 @ 触发（默认开启,对齐 Telegram require_mention 语义）
+        raw_rm = os.getenv("ONEBOT11_REQUIRE_MENTION")
+        if raw_rm is not None:
+            self.require_mention = raw_rm.strip().lower() in {"true", "1", "yes", "on"}
+        else:
+            self.require_mention = bool(extra.get("require_mention", True))
+
         # 工具权限（管理员列表）
         raw_admins = os.getenv("ONEBOT11_ADMINS") or extra.get("admins", "")
         self._admins = parse_admin_list(str(raw_admins))
         logger.info(
-            "OneBot11: 群白名单=%s 私聊策略=%s 管理员=%s",
+            "OneBot11: 群白名单=%s 私聊策略=%s 管理员=%s 群聊@触发=%s",
             sorted(self._allowed_groups) or "全部群",
             self.dm_policy,
             sorted(self._admins) or "无(开放)",
+            "开" if self.require_mention else "关",
         )
 
         self._api = OneBotHttpApi(base_url=http_api, token=self.access_token)
@@ -145,6 +153,10 @@ class OneBot11Adapter(BasePlatformAdapter):
         # 群白名单（空 = 不限制）
         if event.chat_type == "group" and self._allowed_groups and event.chat_id not in self._allowed_groups:
             logger.info("OneBot11: 群 %s 不在白名单,忽略消息", event.chat_id)
+            return
+        # 群聊 @ 触发（未 @ 机器人直接忽略）
+        if event.chat_type == "group" and self.require_mention and not event.mentioned_self:
+            logger.info("OneBot11: 群 %s 消息未 @ 机器人,忽略", event.chat_id)
             return
         self._chat_types[event.chat_id] = event.chat_type
         await self.handle_message(await self._build_message_event(event))
@@ -310,7 +322,8 @@ def _env_enablement() -> dict | None:
         return None
     seed: dict[str, Any] = {"http_api": http_api, "self_id": self_id}
     for key in ("ONEBOT11_ACCESS_TOKEN", "ONEBOT11_WS_PORT", "ONEBOT11_DM_POLICY",
-                "ONEBOT11_ALLOWED_USERS", "ONEBOT11_ALLOWED_GROUPS", "ONEBOT11_ADMINS"):
+                "ONEBOT11_ALLOWED_USERS", "ONEBOT11_ALLOWED_GROUPS", "ONEBOT11_REQUIRE_MENTION",
+                "ONEBOT11_ADMINS"):
         value = os.getenv(key, "").strip()
         if value:
             seed[key.removeprefix("ONEBOT11_").lower()] = value

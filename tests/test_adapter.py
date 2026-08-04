@@ -184,16 +184,98 @@ async def test_私聊策略allowlist白名单外拒绝(monkeypatch):
     assert recorded == []
 
 
-def _group_raw(group_id: int, text: str = "在吗") -> dict:
+def _group_raw(group_id: int, text: str = "在吗", at_self: bool = True) -> dict:
+    """构造群消息事件;at_self=True 时附带 @ 机器人段（测试用 SELF_ID=1）。"""
+    message: list[dict] = []
+    if at_self:
+        message.append({"type": "at", "data": {"qq": "1"}})
+    message.append({"type": "text", "data": {"text": text}})
     return {
         "post_type": "message",
         "message_type": "group",
         "message_id": 1,
         "group_id": group_id,
         "user_id": 123,
-        "message": [{"type": "text", "data": {"text": text}}],
+        "message": message,
         "sender": {"card": "小明", "nickname": "真名"},
     }
+
+
+async def test_群聊默认需要at才响应(monkeypatch):
+    """require_mention 默认开启: 未 @ 机器人的群消息被过滤。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    recorded: list = []
+
+    async def fake_handle(event):
+        recorded.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    await adapter._on_ws_event(_group_raw(888, at_self=False))
+    assert recorded == []
+
+
+async def test_群聊at机器人放行(monkeypatch):
+    """@ 了机器人的群消息正常进入会话。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    recorded: list = []
+
+    async def fake_handle(event):
+        recorded.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    await adapter._on_ws_event(_group_raw(888, at_self=True))
+    assert len(recorded) == 1
+
+
+async def test_关闭require_mention后无at也放行(monkeypatch):
+    """ONEBOT11_REQUIRE_MENTION=false 时, 群里所有消息都响应。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_REQUIRE_MENTION="false",
+    )
+    recorded: list = []
+
+    async def fake_handle(event):
+        recorded.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    await adapter._on_ws_event(_group_raw(888, at_self=False))
+    assert len(recorded) == 1
+
+
+async def test_require_mention不影响私聊(monkeypatch):
+    """私聊消息不受 require_mention 限制。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    recorded: list = []
+
+    async def fake_handle(event):
+        recorded.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    raw = {
+        "post_type": "message",
+        "message_type": "private",
+        "message_id": 1,
+        "user_id": 123,
+        "message": [{"type": "text", "data": {"text": "hi"}}],
+        "sender": {"nickname": "小明"},
+    }
+    await adapter._on_ws_event(raw)
+    assert len(recorded) == 1
 
 
 async def test_群白名单内群放行(monkeypatch):
