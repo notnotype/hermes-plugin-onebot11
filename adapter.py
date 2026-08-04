@@ -82,6 +82,12 @@ class OneBot11Adapter(BasePlatformAdapter):
         # 群白名单（空 = 不限制,所有群可用）
         raw_groups = os.getenv("ONEBOT11_ALLOWED_GROUPS") or extra.get("allowed_groups", "")
         self._allowed_groups = {g.strip() for g in str(raw_groups).split(",") if g.strip()}
+        logger.info(
+            "OneBot11: 群白名单=%s 私聊策略=%s 管理员=%s",
+            sorted(self._allowed_groups) or "全部群",
+            self.dm_policy,
+            sorted(self._admins) or "无(开放)",
+        )
 
         # 工具权限（管理员列表）
         raw_admins = os.getenv("ONEBOT11_ADMINS") or extra.get("admins", "")
@@ -138,7 +144,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                 return
         # 群白名单（空 = 不限制）
         if event.chat_type == "group" and self._allowed_groups and event.chat_id not in self._allowed_groups:
-            logger.debug("群 %s 不在白名单,忽略", event.chat_id)
+            logger.info("OneBot11: 群 %s 不在白名单,忽略消息", event.chat_id)
             return
         self._chat_types[event.chat_id] = event.chat_type
         await self.handle_message(await self._build_message_event(event))
