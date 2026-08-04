@@ -122,6 +122,10 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._ctx_max_chars = int(os.getenv("ONEBOT11_QUEUE_CONTEXT_CHARS") or extra.get("queue_context_chars", 1500))
         self._ctx_summarizer = None  # Task 8: LLM 摘要回调
 
+        # v2: admin-only 工具表(调用侧角色守卫;空 = 所有工具普通用户可用)
+        raw_adt = os.getenv("ONEBOT11_ADMIN_TOOLS") or extra.get("admin_tools", "")
+        self._admin_tools = {t.strip() for t in str(raw_adt).split(",") if t.strip()}
+
         logger.info(
             "OneBot11: 群白名单=%s 私聊策略=%s 管理员=%s 群聊@触发=%s",
             sorted(self._allowed_groups) or "全部群",
@@ -214,6 +218,17 @@ class OneBot11Adapter(BasePlatformAdapter):
             text = f"[{ev.user_name}] {text}"
         if group_context:
             text = f"[群聊上下文]\n{group_context}\n[当前消息]\n{text}"
+        # v2: 普通用户触发时注入角色说明(存在 admin 工具才提示,保持简短)
+        if (
+            ev.chat_type == "group"
+            and role_of(ev.user_id, self._admins) == "user"
+            and self._admin_tools
+        ):
+            text += (
+                "\n[权限:你是普通用户,仅管理员可用工具: "
+                + ", ".join(sorted(self._admin_tools))
+                + ";越权调用会被拒绝]"
+            )
 
         media_urls: list[str] = []
         media_types: list[str] = []
@@ -322,6 +337,10 @@ class OneBot11Adapter(BasePlatformAdapter):
             error = validate_tool_call(tool_name, args, ctx, self._admins)
             if error:
                 return f"拒绝调用: {error}"
+            # v2: 调用侧角色守卫(admin-only 工具表,越权返回权限错误给 LLM)
+            role_error = check_role_tool_call(tool_name, ctx, self._admins, self._admin_tools)
+            if role_error:
+                return f"拒绝调用: {role_error}"
             handler = _TOOL_HANDLERS[tool_name]
             try:
                 result = await handler(self._api, args, ctx)

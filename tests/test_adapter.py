@@ -187,6 +187,23 @@ async def test_私聊策略allowlist白名单外拒绝(monkeypatch):
     assert recorded == []
 
 
+def _fake_runner(adapter: OneBot11Adapter, user_id: str, chat_type: str, chat_id: str) -> None:
+    """给 adapter 挂一个假的 gateway runner,让 _resolve_tool_context 能取到会话来源。"""
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+
+    class _FakeRunner:
+        def _get_cached_session_source(self, session_id: str):
+            return SessionSource(
+                platform=Platform("onebot11"),
+                chat_id=chat_id,
+                chat_type=chat_type,
+                user_id=user_id,
+            )
+
+    adapter.gateway_runner = _FakeRunner()
+
+
 def _group_raw(group_id: int, text: str = "在吗", at_self: bool = True) -> dict:
     """构造群消息事件;at_self=True 时附带 @ 机器人段（测试用 SELF_ID=1）。"""
     message: list[dict] = []
@@ -306,6 +323,74 @@ async def test_require_mention不影响私聊(monkeypatch):
     }
     await adapter._on_ws_event(raw)
     assert len(recorded) == 1
+
+
+async def test_admin工具普通用户调用被拒(monkeypatch):
+    """admin-only 工具被普通用户调用时返回权限错误。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_ADMINS="10001",
+        ONEBOT11_ADMIN_TOOLS="qq_get_message",
+    )
+    _fake_runner(adapter, user_id="99999", chat_type="group", chat_id="888")
+    handler = adapter._make_tool_handler("qq_get_message")
+    result = await handler(args={}, task_id="t", session_id="s1", user_task="u")
+    assert "仅管理员可用" in result
+
+
+async def test_admin工具管理员调用放行(monkeypatch):
+    """admin-only 工具被管理员调用时越过角色守卫(走到 HTTP 调用)。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_ADMINS="10001",
+        ONEBOT11_ADMIN_TOOLS="qq_get_message",
+    )
+    _fake_runner(adapter, user_id="10001", chat_type="group", chat_id="888")
+    handler = adapter._make_tool_handler("qq_get_message")
+    result = await handler(args={}, task_id="t", session_id="s1", user_task="u")
+    assert "仅管理员可用" not in result  # 守卫放行;后续 HTTP 失败不算权限问题
+
+
+async def test_普通用户触发消息带角色提示(monkeypatch):
+    """存在 admin 工具时,普通用户触发消息注入角色说明。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_ADMINS="10001",
+        ONEBOT11_ADMIN_TOOLS="qq_ban_member",
+    )
+    recorded: list = []
+
+    async def fake_handle(event):
+        recorded.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    await adapter._on_ws_event(_group_raw(888, at_self=True))  # user_id=123 非管理员
+    assert "仅管理员可用工具" in recorded[0].text
+
+
+async def test_管理员触发消息不带角色提示(monkeypatch):
+    """管理员触发时不需要角色提示。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_ADMINS="123",
+        ONEBOT11_ADMIN_TOOLS="qq_ban_member",
+    )
+    recorded: list = []
+
+    async def fake_handle(event):
+        recorded.append(event)
+
+    monkeypatch.setattr(adapter, "handle_message", fake_handle)
+    await adapter._on_ws_event(_group_raw(888, at_self=True))  # user_id=123 是管理员
+    assert "仅管理员可用工具" not in recorded[0].text
 
 
 async def test_群白名单内群放行(monkeypatch):
