@@ -33,6 +33,8 @@ from onebot11.events import InboundEvent  # noqa: E402
 
 
 def _make_adapter(monkeypatch, **env) -> OneBot11Adapter:
+    # 默认用随机端口,避免与正在运行的网关(0.0.0.0:18880)撞端口
+    env.setdefault("ONEBOT11_WS_PORT", "0")
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     return OneBot11Adapter(PlatformConfig(enabled=True, extra={}))
