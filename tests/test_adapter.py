@@ -340,19 +340,21 @@ async def test_admin工具普通用户调用被拒(monkeypatch):
     assert "仅管理员可用" in result
 
 
-async def test_admin工具管理员调用放行(monkeypatch):
-    """admin-only 工具被管理员调用时越过角色守卫(走到 HTTP 调用)。"""
+async def test_admin工具管理员调用放行(monkeypatch, fake_http_server):
+    """admin-only 工具被管理员调用时越过角色守卫,正常执行。"""
+    base, calls = fake_http_server
     adapter = _make_adapter(
         monkeypatch,
-        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_HTTP_API=base,
         ONEBOT11_SELF_ID="1",
         ONEBOT11_ADMINS="10001",
         ONEBOT11_ADMIN_TOOLS="qq_get_message",
     )
     _fake_runner(adapter, user_id="10001", chat_type="group", chat_id="888")
     handler = adapter._make_tool_handler("qq_get_message")
-    result = await handler(args={}, task_id="t", session_id="s1", user_task="u")
-    assert "仅管理员可用" not in result  # 守卫放行;后续 HTTP 失败不算权限问题
+    result = await handler(args={"message_id": 1}, task_id="t", session_id="s1", user_task="u")
+    assert "仅管理员可用" not in result
+    assert calls and calls[0]["path"] == "/get_message"
 
 
 async def test_普通用户触发消息带角色提示(monkeypatch):
