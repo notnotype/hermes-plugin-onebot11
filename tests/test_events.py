@@ -4,7 +4,7 @@ events.py 返回自定义 InboundEvent（零 Hermes 依赖），由 adapter 层�
 Hermes 的 MessageEvent。群聊 chat_id=group_id、私聊 chat_id=user_id。
 """
 
-from onebot11.events import InboundEvent, build_inbound_event
+from onebot11.events import build_inbound_event
 
 
 def test_私聊消息事件():

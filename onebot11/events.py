@@ -63,8 +63,13 @@ def build_inbound_event(raw: dict, self_id: str | None) -> InboundEvent | None:
     if not user_id or not chat_id:
         return None
 
+    message_segments = raw.get("message")
+    if message_segments is None:
+        # 缺少 message 字段的畸形事件直接丢弃
+        return None
+
     reply_to_id: str | None = None
-    for seg in raw.get("message") or []:
+    for seg in message_segments or []:
         if seg.get("type") == "reply":
             reply_to_id = str(seg.get("data", {}).get("id", "")) or None
             break
