@@ -55,3 +55,21 @@ def validate_tool_call(
         return None
 
     return None
+
+
+def role_of(user_id: str, admins: set[str]) -> str:
+    """角色解析:管理员列表命中 = admin,否则 = user。"""
+    return "admin" if user_id in admins else "user"
+
+
+def check_role_tool_call(
+    tool_name: str, ctx: ToolContext, admins: set[str], admin_tools: set[str]
+) -> str | None:
+    """调用侧角色守卫:admin-only 工具被非管理员调用返回错误;None = 允许。
+
+    与 validate_tool_call 组合使用(先范围校验,再角色守卫)。admin_tools 为空时
+    所有工具对普通用户开放(向后兼容 v1 开放模式)。
+    """
+    if tool_name in admin_tools and ctx.user_id not in admins:
+        return "权限不足:该工具仅管理员可用"
+    return None
