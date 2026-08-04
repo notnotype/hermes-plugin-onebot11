@@ -124,7 +124,10 @@ async def test_入站群聊事件进入handle_message(monkeypatch):
         "message_id": 1001,
         "group_id": 888,
         "user_id": 123,
-        "message": [{"type": "text", "data": {"text": "在吗"}}],
+        "message": [
+            {"type": "at", "data": {"qq": "1"}},
+            {"type": "text", "data": {"text": "在吗"}},
+        ],
         "sender": {"card": "小明", "nickname": "真名"},
     }
     await adapter._on_ws_event(raw)
