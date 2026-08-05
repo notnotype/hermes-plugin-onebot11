@@ -1,56 +1,101 @@
-"""OneBot 11 消息段（array 格式）解析。
+"""OneBot 11 消息段解析（array 和 CQ 字符串）。
 
-v1 只支持 array 格式（messageFormat: array），CQ 字符串格式暂不支持。
-本模块零 Hermes 依赖，可独立测试。
+解析结果保留可展示的媒体/reply/未知段标记；原始 payload 由 adapter 另外限长保存，
+不把任意 OneBot JSON 直接拼进 Hermes prompt。
 """
 
 from __future__ import annotations
 
+import html
+import re
 from dataclasses import dataclass, field
+from typing import Any
+
+_CQ_RE = re.compile(r"\[CQ:([a-zA-Z0-9_]+)((?:,[^\]]*)?)\]")
 
 
 @dataclass
 class ParsedMessage:
-    """从消息段数组解析出的结构化结果。
-
-    - text: 所有 text 段拼接的纯文本（不含 at 段）
-    - images: 图片段列表（file 或 url，按出现顺序）
-    - mentioned_qq: 被 @ 的他人 QQ 号列表
-    - mentioned_self: 是否 @ 了机器人自己
-    """
+    """从消息段中提取正文、媒体和作用域相关标记。"""
 
     text: str = ""
     images: list[str] = field(default_factory=list)
     mentioned_qq: list[str] = field(default_factory=list)
     mentioned_self: bool = False
+    reply_to_message_id: str | None = None
+    markers: list[str] = field(default_factory=list)
+    segments: list[dict[str, Any]] = field(default_factory=list)
 
 
-def parse_message_segments(segments: list[dict] | str, self_id: str | None = None) -> ParsedMessage:
-    """把 OneBot 11 array 格式消息段解析为 ParsedMessage。
+def _unescape_cq(value: str) -> str:
+    """还原 CQ 字符串中的转义字符。"""
+    return html.unescape(value.replace("&#44;", ",").replace("&#91;", "[").replace("&#93;", "]"))
 
-    未知段类型（face/reply 等）静默忽略；字符串格式（CQ 码）抛
-    NotImplementedError（v1 只支持 array）。
-    """
+
+def parse_cq_string(value: str, self_id: str | None = None) -> list[dict[str, Any]]:
+    """把 CQ 字符串转换为与 array 相同的消息段列表。"""
+    segments: list[dict[str, Any]] = []
+    cursor = 0
+    for match in _CQ_RE.finditer(value):
+        if match.start() > cursor:
+            segments.append({"type": "text", "data": {"text": _unescape_cq(value[cursor:match.start()])}})
+        params: dict[str, str] = {}
+        raw_params = match.group(2).lstrip(",")
+        for item in raw_params.split(",") if raw_params else []:
+            if "=" in item:
+                key, raw = item.split("=", 1)
+                params[key] = _unescape_cq(raw)
+        segments.append({"type": match.group(1), "data": params})
+        cursor = match.end()
+    if cursor < len(value):
+        segments.append({"type": "text", "data": {"text": _unescape_cq(value[cursor:])}})
+    if not segments and value:
+        segments.append({"type": "text", "data": {"text": value}})
+    return segments
+
+
+def parse_message_segments(segments: list[dict[str, Any]] | str, self_id: str | None = None) -> ParsedMessage:
+    """解析 OneBot array/CQ 消息，未知段也保留有限标记。"""
     if isinstance(segments, str):
-        raise NotImplementedError("v1 只支持 array 消息格式,请把 messageFormat 设为 array")
+        segments = parse_cq_string(segments, self_id=self_id)
+    if not isinstance(segments, list):
+        raise ValueError("OneBot message 必须是 array 或 CQ 字符串")
 
     result = ParsedMessage()
-    for seg in segments or []:
-        seg_type = seg.get("type")
-        data = seg.get("data") or {}
+    for raw_segment in segments:
+        if not isinstance(raw_segment, dict):
+            result.markers.append("[onebot:invalid-segment]")
+            continue
+        seg_type = str(raw_segment.get("type") or "unknown")
+        data = raw_segment.get("data") or {}
+        if not isinstance(data, dict):
+            data = {}
+        result.segments.append({"type": seg_type, "data": {str(k): str(v) for k, v in data.items() if k != "url"}})
         if seg_type == "text":
-            result.text += data.get("text", "")
+            result.text += str(data.get("text") or "")
         elif seg_type == "at":
-            qq = str(data.get("qq", ""))
+            qq = str(data.get("qq") or "")
             if qq == "all":
-                continue
-            if self_id is not None and qq == str(self_id):
+                result.markers.append("[@all]")
+            elif self_id is not None and qq == str(self_id):
                 result.mentioned_self = True
-            else:
+            elif qq:
                 result.mentioned_qq.append(qq)
         elif seg_type == "image":
-            file_id = data.get("file") or data.get("url")
+            file_id = data.get("url") or data.get("file")
             if file_id:
                 result.images.append(str(file_id))
-        # 其余段类型（face/reply/record/video 等）v1 忽略
+                result.markers.append("[image]")
+        elif seg_type == "reply":
+            reply_id = str(data.get("id") or "")
+            if reply_id:
+                result.reply_to_message_id = reply_id
+                result.markers.append(f"[reply:{reply_id[:128]}]")
+        elif seg_type in {"file", "record", "video", "forward"}:
+            label = str(data.get("name") or data.get("file") or data.get("id") or "")[:128]
+            result.markers.append(f"[{seg_type}:{label}]" if label else f"[{seg_type}]")
+        elif seg_type != "unknown":
+            result.markers.append(f"[{seg_type}]")
+        else:
+            result.markers.append("[onebot:unknown]")
     return result

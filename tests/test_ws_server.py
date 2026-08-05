@@ -110,6 +110,27 @@ async def test_畸形JSON不崩(server):
     assert received == []
 
 
+async def test_事件处理失败关闭连接允许上游重放():
+    """事件未能持久化时关闭来源连接，避免消息静默丢失。"""
+    async def fail(_raw: dict) -> None:
+        raise RuntimeError("queue unavailable")
+
+    srv = ReverseWsServer(port=0, token="", on_event=fail)
+    await srv.start()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(f"http://127.0.0.1:{srv.port}/") as ws:
+                await _send_json(ws, {"post_type": "message", "message_id": 99, "user_id": 7})
+                message = await ws.receive(timeout=3)
+                assert message.type in {
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.ERROR,
+                }
+    finally:
+        await srv.stop()
+
+
 async def asyncio_sleep() -> None:
     import asyncio
 

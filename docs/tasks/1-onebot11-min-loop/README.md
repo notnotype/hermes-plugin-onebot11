@@ -1,7 +1,7 @@
 # OneBot 11 接入最小闭环
 
 - 关联 issue：[#1](https://github.com/notnotype/hermes-plugin-onebot11/issues/1)（待创建,依赖 GitHub 授权）
-- 状态：进行中
+- 状态：历史完成；当前合同由 [Task 2](../2-onebot11-reliability/README.md) 取代
 - 开始日期：2026-08-04
 
 ## 用户需求
@@ -62,7 +62,9 @@
   - 测试环境注意：shell 里若导出了 ONEBOT11_* 变量会影响测试,用 env -i 跑
   - hermes venv 补装了 pytest + pytest-asyncio（仅开发用）
 
-## 后续 TODO
+## 后续 TODO（历史记录）
+
+以下内容保留为最小闭环时期的记录；不要据此判断当前实现合同。当前队列、shared session、角色和 unknown 出站规则以 Task 2、[权限文档](../../permissions.md) 和 ADR 为准。
 
 - [ ] 用户重启 LLBot 后真机验证：3 个白名单群 @ 触发正常,非白名单群零响应
 - [ ] 在常用群 /sethome 设置 home channel（消除 📬 提示）

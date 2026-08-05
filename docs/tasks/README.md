@@ -8,4 +8,8 @@
 
 ## 当前 active 任务
 
-- [1-onebot11-min-loop](1-onebot11-min-loop/README.md)：OneBot 11 接入最小闭环（私聊+群聊、消息查询工具、权限管理）
+- [2-onebot11-reliability](2-onebot11-reliability/README.md)：共享 session、持久队列、触发器、权限门禁和可靠出站
+
+## 历史任务
+
+- [1-onebot11-min-loop](1-onebot11-min-loop/README.md)：OneBot 11 接入最小闭环；其旧的 per-user session 和管理员合同已被 Task 2 取代。

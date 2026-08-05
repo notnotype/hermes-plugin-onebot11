@@ -1,7 +1,5 @@
 """消息段解析测试：array 格式 → 纯文本 / 图片 / @ 提取。"""
 
-import pytest
-
 from onebot11.message import ParsedMessage, parse_message_segments
 
 
@@ -89,7 +87,10 @@ def test_空段返回空():
     assert result == ParsedMessage(text="", images=[], mentioned_qq=[], mentioned_self=False)
 
 
-def test_cq字符串格式暂不支持():
-    """v1 只支持 array 格式,字符串格式抛 NotImplementedError。"""
-    with pytest.raises(NotImplementedError):
-        parse_message_segments("你好[CQ:image,file=abc.jpg]")
+def test_cq字符串格式兼容():
+    """兼容 OneBot 常见 CQ 字符串并保留媒体标记。"""
+    result = parse_message_segments("你好[CQ:reply,id=7][CQ:image,file=abc.jpg]")
+    assert result.text == "你好"
+    assert result.images == ["abc.jpg"]
+    assert result.reply_to_message_id == "7"
+    assert "[reply:7]" in result.markers

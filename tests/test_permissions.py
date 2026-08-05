@@ -1,7 +1,16 @@
 """权限门禁测试：管理员列表 + 会话范围校验（群聊安全底线）。"""
 
 
-from onebot11.permissions import ToolContext, parse_admin_list, validate_tool_call
+import pytest
+
+from onebot11.permissions import (
+    CallerContext,
+    ToolContext,
+    TurnBinding,
+    TurnBindingStore,
+    parse_admin_list,
+    validate_tool_call,
+)
 
 
 def test_解析管理员列表():
@@ -24,12 +33,18 @@ def test_群历史工具私聊被拒():
     assert "群" in err
 
 
-def test_私聊历史非admin被拒():
-    """qq_get_friend_msg_history 非管理员拒绝。"""
+def test_群信息工具私聊被拒():
+    """群信息工具不能把私聊 QQ 号误当成群号。"""
+    ctx = ToolContext(user_id="123", chat_type="dm", chat_id="123")
+    assert validate_tool_call("qq_get_group_info", {}, ctx, set()) is not None
+    assert validate_tool_call("qq_get_group_member_info", {}, ctx, set()) is not None
+
+
+def test_私聊历史普通用户可用():
+    """普通用户默认允许当前私聊的只读查询。"""
     ctx = ToolContext(user_id="123", chat_type="dm", chat_id="123")
     err = validate_tool_call("qq_get_friend_msg_history", {}, ctx, {"999"})
-    assert err is not None
-    assert "管理员" in err
+    assert err is None
 
 
 def test_私聊历史admin在群聊被拒():
@@ -46,8 +61,8 @@ def test_私聊历史admin在私聊允许():
     assert validate_tool_call("qq_get_friend_msg_history", {}, ctx, {"999"}) is None
 
 
-def test_管理员列表为空时全部放开():
-    """admins 为空 = 所有已授权用户同权（开放模式）。"""
+def test_管理员列表为空时普通用户仍可读():
+    """超级管理员为空不隐式放开写权限；普通用户仍可读。"""
     ctx = ToolContext(user_id="123", chat_type="dm", chat_id="123")
     assert validate_tool_call("qq_get_friend_msg_history", {}, ctx, set()) is None
 
@@ -58,6 +73,16 @@ def test_查询单条消息普通可用():
     assert validate_tool_call("qq_get_message", {}, ctx, set()) is None
 
 
-def test_未知工具默认放行():
+def test_未知工具默认拒绝():
     ctx = ToolContext(user_id="123", chat_type="dm", chat_id="123")
-    assert validate_tool_call("qq_unknown", {}, ctx, set()) is None
+    assert validate_tool_call("qq_unknown", {}, ctx, set()) is not None
+
+
+def test_同一turn不可换绑调用者():
+    """精确 session/turn 绑定一旦建立就不能换成另一个目标。"""
+    store = TurnBindingStore()
+    first = CallerContext(user_id="1", chat_type="group", chat_id="888")
+    second = CallerContext(user_id="2", chat_type="group", chat_id="999")
+    store.bind(TurnBinding("session", "turn", first))
+    with pytest.raises(ValueError):
+        store.bind(TurnBinding("session", "turn", second))

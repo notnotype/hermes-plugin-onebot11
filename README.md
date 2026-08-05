@@ -5,10 +5,12 @@
 ## 它能做什么
 
 - **私聊**：和机器人一对一聊天,每条消息都会回复。
-- **群聊**：在群里 @ 机器人触发对话,整群共享一个对话上下文,发言前会自动带上昵称。
-- **图片**：收到的图片会存到本地,供 Hermes 的视觉能力使用。
-- **查消息**：提供几个查询工具,可以让它在群里查最近的消息记录、按消息 ID 查单条消息。
-- **权限控制**：管理员列表 + 会话范围校验——群里的机器人只能查它自己所在群的消息,查不到别的群,更查不到陌生人的私聊。
+- **群聊**：整群共享一个 Hermes session；允许的消息先进入持久 SQLite 队列，再由 @、关键词或显式 LLM trigger 触发一轮处理。
+- **处理指示器**：群 turn 认领后给触发消息添加 👀，Hermes turn 收尾时自动移除；没有真实消息 ID 或 QQ 框架不支持该扩展时按 best-effort 跳过，不影响回复。
+- **上下文**：队列有条数、字节数和单条消息上限，确认后形成滚动摘要，并保留最近消息原文。
+- **图片与消息段**：兼容 array/CQ 字符串，支持图片、reply、文件、语音、视频、转发和未知段标记；图片下载有 host、端口、类型、魔数和大小限制。
+- **工具与管理**：提供当前群/私聊范围内的查询工具，以及撤回、禁言、踢人、全员禁言工具。写操作只生成预览，必须由同一超级管理员在同一目标群发送短期确认命令。
+- **可靠性**：队列支持崩溃恢复、去重、lease heartbeat 和人工处理 `uncertain` 出站结果。OneBot 非幂等请求不自动重试，不承诺 exactly-once。
 
 ## 环境要求
 
@@ -59,15 +61,19 @@ hermes plugins install notnotype/hermes-plugin-onebot11
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `ONEBOT11_WS_PORT` | 18880 | 反向 WS 监听端口 |
+| `ONEBOT11_WS_HOST` | 127.0.0.1 | 反向 WS 监听地址；非 loopback 必须配置 token |
 | `ONEBOT11_ACCESS_TOKEN` | 空 | WS/HTTP 的 Bearer token,与框架侧一致 |
-| `ONEBOT11_HTTP_API` | `http://127.0.0.1:3000` | QQ 框架的 HTTP API 地址 |
-| `ONEBOT11_SELF_ID` | 空 | 机器人 QQ 号（识别群里的 @） |
-| `ONEBOT11_DM_POLICY` | open | 私聊策略：`open` / `allowlist` / `disabled` |
+| `ONEBOT11_HTTP_API` | YAML 可替代 | QQ 框架的 OneBot 11 HTTP API 地址（通常为 `http://127.0.0.1:3000`）；也可写入 `extra.http_api` |
+| `ONEBOT11_SELF_ID` | YAML 可替代 | 机器人 QQ 号（识别群里的 @）；也可写入 `extra.self_id` |
+| `ONEBOT11_DM_POLICY` | open | 私聊策略：`open` / `allowlist` / `disabled`；`open` 仍需显式 allow-all |
 | `ONEBOT11_ALLOWED_USERS` | 空 | 私聊白名单（逗号分隔的 QQ 号） |
 | `ONEBOT11_ALLOWED_GROUPS` | 空 | 群白名单（逗号分隔的群号;空 = 所有群可用） |
-| `ONEBOT11_REQUIRE_MENTION` | true | 群聊是否必须 @ 机器人 才响应 |
-| `ONEBOT11_ADMINS` | 空 | 管理员 QQ 列表（空 = 所有已授权用户同权） |
-| `ONEBOT11_HOME_CHANNEL` | 空 | 定时任务默认投递目标（群号或 QQ 号） |
+| `ONEBOT11_REQUIRE_MENTION` | true | 群聊是否必须 @ 机器人 才创建 trigger；未触发消息仍入队 |
+| `ONEBOT11_SUPER_ADMINS` | 空 | 超级管理员 QQ 列表；为空时写工具和管理命令全部 fail-closed |
+| `ONEBOT11_ADMINS` | 空 | `ONEBOT11_SUPER_ADMINS` 的兼容旧名 |
+| `ONEBOT11_ALLOW_ALL_USERS` | 空 | 明确允许 `dm_policy=open` 的私聊；也可使用 `GATEWAY_ALLOW_ALL_USERS=true` |
+| `ONEBOT11_QUEUE_DB` | Hermes home | SQLite 队列路径；未配置时使用 Hermes home 下的 `onebot11/queue.sqlite3` |
+| `ONEBOT11_HOME_CHANNEL` | 空 | 定时任务目标 ID；必须同时在 `platforms.onebot11.extra.home_channel_type` 指定 `group` 或 `dm` |
 
 启动网关时带上环境变量即可,例如：
 
@@ -78,13 +84,49 @@ ONEBOT11_SELF_ID=3101482118 \
 hermes gateway run
 ```
 
+队列、媒体和 LLM trigger 的高级参数放在 Hermes `config.yaml` 的
+`platforms.onebot11.extra` 中（不是环境变量）。默认值已经适合单实例运行；生产部署通常只需要指定持久队列路径、共享 session 合同和恢复参数：
+
+```yaml
+platforms:
+  onebot11:
+    extra:
+      session_mode: shared
+      group_sessions_per_user: false
+      queue_lease_seconds: 120
+      queue_recovery_poll_seconds: 5
+      queue_max_messages: 1000
+      queue_max_bytes: 2000000
+      queue_max_message_bytes: 32000
+      media_orphan_ttl_seconds: 86400
+      max_image_bytes: 8000000
+      max_image_total_bytes: 16000000
+      media_allowed_hosts: []   # 图片 URL 必须命中此列表；默认还允许 HTTP API host
+      media_allowed_ports: []   # 为空时使用 HTTP API 的端口
+      llm_trigger:
+        enabled: false
+        provider: ""
+        model: ""
+        groups: []
+      processing_reaction_enabled: true
+      processing_reaction_emoji_id: "128064"  # LLBot 的 👀
+```
+
+`queue_recovery_poll_seconds` 只负责发现已过期 lease，不会抢占仍有效的 lease。
+LLM trigger 默认关闭，启用时必须同时配置明确的旁路 `provider`、`model` 和群 allowlist；缺少模型、超时或返回非法 JSON 都按“不触发”处理。
+`media_orphan_ttl_seconds` 到期后由下一次 adapter 启动或 turn 收尾清理遗留媒体目录。
+`processing_reaction_enabled` 默认开启；它使用 LLBot 的 `set_msg_emoji_like` 扩展，只作用于群聊真实消息 ID。添加或移除 reaction 的未知结果不会重放 Agent turn，也不会阻断队列 ack。
+
 ## 权限说明
 
 群聊是 OneBot 11 的主要使用场景,权限分三层（详见 [docs/permissions.md](docs/permissions.md)）：
 
-1. **谁能对话**：群聊默认群里任何人都能 @ 机器人;私聊由 `ONEBOT11_DM_POLICY` 控制。
-2. **谁能用工具**：管理员列表（`ONEBOT11_ADMINS`）区分普通用户和管理员。
-3. **会话范围**：工具只能作用于发起会话本身——群里只能查本群消息。
+1. **谁能入队**：群消息先按 `allowed_groups` 判断；私聊必须满足 `allowlist`，或在 `open` 策略下显式配置 allow-all。
+2. **谁能用工具**：`super_admins` 对应超级管理员；普通用户默认只有当前目标范围内的只读工具。
+3. **会话范围**：工具和出站目标都绑定当前 `(session_id, turn_id)`，群里只能查/操作本群。
+4. **写操作**：模型第一次调用只返回 `/onebot confirm TOKEN`；确认命令在入站层执行，不进入 session 或队列。
+
+群级运维命令由超级管理员直接发送：`/onebot status`、`queue`、`flush`、`clear`、`pause`、`resume`、`resolve retry|discard` 和 `confirm TOKEN`。`clear` 不删除 Hermes session 历史；`uncertain` 和 `failed` 都不会自动重试，必须明确 resolve。
 
 ## 开发
 

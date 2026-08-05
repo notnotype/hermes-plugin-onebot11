@@ -3,6 +3,7 @@
 - [权限模型](permissions.md)：群聊为主场景的三层权限设计。
 - [调研](research/onebot11-hermes-survey.md)：OneBot 11 协议与 Hermes 适配器生态调研。
 - [任务](tasks/)：重大任务的 walkthrough（[规则](tasks/README.md) / [模板](tasks/TEMPLATE.md)）。
+- [ADR](adr/)：shared session、OneBot unknown 出站以及 lease/WS 可靠性边界的架构决策。
 
 ## 目录分工
 

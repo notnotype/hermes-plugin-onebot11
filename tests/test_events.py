@@ -4,7 +4,7 @@ events.py 返回自定义 InboundEvent（零 Hermes 依赖），由 adapter 层�
 Hermes 的 MessageEvent。群聊 chat_id=group_id、私聊 chat_id=user_id。
 """
 
-from onebot11.events import build_inbound_event
+from onebot11.events import build_inbound_event, normalize_auxiliary_event
 
 
 def test_私聊消息事件():
@@ -110,3 +110,48 @@ def test_通知事件返回None():
 def test_缺少message字段返回None():
     raw = {"post_type": "message", "message_type": "private", "message_id": 1, "user_id": 2}
     assert build_inbound_event(raw, self_id="3101482118") is None
+
+
+def test_缺少message_id时忽略时间戳生成稳定去重键():
+    """同一重放事件的时间字段变化不能造成第二条队列消息。"""
+    first = {
+        "post_type": "message",
+        "message_type": "group",
+        "group_id": 888,
+        "user_id": 123,
+        "time": 100,
+        "message": [{"type": "text", "data": {"text": "同一条"}}],
+    }
+    replay = {**first, "time": 101}
+    first_event = build_inbound_event(first, self_id="1")
+    replay_event = build_inbound_event(replay, self_id="1")
+    assert first_event is not None and replay_event is not None
+    assert first_event.message_id == replay_event.message_id
+
+
+def test_保留CQ原文供队列最近原文使用():
+    """CQ raw_message 进入受限原文字段，不依赖完整 raw payload。"""
+    raw = {
+        "post_type": "message",
+        "message_type": "group",
+        "message_id": 2006,
+        "group_id": 888,
+        "user_id": 123,
+        "raw_message": "[CQ:face,id=1]你好",
+        "message": "[CQ:face,id=1]你好",
+        "sender": {"nickname": "小明"},
+    }
+    event = build_inbound_event(raw, self_id="1")
+    assert event is not None
+    assert event.text == "你好"
+    assert event.raw_text == "[CQ:face,id=1]你好"
+
+
+def test_notice摘要按UTF8字节限制():
+    """辅助事件摘要的限制按存储字节而不是 Python 字符数计算。"""
+    event = normalize_auxiliary_event(
+        {"post_type": "notice", "notice_type": "group_upload", "group_id": 888, "time": "啊" * 1000},
+        limit=64,
+    )
+    assert event is not None
+    assert len(event.summary.encode("utf-8")) <= 64

@@ -10,7 +10,7 @@
   - HTTP POST：OneBot 做客户端,把事件 POST 到你的 URL。
   - 正向 WS：OneBot 做 WS 服务端。
   - 反向 WS：OneBot 做 WS 客户端,主动拨到你提供的 WS 服务端（**本插件采用**）。
-- 消息格式：字符串（CQ 码）或数组（消息段 `[{type,data}]`,**推荐,本插件只支持 array**）。
+- 消息格式：字符串（CQ 码）或数组（消息段 `[{type,data}]`）；本插件两者都兼容，并统一保留 reply/媒体/未知段标记。
 - 事件四类：message / notice / request / meta（lifecycle、heartbeat）。
 - API：`{"action","params","echo"}` JSON POST → `{"status","retcode","data","echo"}`。
 - 鉴权：`Authorization: Bearer <token>`。

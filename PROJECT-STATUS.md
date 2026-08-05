@@ -1,40 +1,58 @@
 # PROJECT-STATUS
 
-仓库级现状报告。TODO / 跟进事项一律开 GitHub Issue,不写进本文件。
+仓库级现状报告。实现变更通过分支和 PR 收口；本文只记录当前代码合同、验证证据和仍需外部联调的事项。
 
 ## 当前状态
 
-- **阶段**：首个功能已完成并合并（PR #2，Closes issue #1：OneBot 11 接入最小闭环）
-- **最近验证**：与真实 QQ 框架（LLBot 8.1.5,直连模式）联调已通；群白名单 + @ 触发已上线
-- **重点**：消息解析 → 反向 WS → HTTP 发送 → 工具与权限 → adapter 组装 → 联调（全部完成）
+- **阶段**：OneBot 11 可靠性与安全完善已实现本地闭环，并已完成 Arch + LLBot 指定白名单及群处理 reaction 指示器联调；尚未创建本轮 PR。
+- **核心合同**：群固定一个共享 session；群消息持久入队；触发后按 lease 启动单群单 turn；非幂等出站结果未知时进入 `uncertain`，不自动重放。
+- **本地验证**：协议/状态机测试通过；使用本地 Hermes 源码与其 site-packages 运行 adapter 测试通过。最终门禁命令和环境见“验证证据”。
 
 ## 模块状态
 
-| 模块 | 状态 | 说明 |
+| 模块 | 状态 | 当前合同 |
 |---|---|---|
-| onebot11/message.py | 完成 | array 消息段解析（文本/图片/@,CQ 字符串格式显式不支持） |
-| onebot11/events.py | 完成 | OneBot 事件 → InboundEvent（群聊 chat_id=group_id、私聊=user_id） |
-| onebot11/ws_server.py | 完成 | 反向 WS 服务端（Bearer 校验、heartbeat 忽略） |
-| onebot11/http_api.py | 完成 | HTTP 发送与动作调用（重试、分块、reply 段、图片下载） |
-| onebot11/tools.py | 完成 | 平台工具（消息查询 x3,toolset onebot11） |
-| onebot11/permissions.py | 完成 | 权限模型（管理员列表 + 会话范围校验;v1.1 预留群角色） |
-| adapter.py | 完成 | 适配器主类 + register（群白名单、@ 触发、私聊策略） |
-| plugin.yaml | 完成 | 插件元数据（name=onebot11-platform,kind=platform） |
+| `onebot11/message.py` | 完成 | array/CQ 字符串解析，保留 text、媒体、reply、文件/语音/视频/转发/未知段标记 |
+| `onebot11/events.py` | 完成 | message 事件归一化；自身回传过滤；notice/request/lifecycle 只做限长统计摘要 |
+| `onebot11/ws_server.py` | 完成 | token、loopback 默认、有界接收队列、同 chat 顺序、全局 inflight、失败关闭连接促使上游重放 |
+| `onebot11/http_api.py` | 完成 | 查询有限重试；发送/管理/reaction 写永不自动重试；有符号 message_id；超时、429/5xx、非 JSON、超大响应分类；媒体 SSRF/类型/大小限制 |
+| `onebot11/queue.py` | 完成 | SQLite WAL、schema 迁移、持久去重、批量 lease、heartbeat、摘要、tombstone、uncertain 人工 resolve |
+| `onebot11/dispatch.py` | 完成 | 每群最多一个活动 turn，恢复触发请求，暂停/恢复和失败状态转换 |
+| `onebot11/triggers.py` | 完成 | @、关键词、always、冷却纯函数；LLM trigger 显式群 allowlist + 旁路 provider/model |
+| `onebot11/permissions.py` | 完成 | `CallerContext`、`ChatTarget`、精确 `(session_id, turn_id)` binding、角色工具并集、fail-closed |
+| `onebot11/tools.py` | 完成 | 当前群/私聊范围查询和群管理写工具；写操作必须确认 |
+| `adapter.py` | 完成 | Hermes glue、shared session、入站访问策略、hooks、工具 handler、群 turn 👀 指示器、出站生命周期和媒体回收 |
+| 文档/ADR | 完成 | README、权限、状态、任务 walkthrough 和两项架构决策同步到当前合同 |
 
-## 联调状态（LLBot 生产环境）
+## 验证证据
 
-- Hermes 网关 3 平台在线,反向 WS 连接成功,事件上报正常
-- 群白名单 ONEBOT11_ALLOWED_GROUPS=1072992996,287447372,976967537（白名单外群消息过滤,INFO 日志可观测）
-- 群聊 @ 触发 ONEBOT11_REQUIRE_MENTION=true（默认开;未 @ 机器人的群消息忽略）
-- 会话模型：群里每用户独立会话（group_sessions_per_user 默认 true,对齐 Telegram/Discord）
-- 发送路径：Hermes → http://127.0.0.1:3000（LLBot ob11 HTTP,compose 映射 3000）
+- `.venv\\Scripts\\python.exe -m pytest -q`：`93 passed, 1 skipped`；没有 Hermes 依赖的环境会跳过 adapter 集成文件。
+- 使用本地 Hermes 实例的源码和 site-packages：全套测试 `134 passed`，覆盖 adapter hooks、工具注册、共享队列、身份绑定、shared session key、媒体清理、出站 unknown、负数 message_id 和 reaction 生命周期。
+- `.venv\\Scripts\\python.exe -m ruff check .`：通过。
+- 真实 Hermes 临时 `HERMES_HOME` 注册 smoke：已确认平台、9 个工具、4 个安全 hooks 和 `onebot11_trigger` auxiliary 均注册，并验证真实 Gateway auth/session/tool 调用链。
 
-## 风险
+## 外部联调状态
 
-- 权限系统待重设计（调研 Discord/Telegram 后）：白名单群用户不可信任,不放开 shell/管理工具
-- 出站侧白名单拦截（可选加固）:非白名单群目标的发送目前只靠会话清理兜底
-- 反向 WS 依赖 Hermes 侧常驻服务,LLBot 断线自动重拨
+2026-08-05 在 Arch `192.168.1.18` 使用真实 Hermes 0.20 + LLBot 8.1.5 direct compose 完成指定白名单联调。机器人 QQ 为 `3101482118`，唯一允许群为 `1072992996`，唯一允许私聊用户为 `2056963663`；Hermes/LLBot WS 与 HTTP token 已配置一致且未记录在文档中。
 
-## 近期任务
+已确认：
 
-- 见 [docs/tasks/](docs/tasks/) 的 active task walkthrough（Task 13 收尾已完成:合并、删分支、文档）
+- Hermes 实际加载当前 0.2.0 插件，`session=shared`，WS 监听和 LLBot 反向 WS 自动重连均成功。
+- OneBot `get_login_info`、目标群/用户查询、群消息和私聊测试发送均返回 `retcode=0`，出站目标只有上述群和用户。
+- 通过真实 WS 服务注入允许群 @ 事件，消息进入持久 SQLite 队列，Agent 回复 `OneBot11联调成功` 并成功发回目标群；允许用户私聊回复 `OneBot11私聊成功`。
+- 不带 @ 的消息在 pending 中持久化；重启 Hermes 后仍在队列，管理员 `flush` 后完成处理并清空消息/trigger。
+- 真实 LLBot 上报的其他群消息和合成的非白名单私聊均被拒绝并写入审计；没有产生出站。
+- 在指定群用真实消息 ID `-71496113` 完成 reaction smoke：`set=true` 后收到 Hermes 群回复，再发送 `set=false`；`fetch_emoji_like` 返回空列表，确认 👀 已清理。
+
+仍需单独完成：
+
+- 以上 Agent 入站事件使用了真实反向 WS 的合成 OneBot payload，不等同于 QQ 客户端真人发言；还未完成两名真人群成员同时触发时的外部观察。
+- 群管理写工具的预览/确认、非幂等出站断线后的 `uncertain` 与人工 resolve 尚未在真实 QQ 上执行；本地测试覆盖了状态机。
+- 未在本轮使用 NapCat，也未把 WS 重连重放行为提升为协议保证。
+
+## 约束与取舍
+
+- `onebot11/` 保持零 Hermes 依赖；只有根目录 `adapter.py` 依赖 Hermes gateway。
+- 消息处理是至少一次语义；OneBot 11 非幂等请求无法提供 exactly-once，因此未知结果不自动重试。
+- 不自动迁移旧的群 `per_user` session 历史到新的 shared session；需要人工决定是否清理旧历史。
+- 本轮不纳入 OneBot 12、语音转写、群级热更新、复杂管理后台和强制语义摘要模型。
