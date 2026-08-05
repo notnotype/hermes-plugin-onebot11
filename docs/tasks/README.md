@@ -9,6 +9,7 @@
 ## 当前 active 任务
 
 - [2-onebot11-reliability](2-onebot11-reliability/README.md)：共享 session、持久队列、触发器、权限门禁和可靠出站
+- [3-onebot11-trigger-spike](3-onebot11-trigger-spike/README.md)：分层触发与活跃窗口 spike
 
 ## 历史任务
 
