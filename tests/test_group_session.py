@@ -51,3 +51,19 @@ def test_群会话默认一群一会话(monkeypatch):
 def test_开启per_user后同群不同用户不同key(monkeypatch):
     adapter = _make_adapter_shared(monkeypatch, ONEBOT11_GROUP_SESSIONS_PER_USER="true")
     assert _key_for(adapter, "1") != _key_for(adapter, "2")
+
+
+def test_config_yaml字符串布尔正确解析():
+    """config.yaml 部署时 extra 里是字符串 'false',必须解析为 False(一群一会话)。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "group_sessions_per_user": "false",
+            },
+        )
+    )
+    assert adapter._group_sessions_per_user is False
+    assert _key_for(adapter, "1") == _key_for(adapter, "2")

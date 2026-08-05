@@ -91,12 +91,16 @@ class OneBot11Adapter(BasePlatformAdapter):
         raw_groups = os.getenv("ONEBOT11_ALLOWED_GROUPS") or extra.get("allowed_groups", "")
         self._allowed_groups = {g.strip() for g in str(raw_groups).split(",") if g.strip()}
 
-        # 群聊 @ 触发（默认开启,对齐 Telegram require_mention 语义）
+        # 群聊 @ 触发（默认开启,对齐 Telegram require_mention 语义;v0.2 起废弃,仅保留向后兼容解析）
         raw_rm = os.getenv("ONEBOT11_REQUIRE_MENTION")
         if raw_rm is not None:
             self.require_mention = raw_rm.strip().lower() in {"true", "1", "yes", "on"}
         else:
-            self.require_mention = bool(extra.get("require_mention", True))
+            raw_extra = extra.get("require_mention", True)
+            if isinstance(raw_extra, str):
+                self.require_mention = raw_extra.strip().lower() in {"true", "1", "yes", "on"}
+            else:
+                self.require_mention = bool(raw_extra)
 
         # 工具权限（管理员列表）
         raw_admins = os.getenv("ONEBOT11_ADMINS") or extra.get("admins", "")
@@ -107,8 +111,13 @@ class OneBot11Adapter(BasePlatformAdapter):
         if raw_gspu is not None:
             self._group_sessions_per_user = raw_gspu.strip().lower() in {"true", "1", "yes", "on"}
         else:
-            self._group_sessions_per_user = bool(extra.get("group_sessions_per_user", False))
-        # base.handle_message 直接读 config.extra;必须是真布尔("false" 字符串是 truthy)
+            # extra 可能来自 env_enablement 的字符串 seed("false" 是 truthy,须按字符串解析)
+            raw_extra = extra.get("group_sessions_per_user", False)
+            if isinstance(raw_extra, str):
+                self._group_sessions_per_user = raw_extra.strip().lower() in {"true", "1", "yes", "on"}
+            else:
+                self._group_sessions_per_user = bool(raw_extra)
+        # base.handle_message 直接读 config.extra;必须是真布尔
         self.config.extra["group_sessions_per_user"] = self._group_sessions_per_user
 
         # v2: 消息队列 + 触发策略 + 上下文参数
