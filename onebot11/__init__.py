@@ -14,10 +14,23 @@ from . import (
     triggers,
     ws_server,
 )
-from .context import build_agent_context
+from .context import build_agent_context, build_dynamic_context, build_queue_batch_summary
 from .dispatch import ActiveTurn, GroupDispatcher
 from .message import ParsedMessage, parse_message_segments
-from .permissions import CallerContext, ChatTarget, TurnBinding, TurnBindingStore
+from .permissions import (
+    ALL_TOOLS,
+    CONFIG_READ_TOOLS,
+    CONFIG_WRITE_TOOLS,
+    CallerContext,
+    ChatTarget,
+    TurnBinding,
+    TurnBindingStore,
+    build_role_tools,
+    build_trusted_users,
+    is_onebot_tool_name,
+    parse_exact_tool_names,
+    role_for_user,
+)
 from .queue import QueueLease, QueueMessage, QueueStore, TriggerRequest
 
 __all__ = [
@@ -46,4 +59,14 @@ __all__ = [
     "ActiveTurn",
     "GroupDispatcher",
     "build_agent_context",
+    "build_queue_batch_summary",
+    "build_dynamic_context",
+    "ALL_TOOLS",
+    "CONFIG_READ_TOOLS",
+    "CONFIG_WRITE_TOOLS",
+    "build_role_tools",
+    "build_trusted_users",
+    "is_onebot_tool_name",
+    "parse_exact_tool_names",
+    "role_for_user",
 ]

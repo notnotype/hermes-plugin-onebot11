@@ -59,6 +59,36 @@ TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "properties": {"enable": {"type": "boolean", "description": "是否开启全员禁言"}},
         "required": ["enable"],
     },
+    "onebot_get_permissions": {
+        "type": "object",
+        "properties": {},
+    },
+    "onebot_set_role_tools": {
+        "type": "object",
+        "properties": {
+            "role": {
+                "type": "string",
+                "enum": ["user", "trusted_user", "super_admin"],
+            },
+            "tools": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "精确工具名列表，不支持 wildcard 或 toolset 名",
+            },
+        },
+        "required": ["role", "tools"],
+    },
+    "onebot_set_trusted_users": {
+        "type": "object",
+        "properties": {
+            "users": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "trusted_user 的 QQ 号列表",
+            },
+        },
+        "required": ["users"],
+    },
 }
 
 READ_TOOL_NAMES = frozenset(
@@ -68,6 +98,7 @@ READ_TOOL_NAMES = frozenset(
         "qq_get_friend_msg_history",
         "qq_get_group_info",
         "qq_get_group_member_info",
+        "onebot_get_permissions",
     }
 )
 WRITE_TOOL_NAMES = frozenset(set(TOOL_SCHEMAS) - set(READ_TOOL_NAMES))

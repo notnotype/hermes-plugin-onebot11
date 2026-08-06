@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import copy
 import hashlib
 import inspect
 import json
@@ -16,6 +17,7 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Mapping
@@ -51,6 +53,8 @@ TurnBindingStore = _proto.TurnBindingStore
 WRITE_TOOLS = _proto.permissions.WRITE_TOOLS
 READ_ONLY_TOOLS = _proto.permissions.READ_ONLY_TOOLS
 ALL_TOOLS = _proto.permissions.ALL_TOOLS
+CONFIG_READ_TOOLS = _proto.permissions.CONFIG_READ_TOOLS
+CONFIG_WRITE_TOOLS = _proto.permissions.CONFIG_WRITE_TOOLS
 build_inbound_event = _proto.events.build_inbound_event
 normalize_auxiliary_event = _proto.events.normalize_auxiliary_event
 OneBotApiError = _proto.http_api.OneBotApiError
@@ -63,7 +67,11 @@ AuditLog = _proto.audit.AuditLog
 ConfirmationStore = _proto.confirm.ConfirmationStore
 ToolContext = _proto.permissions.ToolContext
 build_role_tools = _proto.permissions.build_role_tools
+build_trusted_users = _proto.permissions.build_trusted_users
+permission_config = _proto.permissions.permission_config
 parse_admin_list = _proto.permissions.parse_admin_list
+parse_exact_tool_names = _proto.permissions.parse_exact_tool_names
+is_onebot_tool_name = _proto.permissions.is_onebot_tool_name
 parse_bool = _proto.permissions.parse_bool
 parse_id_list = _proto.permissions.parse_id_list
 role_for_user = _proto.permissions.role_for_user
@@ -81,6 +89,7 @@ WRITE_TOOL_NAMES = _proto.tools.WRITE_TOOL_NAMES
 build_trigger_config = _proto.triggers.build_trigger_config
 build_llm_trigger_input = _proto.triggers.build_llm_trigger_input
 build_agent_context = _proto.context.build_agent_context
+build_dynamic_context = _proto.context.build_dynamic_context
 should_trigger = _proto.triggers.should_trigger
 ReverseWsServer = _proto.ws_server.ReverseWsServer
 
@@ -165,7 +174,7 @@ def _caller_from_metadata(value: Any) -> CallerContext | None:
         return None
     if lease_id and not adapter._lease_matches_target(lease_id, chat_type, chat_id):
         return None
-    role = role_for_user(user_id, adapter.super_admins)
+    role = role_for_user(user_id, adapter.super_admins, adapter.trusted_users)
     return CallerContext(
         user_id=user_id,
         chat_type=chat_type,
@@ -241,6 +250,7 @@ class OneBot11Adapter(BasePlatformAdapter):
             raw_super_admins = extra.get("admins")
         self.super_admins = parse_id_list(raw_super_admins)
         self.role_tools = build_role_tools(extra)
+        self.trusted_users = build_trusted_users(extra)
         self._processing_reaction_enabled = parse_bool(
             extra.get("processing_reaction_enabled"),
             default=True,
@@ -281,6 +291,14 @@ class OneBot11Adapter(BasePlatformAdapter):
         queue_path = os.getenv("ONEBOT11_QUEUE_DB") or extra.get("queue_db_path")
         if not queue_path:
             queue_path = str(self._hermes_home / "onebot11" / "queue.sqlite3")
+        self._agent_input_bytes = max(
+            4_096,
+            min(256 * 1024, int(extra.get("agent_input_bytes", 64 * 1024))),
+        )
+        self._agent_recent_originals = max(
+            0,
+            int(extra.get("agent_recent_originals", extra.get("queue_recent_originals", 3))),
+        )
         self._queue = QueueStore(
             queue_path,
             max_messages=int(extra.get("queue_max_messages", 1000)),
@@ -288,12 +306,12 @@ class OneBot11Adapter(BasePlatformAdapter):
             max_message_bytes=int(extra.get("queue_max_message_bytes", 32_000)),
             max_original_bytes=int(extra.get("queue_max_original_bytes", 8_000)),
             max_summary_bytes=int(extra.get("queue_max_summary_bytes", 16_000)),
-            recent_originals=int(extra.get("queue_recent_originals", 3)),
+            recent_originals=int(
+                extra.get("queue_recent_originals", self._agent_recent_originals)
+            ),
             dedupe_ttl_seconds=float(extra.get("queue_dedupe_ttl_seconds", 7 * 24 * 3600)),
             max_attempts=int(extra.get("queue_max_attempts", 3)),
         )
-        self._agent_input_bytes = max(4_096, min(256 * 1024, int(extra.get("agent_input_bytes", 64 * 1024))))
-        self._agent_recent_originals = max(0, int(extra.get("agent_recent_originals", 3)))
         self._dispatcher = GroupDispatcher(
             self._queue,
             self._start_queue_turn,
@@ -303,6 +321,7 @@ class OneBot11Adapter(BasePlatformAdapter):
             on_lease_lost=self._on_lease_lost,
         )
         self._bindings = TurnBindingStore()
+        self._config_write_lock = threading.RLock()
         self._confirmations = ConfirmationStore(float(extra.get("confirm_ttl_seconds", 60)))
         audit_path = extra.get("audit_path") or (
             str(self._hermes_home / "onebot11" / "audit.jsonl")
@@ -437,10 +456,12 @@ class OneBot11Adapter(BasePlatformAdapter):
             self._targets[event.chat_id] = target
         self._chat_types[event.chat_id] = event.chat_type
 
-        if event.text.strip().startswith("/onebot"):
+        if event.text.strip().split(maxsplit=1)[0].casefold() == "/onebot":
             await self._handle_admin_command(event)
             return
         if event.chat_type == "group":
+            if await self._handle_group_slash_command(event):
+                return
             await self._enqueue_group_event(event)
             return
         message_event = await self._build_message_event(event)
@@ -767,7 +788,7 @@ class OneBot11Adapter(BasePlatformAdapter):
             if not messages:
                 return
             prompt = build_llm_trigger_input(
-                str(status.get("summary") or ""),
+                "",
                 messages,
                 self.trigger_config.llm_input_bytes,
             )
@@ -825,7 +846,7 @@ class OneBot11Adapter(BasePlatformAdapter):
     def _caller_for_event(self, source: Any, *, lease_id: str | None = None) -> CallerContext:
         """按当前入站消息解析角色和允许工具集合。"""
         user_id = str(source.user_id or "")
-        role = role_for_user(user_id, self.super_admins)
+        role = role_for_user(user_id, self.super_admins, self.trusted_users)
         return CallerContext(
             user_id=user_id,
             chat_type=str(source.chat_type),
@@ -835,6 +856,24 @@ class OneBot11Adapter(BasePlatformAdapter):
             lease_id=lease_id,
         )
 
+    def _tool_allowed_now(self, caller: CallerContext, tool_name: str) -> bool:
+        """检查当前配置是否仍允许工具；撤销权限立即作用于后续调用。"""
+        current_role = role_for_user(
+            caller.user_id,
+            self.super_admins,
+            self.trusted_users,
+        )
+        return current_role == caller.role and str(tool_name) in self.role_tools.get(
+            current_role, frozenset()
+        )
+
+    def _permission_snapshot(self) -> dict[str, Any]:
+        """返回当前角色权限快照，供管理工具和 slash command 展示。"""
+        extra = self.config.extra if isinstance(self.config.extra, Mapping) else {}
+        snapshot = permission_config(extra)
+        snapshot["super_admins"] = sorted(self.super_admins)
+        return snapshot
+
     async def _start_queue_turn(self, lease: QueueLease) -> None:
         """将 lease 批量编排为一个 synthetic user turn，保持 caller/target 绑定。"""
         if not self._chat_access_allowed("group", lease.chat_id):
@@ -842,7 +881,11 @@ class OneBot11Adapter(BasePlatformAdapter):
         if not await asyncio.to_thread(self._queue.mark_agent_started, lease):
             raise PermissionError("OneBot11 queue lease 已失效")
         trigger = lease.trigger
-        role = role_for_user(trigger.caller_user_id, self.super_admins)
+        role = role_for_user(
+            trigger.caller_user_id,
+            self.super_admins,
+            self.trusted_users,
+        )
         caller = CallerContext(
             user_id=trigger.caller_user_id,
             chat_type="group",
@@ -1338,6 +1381,15 @@ class OneBot11Adapter(BasePlatformAdapter):
         """包装工具 handler，执行角色/作用域硬校验和写操作确认。"""
 
         async def wrapped(args: dict[str, Any], **kwargs: Any) -> str:
+            requested_platform = _platform_value(kwargs.get("platform"))
+            if requested_platform and requested_platform != _PLATFORM_NAME:
+                return json.dumps(
+                    {
+                        "status": "permission_error",
+                        "error": "OneBot11 工具不能从其他 platform turn 调用",
+                    },
+                    ensure_ascii=False,
+                )
             session_id = kwargs.get("session_id")
             turn_id = kwargs.get("turn_id")
             binding = self._resolve_binding(session_id, turn_id) if turn_id else self._binding_from_context()
@@ -1375,6 +1427,19 @@ class OneBot11Adapter(BasePlatformAdapter):
                     {"status": "permission_error", "error": "当前目标不再满足访问策略"},
                     ensure_ascii=False,
                 )
+            if not self._tool_allowed_now(caller, tool_name):
+                error = f"角色 {caller.role} 当前无权调用 {tool_name}"
+                self._audit.record(
+                    "permission_denied",
+                    {
+                        "tool": tool_name,
+                        "user_id": caller.user_id,
+                        "chat_type": caller.chat_type,
+                        "chat_id": caller.chat_id,
+                        "reason": error,
+                    },
+                )
+                return json.dumps({"status": "permission_error", "error": error}, ensure_ascii=False)
             error = validate_tool_call(tool_name, args, caller, self.super_admins)
             if error:
                 self._audit.record(
@@ -1399,7 +1464,12 @@ class OneBot11Adapter(BasePlatformAdapter):
                     )
                     self._audit.record("preview", {"tool": tool_name, "user_id": caller.user_id, "chat_type": caller.chat_type, "chat_id": caller.chat_id, "params": {key: str(value)[:128] for key, value in args.items()}})
                     return json.dumps({"status": "confirmation_required", "command": f"/onebot confirm {confirmation.token}", "tool": tool_name}, ensure_ascii=False)
-                result = await _TOOL_HANDLERS[tool_name](self._api, args, caller)
+                if tool_name == "onebot_get_permissions":
+                    result = {"status": "ok", **self._permission_snapshot()}
+                elif tool_name in _TOOL_HANDLERS:
+                    result = await _TOOL_HANDLERS[tool_name](self._api, args, caller)
+                else:
+                    result = {"status": "permission_error", "error": "OneBot11 工具未注册"}
                 return json.dumps(result, ensure_ascii=False, default=str)
             except OneBotApiError as exc:
                 if exc.unknown_outcome and binding.lease_id:
@@ -1431,6 +1501,69 @@ class OneBot11Adapter(BasePlatformAdapter):
             separators=(",", ":"),
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _save_permission_change(self, tool_name: str, params: Mapping[str, Any]) -> dict[str, Any]:
+        """串行执行权限配置读改写，避免同进程管理员更新互相覆盖。"""
+        with self._config_write_lock:
+            return self._save_permission_change_unlocked(tool_name, params)
+
+    def _save_permission_change_unlocked(
+        self, tool_name: str, params: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """只修改 Hermes YAML 的 platforms.onebot11.extra.roles 子树。"""
+        try:
+            from hermes_cli.config import atomic_config_write, get_config_path, read_user_config_raw
+
+            raw_config = read_user_config_raw()
+            if not isinstance(raw_config, dict):
+                raw_config = {}
+            platforms = raw_config.setdefault("platforms", {})
+            if not isinstance(platforms, dict):
+                raise ValueError("config.yaml 的 platforms 必须是 mapping")
+            platform = platforms.setdefault("onebot11", {})
+            if not isinstance(platform, dict):
+                raise ValueError("config.yaml 的 platforms.onebot11 必须是 mapping")
+            extra = platform.setdefault("extra", {})
+            if not isinstance(extra, dict):
+                raise ValueError("config.yaml 的 platforms.onebot11.extra 必须是 mapping")
+            roles = extra.setdefault("roles", {})
+            if not isinstance(roles, dict):
+                raise ValueError("config.yaml 的 roles 必须是 mapping")
+
+            if tool_name == "onebot_set_role_tools":
+                role = str(params.get("role") or "").strip()
+                if role not in {"user", "trusted_user", "super_admin"}:
+                    raise ValueError("role 必须是 user、trusted_user 或 super_admin")
+                tools = parse_exact_tool_names(
+                    params.get("tools"),
+                    name=f"roles.{role}.tools",
+                )
+                role_entry = roles.setdefault(role, {})
+                if not isinstance(role_entry, dict):
+                    raise ValueError(f"roles.{role} 必须是 mapping")
+                role_entry["tools"] = sorted(tools)
+                changed = {"role": role, "tools": sorted(tools)}
+            elif tool_name == "onebot_set_trusted_users":
+                users = sorted(parse_id_list(params.get("users")))
+                role_entry = roles.setdefault("trusted_user", {})
+                if not isinstance(role_entry, dict):
+                    raise ValueError("roles.trusted_user 必须是 mapping")
+                role_entry["users"] = users
+                changed = {"trusted_users": users}
+            else:
+                return {"status": "permission_error", "error": "未知权限配置工具"}
+
+            atomic_config_write(get_config_path(), raw_config)
+        except (ImportError, OSError, TypeError, ValueError) as exc:
+            return {"status": "error", "error": f"权限配置保存失败: {str(exc)[:300]}"}
+
+        current_extra = self.config.extra if isinstance(self.config.extra, dict) else {}
+        current_extra.setdefault("roles", {})
+        current_extra["roles"] = copy.deepcopy(raw_config["platforms"]["onebot11"]["extra"]["roles"])
+        self.config.extra = current_extra
+        self.role_tools = build_role_tools(current_extra)
+        self.trusted_users = build_trusted_users(current_extra)
+        return {"status": "ok", "changed": changed, "effective_next_turn": True}
 
     async def _execute_confirmed(self, confirmation: Any) -> dict[str, Any]:
         """执行已经由直接管理命令消费的确认令牌。"""
@@ -1504,7 +1637,18 @@ class OneBot11Adapter(BasePlatformAdapter):
             )
             return {"status": "permission_error", "error": "当前操作者或目标已不再授权"}
         try:
-            result = await handle_write_action(self._api, confirmation.tool_name, dict(confirmation.params), caller)
+            if confirmation.tool_name in CONFIG_WRITE_TOOLS:
+                result = self._save_permission_change(
+                    confirmation.tool_name,
+                    dict(confirmation.params),
+                )
+            else:
+                result = await handle_write_action(
+                    self._api,
+                    confirmation.tool_name,
+                    dict(confirmation.params),
+                    caller,
+                )
         except OneBotApiError as exc:
             result = {"status": "unknown" if exc.unknown_outcome else "error", "error": str(exc)}
             if exc.unknown_outcome:
@@ -1568,7 +1712,10 @@ class OneBot11Adapter(BasePlatformAdapter):
                 if event.chat_type != "group":
                     await self._send_direct(event, "status/queue 只能作用于当前群队列")
                     return
-                await self._send_direct(event, json.dumps(self._queue.status(chat_id), ensure_ascii=False))
+                status = self._queue.status(chat_id)
+                status.pop("summary", None)
+                status["chat_type"] = event.chat_type
+                await self._send_direct(event, json.dumps(status, ensure_ascii=False))
             elif command == "flush":
                 if event.chat_type != "group":
                     await self._send_direct(event, "flush 只能作用于当前群队列")
@@ -1625,6 +1772,62 @@ class OneBot11Adapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("OneBot11 管理命令失败", exc_info=True)
             await self._send_direct(event, f"命令失败: {type(exc).__name__}: {str(exc)[:200]}")
+
+    async def _handle_group_slash_command(self, event: _proto.events.InboundEvent) -> bool:
+        """在入队前处理群只读 slash command，返回是否已消费。"""
+        text = event.text.strip()
+        if not text.startswith("/"):
+            return False
+        command = text.split(maxsplit=1)[0].casefold()
+        if command in {"/help", "/commands"}:
+            await self._send_direct(
+                event,
+                "群命令: /context 查看待处理上下文；/status 查看队列状态；"
+                "/whoami 查看身份；/help 查看命令。管理操作使用 /onebot。",
+            )
+            return True
+        if command == "/whoami":
+            caller = self._caller_for_event(event)
+            await self._send_direct(
+                event,
+                json.dumps(
+                    {
+                        "user_id": caller.user_id,
+                        "chat_type": caller.chat_type,
+                        "chat_id": caller.chat_id,
+                        "role": caller.role,
+                        "allowed_tools": sorted(caller.allowed_tools),
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+            return True
+        if command == "/status":
+            status = await asyncio.to_thread(self._queue.status, event.chat_id)
+            status.pop("summary", None)
+            status["chat_type"] = event.chat_type
+            await self._send_direct(event, json.dumps(status, ensure_ascii=False))
+            return True
+        if command == "/context":
+            messages = await asyncio.to_thread(self._queue.peek, event.chat_id)
+            if not messages:
+                response = "当前群没有可展示的待处理队列消息。"
+            else:
+                response = build_agent_context(
+                    "",
+                    messages,
+                    min(self._agent_input_bytes, 6000),
+                    self._agent_recent_originals,
+                )
+            await self._send_direct(event, response)
+            return True
+        if command in {"/new", "/reset", "/restart", "/model", "/compress"}:
+            await self._send_direct(
+                event,
+                f"群聊不允许直接执行 {command}；该命令不会进入 Agent session。",
+            )
+            return True
+        return False
 
     async def _send_direct(self, event: _proto.events.InboundEvent, text: str) -> None:
         """向入站事件的明确目标发送管理命令结果。"""
@@ -1749,24 +1952,74 @@ def _pre_llm_call_hook(session_id: str = "", turn_id: str = "", platform: Any = 
     return {"context": role_prompt(caller)}
 
 
-def _pre_tool_call_hook(tool_name: str = "", session_id: str = "", turn_id: str = "", args: dict | None = None, **kwargs: Any) -> dict[str, str] | None:
-    """在 Hermes 工具执行前硬拦截越权调用。"""
+def _pre_provider_request_hook(
+    request: Any = None,
+    session_id: str = "",
+    turn_id: str = "",
+    **kwargs: Any,
+) -> dict[str, Any] | None:
+    """在宿主支持时向 request copy 添加动态上下文，不修改 transcript。"""
     del kwargs
-    if tool_name not in ALL_TOOLS and not str(tool_name).startswith("qq_"):
+    adapter = _get_live_adapter()
+    if adapter is None:
+        return None
+    binding = adapter._resolve_binding(session_id, turn_id)
+    if binding is None or not adapter._chat_access_allowed(
+        binding.caller.chat_type,
+        binding.caller.chat_id,
+        binding.caller.user_id,
+    ):
+        return None
+    if not isinstance(request, Mapping):
+        return None
+    dynamic = build_dynamic_context(
+        {
+            "当前目标": f"{binding.caller.chat_type}:{binding.caller.chat_id}",
+            "当前角色": binding.caller.role,
+            "当前时间": time.strftime("%Y-%m-%d %H:%M:%S %z"),
+        }
+    )
+    patched: dict[str, Any] = copy.deepcopy(dict(request))
+    body = patched.get("body")
+    if not isinstance(body, dict):
+        body = patched
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return None
+    copied_messages = copy.deepcopy(messages)
+    copied_messages.append({"role": "user", "content": dynamic})
+    body["messages"] = copied_messages
+    return {"request": patched}
+
+
+def _pre_tool_call_hook(tool_name: str = "", session_id: str = "", turn_id: str = "", args: dict | None = None, **kwargs: Any) -> dict[str, str] | None:
+    """在所有 Hermes 工具执行前按当前 OneBot turn 硬拦截越权调用。"""
+    platform = _platform_value(kwargs.get("platform"))
+    normalized_tool = str(tool_name).strip()
+    if platform and platform != _PLATFORM_NAME:
+        return None
+    unknown_onebot_tool = is_onebot_tool_name(normalized_tool) and normalized_tool not in ALL_TOOLS
+    if not unknown_onebot_tool and not normalized_tool:
         return None
     adapter = _get_live_adapter()
     if adapter is None:
-        return {"action": "block", "message": "OneBot11 adapter unavailable"}
-    if tool_name not in ALL_TOOLS:
+        return (
+            {"action": "block", "message": "权限错误: 未知 OneBot11 工具"}
+            if unknown_onebot_tool
+            else None
+        )
+    if unknown_onebot_tool:
         return {"action": "block", "message": "权限错误: 未知 OneBot11 工具"}
     binding = adapter._resolve_binding(session_id, turn_id)
     if binding is None:
-        return {"action": "block", "message": "OneBot11 current turn binding unavailable"}
+        if platform == _PLATFORM_NAME or normalized_tool in ALL_TOOLS or _CURRENT_CALLER.get() is not None:
+            return {"action": "block", "message": "OneBot11 current turn binding unavailable"}
+        return None
     if binding.lease_id and not adapter._lease_is_current(binding.lease_id):
         adapter._audit.record(
             "permission_denied",
             {
-                "tool": tool_name,
+                "tool": normalized_tool,
                 "user_id": binding.caller.user_id,
                 "chat_type": binding.caller.chat_type,
                 "chat_id": binding.caller.chat_id,
@@ -1788,9 +2041,17 @@ def _pre_tool_call_hook(tool_name: str = "", session_id: str = "", turn_id: str 
             },
         )
         return {"action": "block", "message": "权限错误: 当前目标不再满足访问策略"}
-    error = validate_tool_call(tool_name, args or {}, binding.caller, adapter.super_admins)
+    if not adapter._tool_allowed_now(binding.caller, normalized_tool):
+        error = f"角色 {binding.caller.role} 当前无权调用 {normalized_tool}"
+    else:
+        error = validate_tool_call(
+            normalized_tool,
+            args or {},
+            binding.caller,
+            adapter.super_admins,
+        )
     if error:
-        adapter._audit.record("permission_denied", {"tool": tool_name, "user_id": binding.caller.user_id, "chat_type": binding.caller.chat_type, "chat_id": binding.caller.chat_id, "reason": error})
+        adapter._audit.record("permission_denied", {"tool": normalized_tool, "user_id": binding.caller.user_id, "chat_type": binding.caller.chat_type, "chat_id": binding.caller.chat_id, "reason": error})
         return {"action": "block", "message": f"权限错误: {error}"}
     return None
 
@@ -1852,6 +2113,8 @@ def validate_config(config: Any) -> bool:
         parse_id_list(
             raw_allowed_groups if raw_allowed_groups is not None else extra.get("allowed_groups")
         )
+        build_role_tools(extra)
+        build_trusted_users(extra)
         return True
     except (TypeError, ValueError):
         return False
@@ -1949,6 +2212,16 @@ def register(ctx: Any) -> None:
         register_hook("pre_llm_call", _pre_llm_call_hook)
         register_hook("pre_tool_call", _pre_tool_call_hook)
         register_hook("post_llm_call", _post_llm_call_hook)
+        try:
+            from hermes_cli.plugins import VALID_HOOKS
+        except ImportError:
+            VALID_HOOKS = set()
+        if "pre_provider_request" in VALID_HOOKS:
+            register_hook("pre_provider_request", _pre_provider_request_hook)
+        else:
+            logger.info(
+                "Hermes 当前未提供 pre_provider_request；OneBot11 动态上下文等待上游接口"
+            )
     register_auxiliary = getattr(ctx, "register_auxiliary_task", None)
     if callable(register_auxiliary):
         register_auxiliary(

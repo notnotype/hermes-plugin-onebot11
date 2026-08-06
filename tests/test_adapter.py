@@ -410,6 +410,99 @@ async def test_群聊默认需要at才响应(monkeypatch):
     assert status["trigger_requests"] == 0
 
 
+async def test_群slash只读命令旁路且不入队(monkeypatch):
+    """群 slash command 在队列前消费，不创建共享 session 输入。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    responses: list[str] = []
+
+    async def fake_send_direct(_event, text: str) -> None:
+        responses.append(text)
+
+    monkeypatch.setattr(adapter, "_send_direct", fake_send_direct)
+    await adapter._on_ws_event(_group_raw(888, text="/status", at_self=False))
+    assert adapter._queue.peek("888") == ()
+    assert responses and '"chat_id": "888"' in responses[0]
+    assert '"chat_type": "group"' in responses[0]
+    assert '"summary"' not in responses[0]
+    await adapter.disconnect()
+
+
+async def test_群危险slash明确拒绝且不入队(monkeypatch):
+    """会话重置、模型和压缩命令不交给群 Agent。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    responses: list[str] = []
+
+    async def fake_send_direct(_event, text: str) -> None:
+        responses.append(text)
+
+    monkeypatch.setattr(adapter, "_send_direct", fake_send_direct)
+    await adapter._on_ws_event(_group_raw(888, text="/reset", at_self=False))
+    assert adapter._queue.peek("888") == ()
+    assert responses and "不会进入 Agent session" in responses[0]
+    await adapter.disconnect()
+
+
+async def test_相似onebot前缀消息不会被命令吞掉(monkeypatch):
+    """只有独立的 /onebot token 才是管理命令。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    notified: list[str] = []
+
+    async def fake_notify(chat_id: str) -> bool:
+        notified.append(chat_id)
+        return False
+
+    monkeypatch.setattr(adapter._dispatcher, "notify", fake_notify)
+    await adapter._on_ws_event(_group_raw(888, text="/onebotfoo", at_self=True))
+    assert notified == ["888"]
+    assert adapter._queue.peek("888")
+    await adapter.disconnect()
+
+
+async def test_权限配置工具只写roles子树(monkeypatch, tmp_path):
+    """管理员配置工具不能覆盖 token、白名单或其他 Hermes 配置。"""
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "model:\n  provider: demo\nplatforms:\n  onebot11:\n    extra:\n      access_token: keep-me\n      roles:\n        user:\n          tools: [qq_get_message]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_SUPER_ADMINS="100",
+    )
+    result = adapter._save_permission_change(
+        "onebot_set_role_tools",
+        {"role": "trusted_user", "tools": ["web_search", "browser_navigate"]},
+    )
+    assert result["status"] == "ok"
+    from hermes_cli.config import read_user_config_raw
+
+    saved = read_user_config_raw()
+    assert saved["model"]["provider"] == "demo"
+    assert saved["platforms"]["onebot11"]["extra"]["access_token"] == "keep-me"
+    assert saved["platforms"]["onebot11"]["extra"]["roles"]["trusted_user"]["tools"] == [
+        "browser_navigate",
+        "web_search",
+    ]
+    assert adapter.trusted_users == set()
+    await adapter.disconnect()
+
+
 async def test_群聊at机器人放行(monkeypatch):
     """@ 了机器人的群消息正常进入会话。"""
     adapter = _make_adapter(
@@ -785,6 +878,88 @@ async def test_未知qq工具hook直接拒绝(monkeypatch):
     await adapter.disconnect()
 
 
+async def test_未知onebot工具hook直接拒绝(monkeypatch):
+    """没有注册的 onebot_ 工具同样不能绕过 pre_tool_call。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    result = adapter_module._pre_tool_call_hook(
+        tool_name="onebot_unknown", session_id="session", turn_id="turn", args={}
+    )
+    assert result == {"action": "block", "message": "权限错误: 未知 OneBot11 工具"}
+    await adapter.disconnect()
+
+
+async def test_其他平台即使复用相同turn也不受OneBot绑定影响(monkeypatch):
+    """明确的其他平台 turn 不能被 OneBot binding 误拦截。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    event = await adapter._build_message_event(
+        InboundEvent(
+            text="查询",
+            chat_id="888",
+            chat_type="group",
+            user_id="123",
+            user_name="小明",
+            message_id="1001",
+        )
+    )
+    caller = adapter._caller_for_event(event.source)
+    event.metadata["onebot11_caller_context"] = adapter_module._serializable_caller(caller)
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    adapter_module._pre_gateway_dispatch_hook(event)
+    assert adapter_module._pre_llm_call_hook(
+        session_id="same-session", turn_id="same-turn", platform="onebot11"
+    ) is not None
+    assert adapter_module._pre_tool_call_hook(
+        tool_name="web_search",
+        session_id="same-session",
+        turn_id="same-turn",
+        platform="discord",
+        args={},
+    ) is None
+    child_result = json.loads(
+        await adapter._make_tool_handler("qq_get_group_info")(
+            {},
+            session_id="same-session",
+            turn_id="same-turn",
+            platform="subagent",
+        )
+    )
+    assert child_result["status"] == "permission_error"
+    adapter_module._CURRENT_BINDING.set(None)
+    adapter_module._CURRENT_CALLER.set(None)
+    await adapter.disconnect()
+
+
+async def test_trusted用户metadata路径保留角色(monkeypatch):
+    """合成事件从 metadata 恢复时，trusted_user 不能降级为 user。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_ALLOWED_GROUPS="888",
+    )
+    adapter.trusted_users = {"123"}
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    caller = adapter_module._caller_from_metadata(
+        {
+            "user_id": "123",
+            "chat_type": "group",
+            "chat_id": "888",
+        }
+    )
+    assert caller is not None
+    assert caller.role == "trusted_user"
+    await adapter.disconnect()
+
+
 async def test_lease不能跨群注入caller(monkeypatch):
     """合成事件携带其他群 lease 时，pre-gateway 身份解析必须 fail-closed。"""
     adapter = _make_adapter(
@@ -979,6 +1154,9 @@ def test_register注册平台与工具():
         "qq_set_group_ban",
         "qq_set_group_kick",
         "qq_set_group_whole_ban",
+        "onebot_get_permissions",
+        "onebot_set_role_tools",
+        "onebot_set_trusted_users",
     }
     for t in ctx.tools:
         assert t["toolset"] == "onebot11"

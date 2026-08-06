@@ -1,25 +1,32 @@
-# OneBot 11 权限与目标范围
+# OneBot 11 权限、上下文与目标范围
 
-本插件把“能进入 Hermes”与“当前 turn 能调用哪些工具”分开处理。OneBot 入站策略在入队前执行，工具权限在 `pre_tool_call` 和 handler 两层执行；提示词只用于让模型了解规则，不能代替硬校验。
+本插件把“能否进入 Hermes”“当前 batch 怎样进入 session”和“当前 turn 能调用哪些工具”分开处理。OneBot 入站策略在入队前执行，权限在 `pre_tool_call`、插件 handler 两层执行，提示词只用于说明规则，不能代替硬校验。
 
 ## 入站访问策略
 
 | 场景 | 合同 | 配置 |
 |---|---|---|
-| 群消息 | `allowed_groups` 非空时只接受列出的群；为空时接受群消息并按 trigger 决定是否启动 turn | `ONEBOT11_ALLOWED_GROUPS` |
+| 群消息 | `allowed_groups` 非空时只接受列出的群；为空时接受消息并按 trigger 决定是否启动 turn | `ONEBOT11_ALLOWED_GROUPS` |
 | 私聊白名单 | 只接受列出的 QQ | `ONEBOT11_DM_POLICY=allowlist` + `ONEBOT11_ALLOWED_USERS` |
 | 私聊关闭 | 直接丢弃，不进入队列或 session | `ONEBOT11_DM_POLICY=disabled` |
-| 私聊开放 | 只有显式 allow-all 才接受；没有 allow-all 时 fail-closed | `ONEBOT11_DM_POLICY=open` + `ONEBOT11_ALLOW_ALL_USERS=true`，或 `GATEWAY_ALLOW_ALL_USERS=true` |
+| 私聊开放 | 只有显式 allow-all 才接受；没有 allow-all 时 fail-closed | `ONEBOT11_DM_POLICY=open` + `ONEBOT11_ALLOW_ALL_USERS=true` |
 
-未知 `dm_policy`、`group_sessions_per_user=true` 或非 `shared` session 配置都会拒绝启动。插件声明 `enforces_own_access_policy=True`，通过 adapter 访问策略的消息会以 `role_authorized=True` 进入 Hermes，避免被网关默认 allowlist 再次误拒绝。
+未知策略、`group_sessions_per_user=true` 或非 `shared` session 配置都会拒绝启动。插件声明 `enforces_own_access_policy=True`，adapter 访问策略通过后才会以 `role_authorized=True` 进入 Hermes。
 
-群消息即使没有 @、关键词或 `always` trigger，也会先写入 SQLite 队列；这保证触发时能拿到上次触发以来的上下文。没有 trigger 不会启动 Agent turn。
+## 上下文装配
 
-群 turn 认领后，插件默认使用 LLBot 的 `set_msg_emoji_like` 扩展给触发消息添加 `emoji_id=128064`（👀），Hermes turn 收尾时发送 `set=false` 移除。该指示器只作用于当前群的真实消息 ID；内部 hash、私聊消息或 lease 已失效时跳过。reaction 是 best-effort UI 提示，失败或结果未知不会阻断 Agent 回复、队列 ack，也不会自动重试。
+群消息进入 SQLite 后，触发器认领一个 batch。真实 Agent 输入的逻辑结构是：
 
-## 角色与工具
+1. Hermes session 历史消息：之前成功完成的 user/assistant/tool turn，由 Hermes 自己保存并参与 provider 缓存。
+2. 当前 batch 的确定性摘要：只包含本次 lease 中较早的消息，按 UTF-8 字节预算裁剪。
+3. 当前 batch 最近消息原文：默认保留最后几条，保留规范化文本、CQ/media/reply 标记和必要 raw segment。
+4. 动态 request-only 上下文：时间、当前目标等只允许在宿主提供 `pre_provider_request` 后追加到 provider request copy，不能用 `pre_llm_call` 伪装，否则会写入 Hermes 的 `api_content` sidecar。
 
-超级管理员由 QQ 号列表定义：
+第 2、3 项拼成一个 synthetic user turn，因此会进入 session 历史，下一轮不需要从 SQLite 滚动摘要再次注入。`QueueStore.ack()` 只删除已确认消息和触发请求，不再更新跨轮摘要。进程崩溃允许至少一次处理；跨 SQLite 与 Hermes session 没有 exactly-once 事务，极端崩溃窗口可能重复一个 user turn，但正常成功路径不会重复。
+
+## 角色与精确工具权限
+
+角色固定为 `user`、`trusted_user`、`super_admin`，优先级为 `super_admin > trusted_user > user`。配置示例：
 
 ```yaml
 platforms:
@@ -28,54 +35,54 @@ platforms:
       super_admins: ["10001"]
       roles:
         user:
-          tools: [qq_get_message, qq_get_group_msg_history, qq_get_friend_msg_history,
-                  qq_get_group_info, qq_get_group_member_info]
+          tools:
+            - qq_get_message
+            - qq_get_group_msg_history
+            - qq_get_group_info
+            - qq_get_group_member_info
+        trusted_user:
+          users: ["2056963663"]
+          tools:
+            - web_search
+            - web_extract
+            - browser_navigate
         super_admin:
-          tools: [qq_get_message, qq_get_group_msg_history, qq_get_friend_msg_history,
-                  qq_get_group_info, qq_get_group_member_info, qq_delete_message,
-                  qq_set_group_ban, qq_set_group_kick, qq_set_group_whole_ban]
+          tools:
+            - onebot_get_permissions
+            - onebot_set_role_tools
+            - onebot_set_trusted_users
+            - qq_get_message
+            - qq_get_group_msg_history
+            - qq_get_group_info
+            - qq_get_group_member_info
+            - qq_delete_message
+            - qq_set_group_ban
+            - qq_set_group_kick
+            - qq_set_group_whole_ban
 ```
 
-`ONEBOT11_SUPER_ADMINS` 优先，`ONEBOT11_ADMINS` 仅作为兼容旧名。超级管理员为空时没有任何写权限；普通用户默认只有只读工具。可配置的角色工具集合会取所有角色许可工具的并集注册到 Hermes，再由当前 turn 的角色门禁限制实际执行。
+工具名逐个精确匹配，不支持 `*`、`?`、toolset 名或模糊前缀。没有显式配置时，`user` 默认只有当前范围内的只读 OneBot 工具，`trusted_user` 默认为空，`super_admin` 默认只有本插件的 OneBot 工具。网页搜索、网页提取、浏览器、终端、文件/MCP 工具必须显式列入受信角色或超级管理员角色；插件不把这些高风险工具偷偷加入普通用户。
 
-默认只读工具：
+Hermes schema 继续提供所有角色允许工具的并集，以保持共享 session 的 schema 稳定；实际执行时当前 turn 使用不可变权限快照，并在权限收紧后于下一次工具调用重新检查。当前插件的 `pre_tool_call` 会检查所有工具名，包括 `tool_search`、`execute_code`、`delegate_task`；宿主未来还需要把同一集合传入 tool search 和子 Agent 的 tool registry，才能让“不可见”和“不可执行”同时成立。
 
-- `qq_get_message`：返回的消息必须属于当前群或当前私聊。
-- `qq_get_group_msg_history`：只能在当前群查询，群号不从模型参数读取。
-- `qq_get_friend_msg_history`：只能在当前私聊查询当前用户。
-- `qq_get_group_info`、`qq_get_group_member_info`：只能作用于当前群。
+权限配置工具为：
 
-写工具（撤回、禁言、踢人、全员禁言）只能作用于当前群，普通用户永远拒绝。首次调用只产生预览和短期 `/onebot confirm TOKEN`，不会立即执行；确认命令必须由同一超级管理员在同一群发送，令牌单次消费且不写入审计日志。确认命令在 adapter 入站层直接处理，不会进入 Hermes session 或消息队列。
+- `onebot_get_permissions`：读取当前权限快照，仅超级管理员。
+- `onebot_set_role_tools`：替换一个角色的精确工具名列表，仅超级管理员。
+- `onebot_set_trusted_users`：替换受信 QQ 列表，仅超级管理员。
 
-确认令牌和“已知结果未知”的管理动作指纹只保存在当前 adapter 进程内存中。进程重启会让旧令牌失效，也会清空旧的动作阻断记录；审计只保留不含 token 的摘要。重启后重新生成预览属于新的人工操作，不能把它当作旧 unknown 动作已经解决。
+两个写工具只返回预览和 `/onebot confirm TOKEN`。确认命令在 adapter 入站层执行，要求同一超级管理员、同一群和短期单次令牌；只修改 `platforms.onebot11.extra.roles`，不能修改白名单、token、provider 或全局 toolset。写配置的生效规则是：新增权限下一 turn 生效，权限收紧在下一次工具调用立即阻断。
 
-## 身份传递
+## 会话与目标
 
-每次入站 turn 都创建不可变 `CallerContext`。Hermes 的 `session_key` 只用于 session 路由，不能当作身份；工具身份按 `(session_id, turn_id)` 绑定，并在 Hermes registry 没传 `turn_id` 的兼容路径使用当前 task 的 binding，同时校验 `session_id`。找不到精确 binding 时 fail-closed。
+群固定一个 shared Hermes session；私聊按用户独立 session。工具身份按精确 `(session_id, turn_id)` 绑定，`session_key` 只用于 Hermes 路由。出站目标使用显式 `ChatTarget(group|dm, chat_id)`，当前 turn 只能发送到当前目标；同一个数字同时作为群号和 QQ 号时，缺少类型的发送拒绝猜测。
 
-出站目标使用明确的 `ChatTarget(group|dm, chat_id)`。当前 turn 只能向它绑定的目标发送；同一个数字同时被识别为群号和 QQ 号时，未带明确类型的发送会被拒绝。
+群里的 `/context`、`/status`、`/whoami`、`/help`、`/commands` 在入队前旁路处理，不进入队列或 session。`/new`、`/reset`、`/restart`、`/model`、`/compress` 直接拒绝。`/onebot ...` 管理命令继续只允许超级管理员。
 
-## 队列与不确定结果
+## 写操作与未知结果
 
-群队列是持久 SQLite 状态机：
+撤回、禁言、踢人、全员禁言必须确认，且只能作用于当前群。OneBot 11 非幂等 HTTP 请求无法保证 exactly-once；连接中断、超时、非 JSON、缺少 message ID 或部分分块成功时进入 `unknown`，不会自动重放 Agent turn，必须管理员 `/onebot resolve retry|discard`。
 
-```text
-pending -> leased(agent_running) -> acked/deleted
-leased --明确失败且未开始出站--> pending（2、4、8 秒退避，最多 3 次）
-leased --出站已开始、lease 过期或阶段未知--> uncertain
-leased --达到失败上限--> failed
-uncertain --管理员 retry--> pending
-uncertain --管理员 discard--> deleted
-failed --管理员 retry--> pending
-failed --管理员 discard--> deleted
-```
+## 当前边界
 
-消息入队允许至少一次；OneBot 非幂等 HTTP 请求（发送、撤回、禁言、踢人、全员禁言）不自动重试。连接断开、非 JSON 响应、超时、5xx 或部分分块成功时，结果可能是 `unknown`，插件不会重新执行整轮 Agent，必须由管理员 `/onebot resolve retry|discard` 明确处理。lease 一旦写入出站 marker，任何明确错误也不会自动 release；`retry` 仍可能再次执行动作，因此只应在确认目标端没有执行后使用。完成 ack/release 只有在 SQLite 原子状态转换成功后才会推进下一轮。
-
-## 运维命令
-
-超级管理员可在目标群发送：
-
-`/onebot status`、`/onebot queue`、`/onebot flush`、`/onebot clear`、`/onebot pause`、`/onebot resume`、`/onebot resolve retry`、`/onebot resolve discard`、`/onebot confirm TOKEN`。
-
-`pause` 只停止自动 dispatch，消息继续入队；`clear` 清理 pending 消息和滚动摘要但不删除 Hermes session 历史，活动 lease、`uncertain` 或 `failed` 必须先显式处理。
+Docker 子代理不在本 Task 实现，后续任务只记录容器隔离、共享目录、资源/网络限制、凭据隔离和结果大小限制。动态 request-only 上下文和 provider 级精确 tool policy 需要 Hermes 上游公共接口；插件不修改本机 Hermes 安装目录，也不把 `pre_llm_call` 当作 request-only 兼容层。

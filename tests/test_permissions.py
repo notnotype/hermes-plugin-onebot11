@@ -4,11 +4,16 @@
 import pytest
 
 from onebot11.permissions import (
+    CONFIG_WRITE_TOOLS,
     CallerContext,
     ToolContext,
     TurnBinding,
     TurnBindingStore,
+    build_role_tools,
+    build_trusted_users,
+    is_onebot_tool_name,
     parse_admin_list,
+    role_for_user,
     validate_tool_call,
 )
 
@@ -86,3 +91,45 @@ def test_同一turn不可换绑调用者():
     store.bind(TurnBinding("session", "turn", first))
     with pytest.raises(ValueError):
         store.bind(TurnBinding("session", "turn", second))
+
+
+def test_角色优先级和精确工具名():
+    """trusted_user 只按 QQ 白名单和精确工具名生效。"""
+    extra = {
+        "roles": {
+            "user": {"tools": ["qq_get_message"]},
+            "trusted_user": {"users": ["200"], "tools": ["web_search", "terminal"]},
+            "super_admin": {"tools": ["onebot_get_permissions"]},
+        }
+    }
+    role_tools = build_role_tools(extra)
+    assert role_tools["user"] == frozenset({"qq_get_message"})
+    assert role_tools["trusted_user"] == frozenset({"web_search", "terminal"})
+    assert "terminal" not in role_tools["user"]
+    assert build_trusted_users(extra) == {"200"}
+    assert role_for_user("200", set(), {"200"}) == "trusted_user"
+    assert role_for_user("200", {"200"}, set()) == "super_admin"
+    with pytest.raises(ValueError):
+        build_role_tools({"roles": {"user": {"tools": ["browser_*"]}}})
+
+
+def test_通用Hermes工具也遵守角色快照():
+    """非 qq 工具不再绕过同一精确工具名门禁。"""
+    ctx = CallerContext(
+        user_id="200",
+        chat_type="group",
+        chat_id="888",
+        role="trusted_user",
+        allowed_tools=frozenset({"web_search"}),
+    )
+    assert validate_tool_call("web_search", {}, ctx, set()) is None
+    assert validate_tool_call("terminal", {}, ctx, set()) is not None
+    assert validate_tool_call(next(iter(CONFIG_WRITE_TOOLS)), {}, ctx, set()) is not None
+
+
+def test_OneBot工具命名空间未知名称也必须识别():
+    """qq_ 和 onebot_ 工具都不能靠未知名称绕过 fail-closed。"""
+    assert is_onebot_tool_name("qq_get_message")
+    assert is_onebot_tool_name("onebot_set_role_tools")
+    assert is_onebot_tool_name("onebot_unknown")
+    assert not is_onebot_tool_name("web_search")

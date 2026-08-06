@@ -133,6 +133,9 @@ def test_查询和群管理工具schema齐全():
         "qq_set_group_ban",
         "qq_set_group_kick",
         "qq_set_group_whole_ban",
+        "onebot_get_permissions",
+        "onebot_set_role_tools",
+        "onebot_set_trusted_users",
     }
     for schema in TOOL_SCHEMAS.values():
         assert schema["type"] == "object"

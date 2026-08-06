@@ -899,16 +899,16 @@ class QueueStore:
                     """,
                     (lease_id, self._owner_id, now, chat_id, lease_id),
                 )
-                chat_row = self._conn.execute(
-                    "SELECT summary FROM onebot_queue_chat WHERE chat_id=?", (chat_id,)
-                ).fetchone()
+                batch_summary = self._build_batch_summary(message_rows)
                 self._conn.commit()
                 return QueueLease(
                     chat_id=chat_id,
                     lease_id=lease_id,
                     messages=tuple(self._row_to_message(row) for row in message_rows),
                     trigger=self._row_to_trigger(trigger_row),
-                    summary=str(chat_row[0] if chat_row else ""),
+                    # summary 只属于当前 lease 的早期消息；不读取 chat.summary，
+                    # 避免上一轮已经写入 Hermes session 的内容再次进入 prompt。
+                    summary=batch_summary,
                     claimed_at=now,
                     lease_until=until,
                     phase="agent_running",
@@ -991,7 +991,7 @@ class QueueStore:
             return cursor.rowcount > 0
 
     def ack(self, lease: QueueLease | str) -> bool:
-        """确认 lease，删除消息并更新确定性滚动摘要。"""
+        """确认 lease 并删除消息；已成功物化的 batch 不再写入跨轮摘要。"""
         lease_id = lease.lease_id if isinstance(lease, QueueLease) else str(lease)
         with self._lock:
             try:
@@ -1010,11 +1010,6 @@ class QueueStore:
                     self._conn.commit()
                     return False
                 chat_id = str(rows[0]["chat_id"])
-                chat = self._conn.execute(
-                    "SELECT summary FROM onebot_queue_chat WHERE chat_id=?", (chat_id,)
-                ).fetchone()
-                summary = str(chat[0] if chat else "")
-                summary = self._append_summary(summary, rows)
                 self._conn.executemany(
                     "INSERT OR REPLACE INTO onebot_queue_dedupe(chat_id,message_key,seq,created_at) VALUES (?,?,?,?)",
                     [(str(row["chat_id"]), str(row["message_key"]), int(row["seq"]), now) for row in rows],
@@ -1028,8 +1023,8 @@ class QueueStore:
                     (lease_id, self._owner_id),
                 )
                 self._conn.execute(
-                    "UPDATE onebot_queue_chat SET summary=?, updated_at=? WHERE chat_id=?",
-                    (summary, now, chat_id),
+                    "UPDATE onebot_queue_chat SET updated_at=? WHERE chat_id=?",
+                    (now, chat_id),
                 )
                 self._conn.commit()
                 return True
@@ -1447,31 +1442,25 @@ class QueueStore:
                 self._conn.rollback()
                 raise
 
-    def _append_summary(self, current: str, rows: list[sqlite3.Row]) -> str:
-        """将已确认消息追加为确定性摘要，并保留最近内容。"""
-        parts = [current] if current else []
-        original_start = max(0, len(rows) - self.recent_originals)
-        for index, row in enumerate(rows):
-            text = str(row["text"])
-            raw_text = str(row["raw_text"] or "")
-            if index >= original_start and raw_text and raw_text != text:
-                text = f"{text} [原文: {raw_text}]"
-            parts.append(f"#{row['seq']} {row['user_name']}: {text}")
-        result = "\n".join(parts)
+    def _build_batch_summary(self, rows: list[sqlite3.Row]) -> str:
+        """生成当前 lease 的早期消息摘要，不跨 ack 保存上下文。"""
+        summary_rows = rows[:-self.recent_originals] if self.recent_originals else rows
+        if not summary_rows:
+            return ""
+        lines = [
+            f"#{row['seq']} [{row['user_name']}] {str(row['text'])}"
+            for row in summary_rows
+        ]
+        result = "\n".join(lines)
         if len(result.encode("utf-8")) <= self.max_summary_bytes:
             return result
-        marker = "[更早的群消息摘要已裁剪]"
-        recent: list[str] = []
-        used = len(marker.encode("utf-8")) + 1
-        for line in reversed(result.splitlines()):
-            line_bytes = len(line.encode("utf-8")) + (1 if recent else 0)
-            if used + line_bytes > self.max_summary_bytes:
-                break
-            recent.append(line)
-            used += line_bytes
-        if not recent:
-            return marker + "\n" + self._truncate_utf8_tail(result, max(0, self.max_summary_bytes - used))
-        return marker + "\n" + "\n".join(reversed(recent))
+        marker = "[本次队列摘要较大，较早消息已裁剪]"
+        marker_bytes = len(marker.encode("utf-8")) + 1
+        tail = self._truncate_utf8_tail(
+            result,
+            max(0, self.max_summary_bytes - marker_bytes),
+        )
+        return f"{marker}\n{tail}" if tail else marker[: self.max_summary_bytes]
 
     def _row_to_message(self, row: sqlite3.Row) -> QueueMessage:
         """把 SQLite 行转换为不可变队列消息。"""

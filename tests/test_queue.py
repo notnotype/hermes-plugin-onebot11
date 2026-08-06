@@ -47,6 +47,24 @@ def test_一个lease覆盖并确认整批trigger(tmp_path):
     store.close()
 
 
+def test_ack不再追加跨轮滚动摘要(tmp_path):
+    """成功 batch 由 Hermes session 历史承载，SQLite 不重复保存并注入。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    first = _message("1", text="第一轮")
+    store.enqueue(first, _trigger(first))
+    lease = store.claim("888")
+    assert lease is not None
+    assert lease.summary == ""
+    assert store.ack(lease)
+    assert store.status("888")["summary"] == ""
+    second = _message("2", text="第二轮")
+    store.enqueue(second, _trigger(second))
+    next_lease = store.claim("888")
+    assert next_lease is not None
+    assert "第一轮" not in next_lease.summary
+    store.close()
+
+
 def test_恢复不抢占仍有效的其他进程租约(tmp_path, monkeypatch):
     """启动第二个进程时，只能恢复已过期 lease。"""
     now = [1000.0]

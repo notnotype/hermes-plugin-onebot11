@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- **阶段**：OneBot 11 可靠性与安全完善已实现本地闭环，并已完成 Arch + LLBot 指定白名单及群处理 reaction 指示器联调；尚未创建本轮 PR。
+- **阶段**：OneBot 11 可靠性与安全完善已实现本地闭环；Task 4 的上下文/角色权限改动已完成本地门禁、Arch + LLBot 指定白名单联调，尚未创建本轮 PR。
 - **核心合同**：群固定一个共享 session；群消息持久入队；触发后按 lease 启动单群单 turn；非幂等出站结果未知时进入 `uncertain`，不自动重放。
 - **本地验证**：协议/状态机测试通过；使用本地 Hermes 源码与其 site-packages 运行 adapter 测试通过。最终门禁命令和环境见“验证证据”。
 
@@ -26,14 +26,23 @@
 
 ## 验证证据
 
-- `.venv\\Scripts\\python.exe -m pytest -q`：`93 passed, 1 skipped`；没有 Hermes 依赖的环境会跳过 adapter 集成文件。
-- 使用本地 Hermes 实例的源码和 site-packages：全套测试 `134 passed`，覆盖 adapter hooks、工具注册、共享队列、身份绑定、shared session key、媒体清理、出站 unknown、负数 message_id 和 reaction 生命周期。
+- 纯插件依赖：`pytest -q`：`101 passed, 1 skipped`；没有 Hermes 依赖的环境会跳过 adapter 集成文件。
+- 使用本地 Hermes 实例的源码和依赖：全套测试 `149 passed`，覆盖 adapter hooks、工具注册、共享队列、身份绑定、shared session key、媒体清理、出站 unknown、负数 message_id、reaction 生命周期、角色权限和群 slash command。
+- 本轮 Arch + LLBot：服务加载 `0.3.0`；群 `1072992996` 和私聊 `2056963663` 是唯一出站目标。已验证 `/context` 旁路、紧凑 `/status`、普通用户高风险工具拒绝、shared session key、群 reaction 生命周期、允许私聊回复，以及非白名单群/私聊 fail-closed。
 - `.venv\\Scripts\\python.exe -m ruff check .`：通过。
-- 真实 Hermes 临时 `HERMES_HOME` 注册 smoke：已确认平台、9 个工具、4 个安全 hooks 和 `onebot11_trigger` auxiliary 均注册，并验证真实 Gateway auth/session/tool 调用链。
+- 真实 Hermes 临时 `HERMES_HOME` 注册 smoke：已确认平台、12 个 OneBot 工具、4 个现有安全 hooks 和 `onebot11_trigger` auxiliary 均注册；shared session 默认桥接返回 `group_sessions_per_user=false`。当前 Hermes 没有 `pre_provider_request`，动态 request-only 上下文仍待上游接口。
 
 ## 外部联调状态
 
-2026-08-05 在 Arch `192.168.1.18` 使用真实 Hermes 0.20 + LLBot 8.1.5 direct compose 完成指定白名单联调。机器人 QQ 为 `3101482118`，唯一允许群为 `1072992996`，唯一允许私聊用户为 `2056963663`；Hermes/LLBot WS 与 HTTP token 已配置一致且未记录在文档中。
+2026-08-06 在 Arch `192.168.1.18` 使用真实 Hermes + LLBot direct compose 部署 `0.3.0` 完成 Task 4 指定白名单联调。机器人 QQ 为 `3101482118`，唯一允许群为 `1072992996`，唯一允许私聊用户为 `2056963663`；Hermes/LLBot WS 与 HTTP token 已配置一致且未记录在文档中。以下外部事件仍是通过真实反向 WS 注入的合成 OneBot payload，不等同于真人 QQ 客户端发言。
+
+Task 4 新增证据：
+
+- 群普通用户和超级管理员消息落在同一 session key `agent:main:onebot11:group:1072992996`；两条消息合并为一个 queue batch，回复后 queue/trigger 均清空。
+- `/context` 在入队前旁路返回待处理 batch；`/status` 返回 `chat_type=group`、lease/失败计数等紧凑状态，不再发送旧 summary 原文。
+- 普通用户 `/whoami` 只显示 5 个当前范围只读查询工具；请求 `terminal` 产生结构化权限错误和 `permission_denied` 审计，没有执行命令。
+- 群处理 reaction 在指定群的真实消息 ID 上按 `set=true -> 回复 -> set=false` 完成；允许私聊用户收到正常 Agent 回复。
+- 非白名单群 `786830134` 和私聊 `999999999` 只记录 `access_denied`，没有队列记录和出站请求。
 
 已确认：
 
