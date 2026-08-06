@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- **阶段**：OneBot 11 可靠性与安全完善已实现本地闭环，并已完成 Arch + LLBot 指定白名单及群处理 reaction 指示器联调；尚未创建本轮 PR。
+- **阶段**：OneBot 11 可靠性、安全和分层触发已完成本地闭环，并已完成 Arch + LLBot 指定白名单及群处理 reaction 指示器联调；本分支待提交、推送和创建 PR。
 - **核心合同**：群固定一个共享 session；群消息持久入队；触发后按 lease 启动单群单 turn；非幂等出站结果未知时进入 `uncertain`，不自动重放。
 - **本地验证**：协议/状态机测试通过；使用本地 Hermes 源码与其 site-packages 运行 adapter 测试通过。最终门禁命令和环境见“验证证据”。
 
@@ -18,7 +18,7 @@
 | `onebot11/http_api.py` | 完成 | 查询有限重试；发送/管理/reaction 写永不自动重试；有符号 message_id；超时、429/5xx、非 JSON、超大响应分类；媒体 SSRF/类型/大小限制 |
 | `onebot11/queue.py` | 完成 | SQLite WAL、schema 迁移、持久去重、批量 lease、heartbeat、摘要、tombstone、uncertain 人工 resolve |
 | `onebot11/dispatch.py` | 完成 | 每群最多一个活动 turn，恢复触发请求，暂停/恢复和失败状态转换 |
-| `onebot11/triggers.py` | 完成 | @、关键词、always、冷却纯函数；LLM trigger 显式群 allowlist + 旁路 provider/model |
+| `onebot11/triggers.py` | 完成 | @、关键词、always、问句/记忆候选、5 秒 debounce、60 秒活跃窗口和显式旁路 LLM 三态判断 |
 | `onebot11/permissions.py` | 完成 | `CallerContext`、`ChatTarget`、精确 `(session_id, turn_id)` binding、角色工具并集、fail-closed |
 | `onebot11/tools.py` | 完成 | 当前群/私聊范围查询和群管理写工具；写操作必须确认 |
 | `adapter.py` | 完成 | Hermes glue、shared session、入站访问策略、hooks、工具 handler、群 turn 👀 指示器、出站生命周期和媒体回收 |
@@ -26,23 +26,25 @@
 
 ## 验证证据
 
-- `.venv\\Scripts\\python.exe -m pytest -q`：`93 passed, 1 skipped`；没有 Hermes 依赖的环境会跳过 adapter 集成文件。
-- 使用本地 Hermes 实例的源码和 site-packages：全套测试 `134 passed`，覆盖 adapter hooks、工具注册、共享队列、身份绑定、shared session key、媒体清理、出站 unknown、负数 message_id 和 reaction 生命周期。
+- `.venv\\Scripts\\python.exe -m pytest -q`：`109 passed, 1 skipped`；没有 Hermes 依赖的环境只跳过需要 Hermes 运行时的 adapter 集成测试。
+- 使用本地 Hermes 实例的源码和 site-packages：全套测试 `168 passed`；覆盖 adapter hooks、工具注册、共享队列、身份绑定、shared session key、媒体清理、出站 unknown、严格 auxiliary 参数、触发竞争和 reaction 生命周期。
+- 严格 auxiliary 回归测试：`3 passed`；确认 `fallback_policy="none"`、`max_attempts=1` 和旧 API 安全降级。
 - `.venv\\Scripts\\python.exe -m ruff check .`：通过。
-- 真实 Hermes 临时 `HERMES_HOME` 注册 smoke：已确认平台、9 个工具、4 个安全 hooks 和 `onebot11_trigger` auxiliary 均注册，并验证真实 Gateway auth/session/tool 调用链。
+- 真实 Hermes 临时 `HERMES_HOME` 注册 smoke：已确认平台、9 个工具、4 个安全 hooks 和 `onebot11_trigger` auxiliary 均注册，并验证 shared session 合同和严格旁路配置。
 
 ## 外部联调状态
 
-2026-08-05 在 Arch `192.168.1.18` 使用真实 Hermes 0.20 + LLBot 8.1.5 direct compose 完成指定白名单联调。机器人 QQ 为 `3101482118`，唯一允许群为 `1072992996`，唯一允许私聊用户为 `2056963663`；Hermes/LLBot WS 与 HTTP token 已配置一致且未记录在文档中。
+2026-08-06 在 Arch `192.168.1.18` 使用真实 Hermes + LLBot direct compose 完成指定白名单联调。机器人 QQ 为 `3101482118`，唯一允许群为 `1072992996`，唯一允许私聊用户为 `2056963663`；Hermes/LLBot WS 与 HTTP token 已配置一致且未记录在文档中。
 
 已确认：
 
-- Hermes 实际加载当前 0.2.0 插件，`session=shared`，WS 监听和 LLBot 反向 WS 自动重连均成功。
+- Hermes 实际加载当前 0.3.0 插件，`session=shared`，WS 监听和 LLBot 反向 WS 自动重连均成功。
 - OneBot `get_login_info`、目标群/用户查询、群消息和私聊测试发送均返回 `retcode=0`，出站目标只有上述群和用户。
-- 通过真实 WS 服务注入允许群 @ 事件，消息进入持久 SQLite 队列，Agent 回复 `OneBot11联调成功` 并成功发回目标群；允许用户私聊回复 `OneBot11私聊成功`。
-- 不带 @ 的消息在 pending 中持久化；重启 Hermes 后仍在队列，管理员 `flush` 后完成处理并清空消息/trigger。
+- 通过真实反向 WS 服务注入允许群消息，普通消息先进入持久 SQLite 队列，随后注入 @ 触发；队列出现单个群 lease，最终消息和 trigger request 均完成清理，滚动摘要写入。
+- 指定群收到 Hermes 回复 `OneBot11 联调成功`；允许用户 `2056963663` 收到私聊回复 `OneBot11 私聊联调成功`。
+- 已验证 pending 消息在 Hermes 重启后仍可恢复，并由管理员 `flush` 完成处理；WS/HTTP 重连行为只记录为实际联调结果，不升级为 OneBot 11 协议保证。
 - 真实 LLBot 上报的其他群消息和合成的非白名单私聊均被拒绝并写入审计；没有产生出站。
-- 在指定群用真实消息 ID `-71496113` 完成 reaction smoke：`set=true` 后收到 Hermes 群回复，再发送 `set=false`；`fetch_emoji_like` 返回空列表，确认 👀 已清理。
+- 在指定群用真实消息 ID `-726745341` 完成 reaction smoke：`set=true` 后收到 Hermes 群回复，再发送 `set=false`；LLBot 的 `fetch_emoji_like` 返回空列表，确认 👀 已清理。
 
 仍需单独完成：
 

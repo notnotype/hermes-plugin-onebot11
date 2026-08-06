@@ -79,3 +79,16 @@ failed --管理员 discard--> deleted
 `/onebot status`、`/onebot queue`、`/onebot flush`、`/onebot clear`、`/onebot pause`、`/onebot resume`、`/onebot resolve retry`、`/onebot resolve discard`、`/onebot confirm TOKEN`。
 
 `pause` 只停止自动 dispatch，消息继续入队；`clear` 清理 pending 消息和滚动摘要但不删除 Hermes session 历史，活动 lease、`uncertain` 或 `failed` 必须先显式处理。
+
+## 分层触发和旁路模型
+
+群消息的触发顺序是“硬触发优先，候选消息再仲裁”：
+
+- @、关键词、`always` 和管理员命令直接创建持久 trigger，不调用 LLM。
+- 空闲状态只把问句或带有“之前/上次/刚才/继续”等回指词、且当前群已有摘要或最近原文的消息送入候选。
+- 候选消息使用 5 秒 trailing debounce；每群最多一个判断任务，冷却期间不创建判断。
+- 旁路模型必须显式配置 provider、model 和群 allowlist，并且 Hermes auxiliary API 必须支持 `fallback_policy`、`max_attempts`。插件固定使用 `fallback_policy=none`、`max_attempts=1`；旧 API 会安全跳过，绝不调用主 Agent 作为隐式 fallback。
+- 模型只能返回 `{"decision":"trigger|wait|ignore","wait_seconds":5}`。`wait_seconds` 只能为 `5/10/30/60`；非法 JSON、超时、模型错误均按 `ignore`，消息留在 pending，不创建 lease。
+- 成功 turn 后进入最多 60 秒 idle 活跃窗口，最长连续活跃时间 300 秒，最多 3 次 LLM 仲裁；重启后 active/engaged 状态回到 idle，只恢复 SQLite 消息和显式 durable trigger。
+
+这些规则只决定“是否启动一轮 Agent”，不改变角色权限。实际工具调用仍必须通过当前 `(session_id, turn_id)` binding、访问策略和 lease fencing。

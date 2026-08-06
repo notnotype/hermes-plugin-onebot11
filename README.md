@@ -5,7 +5,8 @@
 ## 它能做什么
 
 - **私聊**：和机器人一对一聊天,每条消息都会回复。
-- **群聊**：整群共享一个 Hermes session；允许的消息先进入持久 SQLite 队列，再由 @、关键词或显式 LLM trigger 触发一轮处理。
+- **群聊**：整群共享一个 Hermes session；允许的消息先进入持久 SQLite 队列，再由 @、关键词、`always` 或分层 LLM trigger 触发一轮处理。
+- **连续对话**：成功回复后进入最多 60 秒的活跃窗口；窗口内普通消息经过 5 秒 trailing debounce，再交给低成本旁路模型判断是否回复，单窗口最多仲裁 3 次。
 - **处理指示器**：群 turn 认领后给触发消息添加 👀，Hermes turn 收尾时自动移除；没有真实消息 ID 或 QQ 框架不支持该扩展时按 best-effort 跳过，不影响回复。
 - **上下文**：队列有条数、字节数和单条消息上限，确认后形成滚动摘要，并保留最近消息原文。
 - **图片与消息段**：兼容 array/CQ 字符串，支持图片、reply、文件、语音、视频、转发和未知段标记；图片下载有 host、端口、类型、魔数和大小限制。
@@ -108,12 +109,20 @@ platforms:
         provider: ""
         model: ""
         groups: []
+        timeout: 10
+        input_bytes: 12000
+        concurrency: 2
+        trigger_debounce_seconds: 5
+        engaged_idle_seconds: 60
+        engaged_max_seconds: 300
+        engaged_max_arbitrations: 3
       processing_reaction_enabled: true
       processing_reaction_emoji_id: "128064"  # LLBot 的 👀
 ```
 
 `queue_recovery_poll_seconds` 只负责发现已过期 lease，不会抢占仍有效的 lease。
-LLM trigger 默认关闭，启用时必须同时配置明确的旁路 `provider`、`model` 和群 allowlist；缺少模型、超时或返回非法 JSON 都按“不触发”处理。
+LLM trigger 默认关闭，启用时必须同时配置明确的旁路 `provider`、`model` 和群 allowlist；每群最多一个判断任务，使用 5 秒 debounce 和全局并发上限。判断调用固定使用 `fallback_policy=none`、`max_attempts=1`，不支持这两个 Hermes auxiliary 参数的旧版本会安全禁用 LLM trigger，不回退主模型。缺少模型、超时或返回非法 JSON 都按“不触发”处理。
+旁路模型只接受 `{"decision":"trigger|wait|ignore","wait_seconds":5}`；`wait_seconds` 只能是 `5/10/30/60`，非法结果保留队列消息，不创建 lease。
 `media_orphan_ttl_seconds` 到期后由下一次 adapter 启动或 turn 收尾清理遗留媒体目录。
 `processing_reaction_enabled` 默认开启；它使用 LLBot 的 `set_msg_emoji_like` 扩展，只作用于群聊真实消息 ID。添加或移除 reaction 的未知结果不会重放 Agent turn，也不会阻断队列 ack。
 
@@ -126,7 +135,7 @@ LLM trigger 默认关闭，启用时必须同时配置明确的旁路 `provider`
 3. **会话范围**：工具和出站目标都绑定当前 `(session_id, turn_id)`，群里只能查/操作本群。
 4. **写操作**：模型第一次调用只返回 `/onebot confirm TOKEN`；确认命令在入站层执行，不进入 session 或队列。
 
-群级运维命令由超级管理员直接发送：`/onebot status`、`queue`、`flush`、`clear`、`pause`、`resume`、`resolve retry|discard` 和 `confirm TOKEN`。`clear` 不删除 Hermes session 历史；`uncertain` 和 `failed` 都不会自动重试，必须明确 resolve。
+群级运维命令由超级管理员直接发送：`/onebot status`、`queue`、`flush`、`clear`、`pause`、`resume`、`resolve retry|discard` 和 `confirm TOKEN`。`clear` 不删除 Hermes session 历史，但会同时失效当前群旧的 debounce/活跃触发状态；`uncertain` 和 `failed` 都不会自动重试，必须明确 resolve。
 
 ## 开发
 
