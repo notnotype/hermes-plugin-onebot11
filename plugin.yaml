@@ -5,7 +5,8 @@ version: 0.3.0
 description: >
   OneBot 11 (QQ) gateway adapter for Hermes Agent.
   Reverse WebSocket + HTTP API. Shared group sessions, durable queued context,
-  DM chat, scoped query tools and confirmed group-management actions.
+  persistent cooldown/reaction cleanup, fail-closed scoped query tools and
+  confirmed group-management actions.
 author: notnotype
 requires_env: []
 optional_env:

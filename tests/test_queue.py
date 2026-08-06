@@ -134,6 +134,20 @@ def test_租约失败释放后按退避重新认领(tmp_path, monkeypatch):
     store.close()
 
 
+def test_status分开显示failure和uncertain原因(tmp_path):
+    """管理员 status 不能把可重试失败和未知结果混成同一类。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    message = _message("reasons")
+    store.enqueue(message, _trigger(message))
+    lease = store.claim("888")
+    assert lease is not None
+    assert store.release(lease, reason="网络明确失败")
+    status = store.status("888")
+    assert status["failure_reasons"] == ["网络明确失败"]
+    assert status["uncertain_reasons"] == []
+    store.close()
+
+
 def test_成功出站可以确认并删除消息(tmp_path):
     """出站阶段已开始不等于结果未知；明确成功仍可 ack。"""
     store = QueueStore(tmp_path / "queue.sqlite3")
@@ -183,6 +197,28 @@ def test_旧schema活动lease迁移为uncertain(tmp_path):
     migrated = QueueStore(path)
     assert migrated.status("888")["uncertain"] == 1
     assert migrated.recover_trigger_requests() == ()
+    migrated.close()
+
+
+def test_v5活动lease升级到v6不被误标记为unknown(tmp_path, monkeypatch):
+    """已有 phase marker 的 v5 文件升级时应保留可恢复的活动 lease。"""
+    now = [1000.0]
+    monkeypatch.setattr("onebot11.queue.time.time", lambda: now[0])
+    path = tmp_path / "queue.sqlite3"
+    store = QueueStore(path)
+    message = _message("v5")
+    store.enqueue(message, _trigger(message))
+    lease = store.claim("888", lease_seconds=30)
+    assert lease is not None
+    store.close()
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA user_version=5")
+    connection.commit()
+    connection.close()
+
+    migrated = QueueStore(path)
+    assert migrated.status("888")["leased"] == 1
+    assert migrated.status("888")["uncertain"] == 0
     migrated.close()
 
 
@@ -240,4 +276,50 @@ def test_队列保留调用方提供的原文(tmp_path):
     )
     assert store.enqueue(message).inserted
     assert store.peek("888")[0].raw_text == "[CQ:face,id=1]规范化正文"
+    store.close()
+
+
+def test_cooldown到期只恢复标记过的触发候选(tmp_path):
+    """普通未触发消息不能被 cooldown 恢复误 dispatch。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    candidate = QueueMessage(
+        **{
+            **_message("candidate").__dict__,
+            "metadata": {"onebot11_cooldown_candidate": True},
+        }
+    )
+    ordinary = _message("ordinary")
+    store.enqueue(candidate)
+    store.enqueue(ordinary)
+    store._conn.execute(
+        "UPDATE onebot_queue_chat SET last_trigger_at=? WHERE chat_id=?",
+        (1000.0, "888"),
+    )
+    store._conn.commit()
+    assert store.recover_due_triggers(1004.0, cooldown_seconds=10) == ()
+    recovered = store.recover_due_triggers(1011.0, cooldown_seconds=10)
+    assert len(recovered) == 1
+    assert recovered[0].reason == "cooldown_recovery"
+    assert store.status("888")["pending_trigger_requests"] == 1
+    store.close()
+
+
+def test_reaction在活动lease期间不恢复_失效后可恢复(tmp_path, monkeypatch):
+    """reaction 只保存可能已设置成功的状态，不重放 set。"""
+    now = [1000.0]
+    monkeypatch.setattr("onebot11.queue.time.time", lambda: now[0])
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    message = _message("reaction")
+    store.enqueue(message, _trigger(message))
+    lease = store.claim("888", lease_seconds=5)
+    assert lease is not None
+    store.record_reaction(lease.lease_id, "888", "123")
+    assert store.mark_reaction_set(lease.lease_id)
+    assert store.pending_reaction_cleanups() == ()
+    assert store.mark_uncertain(lease, "处理取消")
+    now[0] = 1006.0
+    pending = store.pending_reaction_cleanups()
+    assert len(pending) == 1
+    assert pending[0].message_id == "123"
+    assert store.delete_reaction(lease.lease_id)
     store.close()

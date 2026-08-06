@@ -34,6 +34,7 @@ CONFIG_WRITE_TOOLS = frozenset({"onebot_set_role_tools", "onebot_set_trusted_use
 ALL_TOOLS = READ_ONLY_TOOLS | WRITE_TOOLS | CONFIG_READ_TOOLS | CONFIG_WRITE_TOOLS
 ROLE_NAMES = ("user", "trusted_user", "super_admin")
 ONEBOT_TOOL_PREFIXES = ("qq_", "onebot_")
+FORBIDDEN_ROLE_TOOLS = frozenset({"delegate_task"})
 
 
 @dataclass(frozen=True)
@@ -156,6 +157,41 @@ def parse_admin_list(admins: Any) -> set[str]:
     return parse_id_list(admins)
 
 
+def chat_access_allowed(
+    chat_type: str,
+    chat_id: str,
+    user_id: str | None = None,
+    *,
+    allowed_groups: Iterable[str] = (),
+    dm_policy: str = "open",
+    allowed_users: Iterable[str] = (),
+    allow_all_users: bool = False,
+) -> bool:
+    """按 OneBot 入站合同判断目标是否允许访问。
+
+    ``open`` 只在调用方明确提供 ``allow_all_users`` 时放行；这样 cron、
+    恢复和实时入站都能复用同一份 fail-closed 规则。
+    """
+    normalized_type = str(chat_type).strip().casefold()
+    normalized_chat = str(chat_id).strip()
+    if not normalized_chat:
+        return False
+    if normalized_type == "group":
+        groups = {str(item).strip() for item in allowed_groups if str(item).strip()}
+        return not groups or normalized_chat in groups
+    if normalized_type != "dm":
+        return False
+    policy = str(dm_policy).strip().casefold()
+    if policy == "disabled":
+        return False
+    if policy == "allowlist":
+        users = {str(item).strip() for item in allowed_users if str(item).strip()}
+        return str(user_id or normalized_chat).strip() in users
+    if policy == "open":
+        return bool(allow_all_users)
+    return False
+
+
 def parse_exact_tool_names(value: Any, *, name: str = "tools") -> frozenset[str]:
     """解析精确工具名列表，拒绝 wildcard、toolset 和空工具名。"""
     values = value.split(",") if isinstance(value, str) else value
@@ -198,11 +234,14 @@ def build_role_tools(extra: Mapping[str, Any]) -> dict[str, frozenset[str]]:
         if not isinstance(raw, Mapping):
             raise ValueError(f"roles.{role} 必须是 mapping")
         value = raw["tools"] if "tools" in raw else defaults[role]
-        result[role] = (
+        parsed = (
             defaults[role]
             if value is None
             else parse_exact_tool_names(value, name=f"roles.{role}.tools")
         )
+        if FORBIDDEN_ROLE_TOOLS.intersection(parsed):
+            raise ValueError("OneBot11 角色暂不允许配置 delegate_task")
+        result[role] = parsed
     return result
 
 

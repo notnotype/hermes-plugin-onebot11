@@ -27,11 +27,12 @@ from .permissions import (
     TurnBindingStore,
     build_role_tools,
     build_trusted_users,
+    chat_access_allowed,
     is_onebot_tool_name,
     parse_exact_tool_names,
     role_for_user,
 )
-from .queue import QueueLease, QueueMessage, QueueStore, TriggerRequest
+from .queue import QueueLease, QueueMessage, QueueStore, ReactionRecord, TriggerRequest
 
 __all__ = [
     "events",
@@ -56,6 +57,7 @@ __all__ = [
     "QueueMessage",
     "QueueStore",
     "TriggerRequest",
+    "ReactionRecord",
     "ActiveTurn",
     "GroupDispatcher",
     "build_agent_context",
@@ -66,6 +68,7 @@ __all__ = [
     "CONFIG_WRITE_TOOLS",
     "build_role_tools",
     "build_trusted_users",
+    "chat_access_allowed",
     "is_onebot_tool_name",
     "parse_exact_tool_names",
     "role_for_user",

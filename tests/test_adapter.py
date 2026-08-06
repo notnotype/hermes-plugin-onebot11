@@ -7,7 +7,9 @@ CI 环境没有 gateway 时自动跳过。
 import asyncio
 import json
 import os
+import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -44,6 +46,11 @@ def _make_adapter(monkeypatch, **env) -> OneBot11Adapter:
     for key, value in env.items():
         monkeypatch.setenv(key, value)
     return OneBot11Adapter(PlatformConfig(enabled=True, extra={}))
+
+
+async def _async_result(value):
+    """把同步测试值包装成可 await 的结果。"""
+    return value
 
 
 @pytest.fixture
@@ -269,6 +276,65 @@ async def test_入站群聊事件先进入持久队列(monkeypatch):
     assert len(messages) == 1
     assert messages[0].text == "在吗"
     assert adapter._queue.status("888")["pending"] == 1
+
+
+async def test_纯图片消息不因空文本崩溃并保留file字段(monkeypatch):
+    """纯媒体事件也必须先持久化，不能在命令解析阶段 IndexError。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    raw = {
+        "post_type": "message",
+        "message_type": "group",
+        "message_id": 9001,
+        "group_id": 888,
+        "user_id": 123,
+        "message": [{"type": "image", "data": {"file": "pic.jpg"}}],
+        "sender": {"nickname": "小明"},
+    }
+    try:
+        await adapter._on_ws_event(raw)
+        messages = adapter._queue.peek("888")
+        assert len(messages) == 1
+        assert messages[0].text == ""
+        assert messages[0].metadata["onebot11_image_files"] == ["pic.jpg"]
+    finally:
+        await adapter.disconnect()
+
+
+async def test_get_image本地文件只允许显式媒体根(monkeypatch, tmp_path):
+    """OneBot get_image 返回路径时，只复制配置根目录内的真实图片。"""
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source = source_root / "image.png"
+    source.write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00\x00IEND\xaeB`\x82")
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "media_source_roots": [str(source_root)],
+            },
+        )
+    )
+    monkeypatch.setattr(adapter._api, "get_image", lambda _file: _async_result({"file": str(source)}))
+    try:
+        destination = await adapter._download_image("file-id", adapter._media_dir)
+        assert destination is not None
+        assert Path(destination).read_bytes().startswith(b"\x89PNG")
+        outside = tmp_path / "outside.png"
+        outside.write_bytes(source.read_bytes())
+        monkeypatch.setattr(
+            adapter._api,
+            "get_image",
+            lambda _file: _async_result({"file": str(outside)}),
+        )
+        assert await adapter._download_image("outside", adapter._media_dir) is None
+    finally:
+        await adapter.disconnect()
 
 
 async def test_群turn给触发消息加眼睛并在收尾移除(monkeypatch):
@@ -563,6 +629,72 @@ async def test_require_mention不影响私聊(monkeypatch):
     await adapter._on_ws_event(raw)
     assert len(recorded) == 1
     assert recorded[0].source.role_authorized is True
+
+
+async def test_LLM判断期间新增消息会再次判断(monkeypatch):
+    """旁路模型判断期间到达的新消息不能静默留在 pending。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "sidecar",
+                    "model": "judge",
+                    "groups": ["888"],
+                },
+            },
+        )
+    )
+    first = adapter_module.QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1",
+        user_id="123",
+        user_name="小明",
+        text="第一条",
+        message_key="group:1",
+    )
+    second = replace(first, message_id="2", message_key="group:2", text="第二条")
+    adapter._queue.enqueue(first)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def fake_call(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            started.set()
+            await release.wait()
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="false"))]
+        )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.auxiliary_client",
+        SimpleNamespace(async_call_llm=fake_call),
+    )
+    try:
+        task = asyncio.create_task(adapter._judge_llm_trigger("888"))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        adapter._queue.enqueue(second)
+        release.set()
+        await asyncio.wait_for(task, timeout=1)
+        for _ in range(20):
+            retry = adapter._llm_trigger_tasks.get("888")
+            if retry is None:
+                await asyncio.sleep(0.01)
+                continue
+            await asyncio.wait_for(retry, timeout=1)
+            break
+        assert calls == 2
+        assert adapter._queue.status("888")["pending_trigger_requests"] == 0
+    finally:
+        await adapter.disconnect()
 
 
 async def test_群白名单内群放行(monkeypatch):
@@ -878,6 +1010,114 @@ async def test_未知qq工具hook直接拒绝(monkeypatch):
     await adapter.disconnect()
 
 
+async def test_普通工具在adapter缺失时fail_closed(monkeypatch):
+    """OneBot caller 存在但 live adapter 消失时，普通宿主工具也不能放行。"""
+    caller = adapter_module.CallerContext(
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+    )
+    adapter_module._CURRENT_CALLER.set(caller)
+    adapter_module._CURRENT_BINDING.set(None)
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: None)
+    try:
+        result = adapter_module._pre_tool_call_hook(
+            tool_name="terminal",
+            session_id="session",
+            turn_id="turn",
+            args={},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+    finally:
+        adapter_module._CURRENT_CALLER.set(None)
+        adapter_module._CURRENT_BINDING.set(None)
+
+
+async def test_审计写失败不改变权限拒绝结果(monkeypatch):
+    """审计磁盘故障不能让拒绝 hook 抛异常或 fail-open。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    event = await adapter._build_message_event(
+        InboundEvent(
+            text="查询",
+            chat_id="888",
+            chat_type="group",
+            user_id="123",
+            user_name="小明",
+            message_id="1001",
+        )
+    )
+    event.metadata["onebot11_caller_context"] = adapter_module._serializable_caller(
+        adapter._caller_for_event(event.source)
+    )
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    adapter_module._pre_gateway_dispatch_hook(event)
+    adapter_module._pre_llm_call_hook(
+        session_id="session-a",
+        turn_id="turn-a",
+        platform="onebot11",
+    )
+
+    def broken_record(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(adapter._audit, "record", broken_record)
+    try:
+        result = adapter_module._pre_tool_call_hook(
+            tool_name="terminal",
+            session_id="session-a",
+            turn_id="turn-a",
+            args={},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+    finally:
+        adapter_module._CURRENT_BINDING.set(None)
+        adapter_module._CURRENT_CALLER.set(None)
+        await adapter.disconnect()
+
+
+async def test_delegate_task禁止配置和运行(monkeypatch):
+    """在 Hermes 尚未支持 per-turn 子代理授权前，OneBot 不接受 delegate_task。"""
+    with pytest.raises(ValueError):
+        OneBot11Adapter(
+            PlatformConfig(
+                enabled=True,
+                extra={
+                    "http_api": "http://127.0.0.1:3000",
+                    "self_id": "1",
+                    "roles": {"user": {"tools": ["delegate_task"]}},
+                },
+            )
+        )
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    adapter_module._CURRENT_CALLER.set(
+        adapter_module.CallerContext(user_id="123", chat_type="group", chat_id="888")
+    )
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    try:
+        result = adapter_module._pre_tool_call_hook(
+            tool_name="delegate_task",
+            session_id="s",
+            turn_id="t",
+            args={},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+    finally:
+        adapter_module._CURRENT_BINDING.set(None)
+        adapter_module._CURRENT_CALLER.set(None)
+        await adapter.disconnect()
+
+
 async def test_未知onebot工具hook直接拒绝(monkeypatch):
     """没有注册的 onebot_ 工具同样不能绕过 pre_tool_call。"""
     adapter = _make_adapter(
@@ -893,8 +1133,8 @@ async def test_未知onebot工具hook直接拒绝(monkeypatch):
     await adapter.disconnect()
 
 
-async def test_其他平台即使复用相同turn也不受OneBot绑定影响(monkeypatch):
-    """明确的其他平台 turn 不能被 OneBot binding 误拦截。"""
+async def test_其他平台不能继承OneBot调用者权限(monkeypatch):
+    """OneBot caller 不能把当前权限带到 subagent 或其他 platform。"""
     adapter = _make_adapter(
         monkeypatch,
         ONEBOT11_HTTP_API="http://127.0.0.1:3000",
@@ -917,13 +1157,15 @@ async def test_其他平台即使复用相同turn也不受OneBot绑定影响(mon
     assert adapter_module._pre_llm_call_hook(
         session_id="same-session", turn_id="same-turn", platform="onebot11"
     ) is not None
-    assert adapter_module._pre_tool_call_hook(
+    blocked_cross_platform = adapter_module._pre_tool_call_hook(
         tool_name="web_search",
         session_id="same-session",
         turn_id="same-turn",
         platform="discord",
         args={},
-    ) is None
+    )
+    assert blocked_cross_platform is not None
+    assert blocked_cross_platform["action"] == "block"
     child_result = json.loads(
         await adapter._make_tool_handler("qq_get_group_info")(
             {},
@@ -1120,6 +1362,22 @@ async def test_get_chat_info重新检查当前访问策略(monkeypatch):
     with pytest.raises(ValueError):
         await adapter.get_chat_info("888")
     await adapter.disconnect()
+
+
+async def test_cron独立发送复用OneBot白名单(monkeypatch):
+    """cron 不能绕过 adapter 的群白名单和私聊策略。"""
+    monkeypatch.setenv("ONEBOT11_ALLOWED_GROUPS", "1072992996")
+    result = await adapter_module._standalone_send(
+        SimpleNamespace(
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "home_channel_type": "group",
+            }
+        ),
+        "786830134",
+        "不应发送",
+    )
+    assert result["status"] == "permission_error"
 
 
 def test_register注册平台与工具():

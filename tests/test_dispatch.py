@@ -131,3 +131,17 @@ async def test_持久化完成失败不会报告完成(tmp_path, monkeypatch):
     assert dispatcher.active("888") is None
     await dispatcher.close()
     store.close()
+
+
+async def test_shutdown后straggler完成不会访问已关闭SQLite(tmp_path):
+    """dispatcher close 后旧 turn 只能被 fencing，不能再触碰 QueueStore。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    message = _message("shutdown")
+    store.enqueue(message, TriggerRequest.create("888", "group:shutdown", "mention", "1", "用户1"))
+    lease = store.claim("888")
+    assert lease is not None
+    dispatcher = GroupDispatcher(store, lambda _lease: asyncio.sleep(0))
+    dispatcher._active["888"] = ActiveTurn(lease, lease.claimed_at)
+    await dispatcher.close()
+    store.close()
+    assert not await dispatcher.complete(lease.lease_id, outcome="success", unknown=False)

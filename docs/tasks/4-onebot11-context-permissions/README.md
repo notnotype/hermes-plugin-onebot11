@@ -1,7 +1,7 @@
 # OneBot 11 上下文物化与细粒度权限
 
 - 关联 issue：[#6](https://github.com/notnotype/hermes-plugin-onebot11/issues/6)
-- 状态：本地实现、Arch + LLBot 指定白名单联调完成，待 PR 收口
+- 状态：本地实现和安全收口完成；Arch + LLBot 既有版本联调完成，本轮新增恢复/媒体边界尚待重新部署验收
 - 开始日期：2026-08-06
 
 ## 用户需求
@@ -27,31 +27,36 @@
 6. 在 adapter 入站层增加群只读 slash command 和危险命令拒绝。
 7. 记录 Hermes 当前版本没有 `pre_provider_request`；插件仅在宿主公开该 hook 时注册动态 request copy 适配器。
 8. 在 Arch `192.168.1.18` 部署 `0.3.0`，用真实反向 WS/HTTP 链路完成指定群、指定私聊、shared session、slash、reaction、权限拒绝和白名单负向验证。
+9. 收口入站/cron/恢复统一白名单、持久 cooldown、LLM 判断重唤醒、reaction unset 恢复、shutdown fencing、delegate_task 禁止和 OneBot `get_image` 受控本地复制。
 
 ## 变更文件
 
 - `onebot11/context.py`：batch 摘要、最近原文和动态 request context。
 - `onebot11/permissions.py`：三角色、精确工具名、trusted 用户和权限合同。
 - `onebot11/queue.py`：当前 batch 摘要物化，停止 ack 后滚动摘要追加。
+- `onebot11/queue.py`：持久 cooldown 时间、reaction 清理状态和恢复退避。
 - `onebot11/tools.py`：权限配置工具 schema。
 - `onebot11/__init__.py`：导出新增纯协议 API。
 - `adapter.py`：角色/配置工具、全量工具 hook、provider hook 兼容点和群 slash command。
+- `adapter.py`：cron/恢复访问策略、权限 fail-closed、LLM 重唤醒、reaction 恢复、get_image 媒体边界和关闭 fencing。
 - `tests/test_context.py`、`tests/test_permissions.py`、`tests/test_queue.py`、`tests/test_adapter.py`、`tests/test_tools.py`：回归矩阵。
 - `docs/permissions.md`、`README.md`、`docs/adr/0004-context-materialization-and-tool-policy.md`：合同同步。
 
 ## 验证结果
 
-- 纯插件环境：`pytest -q` -> `101 passed, 1 skipped`；跳过项是没有 Hermes `gateway` 依赖的 adapter 集成测试。
+- 纯插件环境：`pytest -q` -> `108 passed, 1 skipped`；跳过项是没有 Hermes `gateway` 依赖的 adapter 集成测试。
 - 纯插件环境：`ruff check .` 通过。
-- 接入本机 Hermes 源码和依赖：`pytest -q` -> `149 passed`，adapter 集成测试不再因缺少 Hermes gateway 而跳过。
+- 接入本机 Hermes 源码和依赖：`pytest -q` -> `163 passed`，adapter 集成测试不再因缺少 Hermes gateway 而跳过。
 - 已覆盖 batch 重复注入、UTF-8 字节预算、最近原文、动态文本标记、角色优先级、wildcard 拒绝、通用 Hermes 工具门禁、权限配置写入保护、群 slash 旁路和危险命令拒绝。
 - Hermes 临时 `HERMES_HOME` smoke 已完成：平台、12 个 OneBot 工具、4 个现有安全 hooks 和 `onebot11_trigger` auxiliary 均注册；当前 Hermes 没有 `pre_provider_request`，因此动态上下文仍是上游接口待办。
 - Arch + LLBot 外部联调已完成：配置只允许群 `1072992996` 和私聊用户 `2056963663`；共享 key 为 `agent:main:onebot11:group:1072992996`，两个群用户计算结果一致。
 - 外部链路已验证：`/context` 不进队列；`/status` 标注 `chat_type=group` 且不回传旧 summary；普通用户 `/whoami` 只有当前范围只读工具；普通用户调用 `terminal` 被 hook/handler 拒绝；群 turn 的 reaction 按 `set=true -> 回复 -> set=false` 完成；允许私聊正常回复；非白名单群和私聊只有 `access_denied` 审计且无出站。
 - 外部消息使用真实反向 WS 的合成 OneBot payload，未冒充真人 QQ 客户端输入；群管理写操作预览/确认、unknown 出站人工 resolve 和 Hermes 上游接口仍未在本 Task 外部验证。
+- 本轮新增的持久 cooldown、reaction 重启清理、cron 负向和 get_image 本地根目录安全测试已在本地覆盖；尚未重新部署到 Arch。
 
 ## 后续 TODO
 
 - Hermes 上游：增加真正的 `pre_provider_request`，每次 provider request/retry 接收 request copy 并允许返回替换副本；增加 per-turn exact `allowed_tool_names`，并贯穿 tool search、`execute_code` 和 delegation 子 Agent。
 - Docker 子代理：单独任务实现容器、共享目录、资源/网络限制、凭据隔离和结果大小限制。
 - 真实联调：严格只使用群 `1072992996` 和私聊用户 `2056963663`，验证两角色共享 session、配置确认、群 slash 和权限拒绝。
+- Hermes 上游：`delegate_task` 暂时禁止；待上游提供 per-turn 工具策略后再恢复子代理能力。

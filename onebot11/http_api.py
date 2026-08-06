@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 QUERY_ACTIONS = frozenset(
     {
         "get_msg",
+        "get_image",
         "get_group_msg_history",
         "get_friend_msg_history",
         "get_group_info",
@@ -164,6 +165,24 @@ def _matches_image_magic(data: bytes, content_type: str, url: str) -> bool:
         return normalized == detected
     suffix = Path(urlsplit(url).path).suffix.lower()
     return suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp"} and normalized == ""
+
+
+def is_valid_image_bytes(data: bytes, content_type: str = "", url: str = "") -> bool:
+    """公开图片魔数校验，供本地 ``get_image`` 文件复制复用。"""
+    return _matches_image_magic(data, content_type, url)
+
+
+def image_suffix(data: bytes) -> str:
+    """根据图片魔数返回安全扩展名。"""
+    if data.startswith(b"\x89PNG"):
+        return ".png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if data.startswith((b"GIF87a", b"GIF89a")):
+        return ".gif"
+    if data.startswith(b"RIFF"):
+        return ".webp"
+    return ".bin"
 
 
 class OneBotHttpApi:
@@ -450,19 +469,19 @@ class OneBotHttpApi:
 
     def _image_suffix(self, data: bytes, content_type: str) -> str:
         """依据魔数选择稳定扩展名。"""
-        if data.startswith(b"\x89PNG"):
-            return ".png"
-        if data.startswith(b"\xff\xd8\xff"):
-            return ".jpg"
-        if data.startswith((b"GIF87a", b"GIF89a")):
-            return ".gif"
-        if data.startswith(b"RIFF"):
-            return ".webp"
-        return ".bin"
+        del content_type
+        return image_suffix(data)
 
     async def get_message(self, message_id: str) -> dict:
         """查询单条消息。"""
         return await self.call_action("get_msg", {"message_id": int(message_id)})
+
+    async def get_image(self, file_id: str) -> dict:
+        """把 OneBot image file 标识解析为受控的本地路径或 URL。"""
+        normalized = str(file_id or "").strip()
+        if not normalized:
+            raise ValueError("图片 file 不能为空")
+        return await self.call_action("get_image", {"file": normalized})
 
     async def get_group_msg_history(self, group_id: str, count: int = 20) -> list[dict]:
         """查询群消息历史。"""

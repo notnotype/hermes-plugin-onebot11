@@ -1,7 +1,7 @@
 # OneBot 11 可靠性与安全完善
 
 - 关联需求：OneBot 11 插件整体完善计划
-- 状态：本地实现完成，已完成 Arch + LLBot 指定白名单及群处理 reaction 指示器联调，待独立分支/PR 和剩余外部验收
+- 状态：本地实现完成；Task 4 收口补充了访问策略、cooldown/reaction 恢复和媒体边界，既有 Arch 联调尚未覆盖本轮新增代码
 - 开始日期：2026-08-05
 
 ## 目标
@@ -19,6 +19,7 @@
 4. 权限：普通用户默认只读，超级管理员列表和角色工具并集；群管理写工具预览 + 同群同管理员短期单次确认。
 5. 协议可靠性：WS 有界接收、同 chat 顺序、inflight 限制、失败关闭连接；HTTP 查询有限重试，非幂等动作永不自动重试；媒体 SSRF/类型/大小限制；支持 LLBot reaction action。
 6. 生命周期：部分发送、连接中断、取消或 turn 在发送后失败均进入 `uncertain`；群 turn 默认显示 👀，收尾时尽力清理；确认命令在 adapter 入站层处理。
+7. 收口：cron 和恢复复用同一访问策略；cooldown 时间与 reaction 状态持久化；关闭时 fencing 旧 turn；`delegate_task` fail-closed；非 URL 图片通过 `get_image` 和显式媒体根目录处理。
 
 ## 关键决策
 
@@ -28,8 +29,8 @@
 
 ## 验证
 
-- 本地协议和状态机：`.venv\\Scripts\\python.exe -m pytest -q`，当前结果 `93 passed, 1 skipped`；adapter 文件在没有 Hermes 依赖的环境按设计跳过。
-- Hermes 集成：把 `C:\Users\notnotype\AppData\Local\hermes\hermes-agent` 和其 `venv/Lib/site-packages` 放入 `PYTHONPATH` 后运行全套测试，当前结果 `134 passed`，覆盖真实 adapter import、注册、4 个 hooks、工具 handler、shared session key、lease 恢复、媒体孤儿清理、负数 message_id 和 reaction 生命周期。
+- 本地协议和状态机：`uv run --extra dev pytest -q`，当前结果 `108 passed, 1 skipped`；adapter 文件在没有 Hermes 依赖的环境按设计跳过。
+- Hermes 集成：使用本地 Hermes 源码和依赖环境运行全套测试，当前结果 `163 passed`，覆盖 adapter import、注册、hooks、工具 handler、shared session key、lease 恢复、cooldown 重唤醒、reaction 清理、媒体根目录和非幂等出站。
 - 静态检查：`.venv\\Scripts\\python.exe -m ruff check .`，当前通过。
 - Arch + LLBot 8.1.5 外部联调已完成：Hermes 实际加载 0.2.0 插件，群 `1072992996` 使用 shared session，私聊白名单只有 `2056963663`；真实 WS/HTTP 连接、允许群 @/私聊 Agent 回复、pending 重启恢复、管理员 flush、非白名单拒绝、审计和群处理 reaction（`set=true` -> 回复 -> `set=false`）均已验证。Agent 入站使用真实 WS 的合成 OneBot payload，真人 QQ 入站、双用户并发、确认写操作和 unknown 出站仍待验收。
 

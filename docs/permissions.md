@@ -64,6 +64,7 @@ platforms:
 工具名逐个精确匹配，不支持 `*`、`?`、toolset 名或模糊前缀。没有显式配置时，`user` 默认只有当前范围内的只读 OneBot 工具，`trusted_user` 默认为空，`super_admin` 默认只有本插件的 OneBot 工具。网页搜索、网页提取、浏览器、终端、文件/MCP 工具必须显式列入受信角色或超级管理员角色；插件不把这些高风险工具偷偷加入普通用户。
 
 Hermes schema 继续提供所有角色允许工具的并集，以保持共享 session 的 schema 稳定；实际执行时当前 turn 使用不可变权限快照，并在权限收紧后于下一次工具调用重新检查。当前插件的 `pre_tool_call` 会检查所有工具名，包括 `tool_search`、`execute_code`、`delegate_task`；宿主未来还需要把同一集合传入 tool search 和子 Agent 的 tool registry，才能让“不可见”和“不可执行”同时成立。
+在 Hermes 上游提供 per-turn 工具策略前，OneBot 角色不能配置或调用 `delegate_task`；它不能把 QQ caller 的权限传递给子 Agent。`tool_search` 没有完整 turn 身份时也会 fail-closed。`execute_code` 若显式授予，代表完整的高风险本机代码执行能力，不应放入普通 `user` 角色。
 
 权限配置工具为：
 

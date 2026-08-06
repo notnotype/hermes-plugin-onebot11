@@ -254,6 +254,17 @@ async def test_查询私聊历史(fake_server):
     await api.close()
 
 
+async def test_get_image使用file字段查询(fake_server):
+    """非 URL 图片先通过 OneBot get_image 解析，不能把 file 直接当 URL。"""
+    base, calls, _ = fake_server
+    api = OneBotHttpApi(base_url=base)
+    result = await api.get_image("abc.jpg")
+    assert result["message_id"] == 42
+    assert calls[0]["path"] == "/get_image"
+    assert calls[0]["params"] == {"file": "abc.jpg"}
+    await api.close()
+
+
 def test_长文本分块():
     """超过限制的文本按行/字符切成多块,不截断单词。"""
     text = "一" * 30 + " " + "二" * 30

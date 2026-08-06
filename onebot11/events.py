@@ -22,6 +22,8 @@ class InboundEvent:
     user_name: str
     message_id: str
     images: list[str] = field(default_factory=list)
+    image_urls: list[str] = field(default_factory=list)
+    image_files: list[str] = field(default_factory=list)
     reply_to_message_id: str | None = None
     mentioned_self: bool = False
     markers: list[str] = field(default_factory=list)
@@ -151,6 +153,8 @@ def build_inbound_event(raw: Mapping[str, Any], self_id: str | None) -> InboundE
         user_name=user_name,
         message_id=message_id,
         images=parsed.images,
+        image_urls=parsed.image_urls,
+        image_files=parsed.image_files,
         reply_to_message_id=parsed.reply_to_message_id,
         mentioned_self=parsed.mentioned_self,
         markers=parsed.markers,

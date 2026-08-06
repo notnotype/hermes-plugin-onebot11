@@ -11,6 +11,7 @@
 - **图片与消息段**：兼容 array/CQ 字符串，支持图片、reply、文件、语音、视频、转发和未知段标记；图片下载有 host、端口、类型、魔数和大小限制。
 - **工具与管理**：提供当前群/私聊范围内的查询工具，以及撤回、禁言、踢人、全员禁言工具。写操作只生成预览，必须由同一超级管理员在同一目标群发送短期确认命令；权限可按精确工具名配置为 user、trusted_user、super_admin。
 - **可靠性**：队列支持崩溃恢复、去重、lease heartbeat 和人工处理 `uncertain` 出站结果。OneBot 非幂等请求不自动重试，不承诺 exactly-once。
+- **安全边界**：白名单同时约束实时入站、cron 和恢复；普通 OneBot caller 不能跨到 subagent。`delegate_task` 在 Hermes 支持 per-turn 工具权限前禁止配置和调用。
 
 ## 环境要求
 
@@ -105,6 +106,7 @@ platforms:
       max_image_total_bytes: 16000000
       media_allowed_hosts: []   # 图片 URL 必须命中此列表；默认还允许 HTTP API host
       media_allowed_ports: []   # 为空时使用 HTTP API 的端口
+      media_source_roots: []    # get_image 返回的本地文件只能来自这些显式根目录
       llm_trigger:
         enabled: false
         provider: ""
@@ -130,6 +132,7 @@ platforms:
 LLM trigger 默认关闭，启用时必须同时配置明确的旁路 `provider`、`model` 和群 allowlist；缺少模型、超时或返回非法 JSON 都按“不触发”处理。
 `media_orphan_ttl_seconds` 到期后由下一次 adapter 启动或 turn 收尾清理遗留媒体目录。
 `processing_reaction_enabled` 默认开启；它使用 LLBot 的 `set_msg_emoji_like` 扩展，只作用于群聊真实消息 ID。添加或移除 reaction 的未知结果不会重放 Agent turn，也不会阻断队列 ack。
+reaction 的清理状态持久化在队列数据库中；重启或恢复只会有限重试 `unset`，不会重放 `set`、Agent turn 或群管理动作。非 URL 图片会先调用 OneBot `get_image`，只有返回路径位于 `media_source_roots` 时才复制到临时目录。
 
 当前 Hermes 版本没有 request-only provider hook，因此动态时间/目标信息只会在宿主实现 `pre_provider_request` 后注入请求副本，不会用 `pre_llm_call` 伪装。队列 batch 本身直接作为当前 user turn 写入 session，历史消息因此可以继续命中 provider 的前缀缓存。
 

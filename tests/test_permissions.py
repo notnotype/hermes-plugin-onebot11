@@ -11,6 +11,7 @@ from onebot11.permissions import (
     TurnBindingStore,
     build_role_tools,
     build_trusted_users,
+    chat_access_allowed,
     is_onebot_tool_name,
     parse_admin_list,
     role_for_user,
@@ -22,6 +23,21 @@ def test_解析管理员列表():
     assert parse_admin_list("111, 222,333") == {"111", "222", "333"}
     assert parse_admin_list("") == set()
     assert parse_admin_list(None) == set()
+
+
+def test_访问策略群和私聊都必须显式满足合同():
+    """群白名单、私聊 allowlist 和 open 的显式 allow-all 规则保持一致。"""
+    assert chat_access_allowed("group", "1072992996", allowed_groups={"1072992996"})
+    assert not chat_access_allowed("group", "786830134", allowed_groups={"1072992996"})
+    assert chat_access_allowed(
+        "dm",
+        "2056963663",
+        allowed_users={"2056963663"},
+        dm_policy="allowlist",
+    )
+    assert not chat_access_allowed("dm", "2056963663", dm_policy="open")
+    assert chat_access_allowed("dm", "2056963663", dm_policy="open", allow_all_users=True)
+    assert not chat_access_allowed("unknown", "1072992996")
 
 
 def test_普通工具群聊可用():
@@ -111,6 +127,8 @@ def test_角色优先级和精确工具名():
     assert role_for_user("200", {"200"}, set()) == "super_admin"
     with pytest.raises(ValueError):
         build_role_tools({"roles": {"user": {"tools": ["browser_*"]}}})
+    with pytest.raises(ValueError):
+        build_role_tools({"roles": {"user": {"tools": ["delegate_task"]}}})
 
 
 def test_通用Hermes工具也遵守角色快照():

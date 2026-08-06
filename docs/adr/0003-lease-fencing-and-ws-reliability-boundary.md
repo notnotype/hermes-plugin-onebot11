@@ -19,10 +19,14 @@
 
 确认写操作的令牌和 unknown 动作阻断记录属于 adapter 进程内存状态；重启会使令牌失效并清空阻断记录。持久化的是队列、lease 阶段和审计摘要，不把管理动作参数或 token 扩展成永久操作 tombstone。
 
+### Reaction 清理
+
+群处理 reaction 是控制面 UI 指示器，不是业务动作。调用 `set=true` 前会持久化目标，成功或结果未知后记录为可清理状态；turn 收尾、恢复轮询和重启只允许有限重试 `set=false`。不会因为 reaction 状态而重放 Agent turn、群管理动作或 `set=true`。当前群访问白名单收紧时，恢复路径不向该群发送清理请求。
+
 ## 原因
 
 OneBot 11 没有可供插件依赖的非幂等请求幂等键。网络断开时无法区分请求未到达、已执行但响应丢失或仍在执行；同样，进程在 SQLite 入队前崩溃时无法从本插件恢复原始事件。将可证明的状态范围写清楚，比伪造更强的可靠性承诺更安全，也避免引入独立 spool 的额外存储和恢复系统。
 
 ## 影响
 
-输入消息是至少一次语义；非幂等出站是 unknown-safe 语义。管理员必须通过 `/onebot resolve retry|discard` 明确处理 uncertain/failed 队列。默认队列、审计和媒体目录写入 Hermes home，测试或部署可用显式路径隔离。
+输入消息是至少一次语义；非幂等业务出站是 unknown-safe 语义。管理员必须通过 `/onebot resolve retry|discard` 明确处理 uncertain/failed 队列。reaction 清理属于独立的有限 best-effort 控制面流程。默认队列、审计和媒体目录写入 Hermes home，测试或部署可用显式路径隔离。

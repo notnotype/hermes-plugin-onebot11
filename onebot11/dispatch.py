@@ -36,8 +36,10 @@ class GroupDispatcher:
         lease_seconds: float = 120.0,
         heartbeat_seconds: float | None = None,
         recovery_poll_seconds: float = 5.0,
+        cooldown_seconds: float = 0.0,
         can_dispatch: Callable[[str], bool] | None = None,
         on_lease_lost: Callable[[QueueLease], Awaitable[None]] | None = None,
+        on_recovery_tick: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """初始化调度器；lease 的续租由后台 heartbeat 负责。"""
         self.store = store
@@ -45,8 +47,10 @@ class GroupDispatcher:
         self.lease_seconds = max(5.0, float(lease_seconds))
         self.heartbeat_seconds = heartbeat_seconds or max(1.0, self.lease_seconds / 3)
         self.recovery_poll_seconds = max(0.05, float(recovery_poll_seconds))
+        self.cooldown_seconds = max(0.0, float(cooldown_seconds))
         self._can_dispatch = can_dispatch or (lambda _chat_id: True)
         self._on_lease_lost = on_lease_lost
+        self._on_recovery_tick = on_recovery_tick
         self._locks: dict[str, asyncio.Lock] = {}
         self._active: dict[str, ActiveTurn] = {}
         self._heartbeat_tasks: dict[str, asyncio.Task[None]] = {}
@@ -186,10 +190,18 @@ class GroupDispatcher:
             return []
         self._ensure_recovery_loop()
         requests = await asyncio.to_thread(self.store.recover_trigger_requests)
+        due_requests = await asyncio.to_thread(
+            self.store.recover_due_triggers,
+            None,
+            self.cooldown_seconds,
+        )
+        requests = (*requests, *due_requests)
+        if self._on_recovery_tick is not None:
+            await self._on_recovery_tick()
         chats: list[str] = []
-        for request in requests:
-            if self._can_dispatch(request.chat_id) and await self.notify(request.chat_id):
-                chats.append(request.chat_id)
+        for chat_id in dict.fromkeys(request.chat_id for request in requests):
+            if self._can_dispatch(chat_id) and await self.notify(chat_id):
+                chats.append(chat_id)
         return chats
 
     def _ensure_recovery_loop(self) -> None:
@@ -203,7 +215,14 @@ class GroupDispatcher:
             while not self._closed:
                 await asyncio.sleep(self.recovery_poll_seconds)
                 requests = await asyncio.to_thread(self.store.recover_trigger_requests)
-                for request in requests:
+                due_requests = await asyncio.to_thread(
+                    self.store.recover_due_triggers,
+                    None,
+                    self.cooldown_seconds,
+                )
+                if self._on_recovery_tick is not None:
+                    await self._on_recovery_tick()
+                for request in (*requests, *due_requests):
                     chat_id = request.chat_id
                     if (
                         not self._can_dispatch(chat_id)
@@ -252,8 +271,14 @@ class GroupDispatcher:
         )
 
     async def close(self) -> None:
-        """停止 heartbeat；不擅自改变 lease 状态，交给恢复流程处理。"""
+        """立即 fencing 内存活动 lease，再停止 heartbeat 和恢复任务。"""
         self._closed = True
+        for chat_id, active in list(self._active.items()):
+            self._active[chat_id] = ActiveTurn(
+                lease=active.lease,
+                started_at=active.started_at,
+                lease_lost=True,
+            )
         recovery = self._recovery_task
         self._recovery_task = None
         if recovery is not None:
@@ -273,3 +298,4 @@ class GroupDispatcher:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self._active.clear()

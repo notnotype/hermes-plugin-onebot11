@@ -20,6 +20,8 @@ class ParsedMessage:
 
     text: str = ""
     images: list[str] = field(default_factory=list)
+    image_urls: list[str] = field(default_factory=list)
+    image_files: list[str] = field(default_factory=list)
     mentioned_qq: list[str] = field(default_factory=list)
     mentioned_self: bool = False
     reply_to_message_id: str | None = None
@@ -70,7 +72,16 @@ def parse_message_segments(segments: list[dict[str, Any]] | str, self_id: str | 
         data = raw_segment.get("data") or {}
         if not isinstance(data, dict):
             data = {}
-        result.segments.append({"type": seg_type, "data": {str(k): str(v) for k, v in data.items() if k != "url"}})
+        result.segments.append(
+            {
+                "type": seg_type,
+                "data": {
+                    str(k): str(v)[:512]
+                    for k, v in data.items()
+                    if k in {"file", "url", "id", "name", "text", "qq", "time"}
+                },
+            }
+        )
         if seg_type == "text":
             result.text += str(data.get("text") or "")
         elif seg_type == "at":
@@ -82,9 +93,15 @@ def parse_message_segments(segments: list[dict[str, Any]] | str, self_id: str | 
             elif qq:
                 result.mentioned_qq.append(qq)
         elif seg_type == "image":
-            file_id = data.get("url") or data.get("file")
-            if file_id:
-                result.images.append(str(file_id))
+            url = str(data.get("url") or "").strip()
+            file_id = str(data.get("file") or "").strip()
+            if url:
+                result.images.append(url)
+                result.image_urls.append(url)
+            if file_id and file_id != url:
+                result.images.append(file_id)
+                result.image_files.append(file_id)
+            if url or file_id:
                 result.markers.append("[image]")
         elif seg_type == "reply":
             reply_id = str(data.get("id") or "")
