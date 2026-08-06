@@ -222,6 +222,126 @@ def test_v5活动lease升级到v6不被误标记为unknown(tmp_path, monkeypatch
     migrated.close()
 
 
+def test_v7旧格式保留revision并补齐当前扩展(tmp_path):
+    """已部署过的 schema 7 只能增量补齐，不能丢掉 revision 或拒绝启动。"""
+    path = tmp_path / "queue.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE onebot_queue_chat (
+            chat_id TEXT PRIMARY KEY,
+            next_seq INTEGER NOT NULL DEFAULT 1,
+            summary TEXT NOT NULL DEFAULT '',
+            paused INTEGER NOT NULL DEFAULT 0,
+            updated_at REAL NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE TABLE onebot_queue_message (
+            row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT NOT NULL,
+            message_key TEXT NOT NULL,
+            chat_type TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            user_name TEXT NOT NULL,
+            text TEXT NOT NULL,
+            raw_text TEXT NOT NULL,
+            message_id TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            byte_size INTEGER NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('pending','leased','uncertain','failed')),
+            lease_id TEXT,
+            lease_until REAL,
+            lease_owner TEXT,
+            lease_phase TEXT NOT NULL DEFAULT 'agent_running',
+            outbound_started INTEGER NOT NULL DEFAULT 0,
+            uncertain_reason TEXT,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            failure_count INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at REAL,
+            failure_reason TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(chat_id, message_key)
+        );
+        CREATE TABLE onebot_queue_trigger (
+            request_id TEXT PRIMARY KEY,
+            chat_id TEXT NOT NULL,
+            message_key TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            caller_user_id TEXT NOT NULL,
+            caller_user_name TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('pending','claimed','uncertain','failed')),
+            lease_id TEXT,
+            lease_owner TEXT,
+            uncertain_reason TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(chat_id, message_key)
+        );
+        INSERT INTO onebot_queue_chat(chat_id, next_seq, revision, updated_at)
+        VALUES ('888', 2, 41, 1000);
+        INSERT INTO onebot_queue_message(
+            chat_id, message_key, chat_type, user_id, user_name, text, raw_text,
+            metadata_json, seq, byte_size, state, created_at, updated_at
+        ) VALUES (
+            '888', 'group:legacy', 'group', '123', '小明', '旧消息', '旧消息',
+            '{}', 1, 8, 'pending', 1000, 1000
+        );
+        INSERT INTO onebot_queue_trigger(
+            request_id, chat_id, message_key, reason, caller_user_id,
+            caller_user_name, status, created_at, updated_at
+        ) VALUES (
+            'trigger-legacy', '888', 'group:legacy', 'mention', '123',
+            '小明', 'pending', 1000, 1000
+        );
+        PRAGMA user_version=7;
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = QueueStore(path)
+    chat_columns = {
+        str(row[1])
+        for row in migrated._conn.execute(
+            "PRAGMA table_info(onebot_queue_chat)"
+        ).fetchall()
+    }
+    assert {"revision", "last_trigger_at"}.issubset(chat_columns)
+    assert migrated._conn.execute(
+        "SELECT revision FROM onebot_queue_chat WHERE chat_id='888'"
+    ).fetchone()[0] == 41
+    assert migrated._conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='onebot_queue_reaction'"
+    ).fetchone() is not None
+    assert migrated.status("888")["pending"] == 1
+
+    assert migrated.enqueue(_message("new")).inserted
+    assert migrated._conn.execute(
+        "SELECT revision FROM onebot_queue_chat WHERE chat_id='888'"
+    ).fetchone()[0] == 42
+    migrated.close()
+
+
+def test_未知更高schema仍然拒绝启动(tmp_path):
+    """schema 8 及以上不能被当前插件猜测迁移。"""
+    path = tmp_path / "queue.sqlite3"
+    store = QueueStore(path)
+    store.close()
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA user_version=8")
+    connection.commit()
+    connection.close()
+
+    try:
+        QueueStore(path)
+    except Exception as exc:
+        assert "高于支持版本" in str(exc)
+    else:
+        raise AssertionError("未知更高 schema 未被拒绝")
+
+
 def test_pending_chat_ids只返回待处理群(tmp_path):
     """启动时可以发现没有 durable trigger 的遗留消息。"""
     store = QueueStore(tmp_path / "queue.sqlite3")

@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_BACKOFF_SECONDS = (2.0, 4.0, 8.0)
 MAX_BACKOFF_SECONDS = 60.0
@@ -198,6 +198,7 @@ class QueueStore:
                 "PRAGMA table_info(onebot_queue_trigger)"
             ).fetchall()
         }
+        required_chat = {"chat_id", "next_seq", "summary", "paused", "updated_at"}
         required_message = {
             "chat_id", "message_key", "chat_type", "user_id", "user_name", "text",
             "raw_text", "metadata_json", "seq", "byte_size", "state", "lease_id",
@@ -207,9 +208,14 @@ class QueueStore:
             "request_id", "chat_id", "message_key", "reason", "caller_user_id",
             "caller_user_name", "status", "lease_id", "created_at", "updated_at",
         }
-        if not required_message.issubset(message_columns) or not required_trigger.issubset(trigger_columns):
+        if (
+            not required_chat.issubset(chat_columns)
+            or not required_message.issubset(message_columns)
+            or not required_trigger.issubset(trigger_columns)
+        ):
             raise QueueError("OneBot11 queue schema 缺少必需列，无法安全迁移")
         additions = (
+            ("onebot_queue_chat", chat_columns, "revision", "INTEGER NOT NULL DEFAULT 0"),
             ("onebot_queue_chat", chat_columns, "last_trigger_at", "REAL"),
             ("onebot_queue_message", message_columns, "message_id", "TEXT NOT NULL DEFAULT ''"),
             ("onebot_queue_message", message_columns, "lease_owner", "TEXT"),
@@ -430,6 +436,7 @@ class QueueStore:
                 chat_id TEXT PRIMARY KEY,
                 next_seq INTEGER NOT NULL DEFAULT 1,
                 summary TEXT NOT NULL DEFAULT '',
+                revision INTEGER NOT NULL DEFAULT 0,
                 last_trigger_at REAL,
                 paused INTEGER NOT NULL DEFAULT 0,
                 updated_at REAL NOT NULL
@@ -647,7 +654,7 @@ class QueueStore:
                     ).fetchone()[0]
                 )
                 self._conn.execute(
-                    "UPDATE onebot_queue_chat SET next_seq=?, updated_at=? WHERE chat_id=?",
+                    "UPDATE onebot_queue_chat SET next_seq=?, revision=revision+1, updated_at=? WHERE chat_id=?",
                     (next_seq + 1, now, message.chat_id),
                 )
                 self._conn.execute(
@@ -1647,7 +1654,7 @@ class QueueStore:
                     (str(chat_id),),
                 )
                 self._conn.execute(
-                    "UPDATE onebot_queue_chat SET summary='', updated_at=? WHERE chat_id=?",
+                    "UPDATE onebot_queue_chat SET summary='', revision=revision+1, updated_at=? WHERE chat_id=?",
                     (now, str(chat_id)),
                 )
                 self._conn.commit()
