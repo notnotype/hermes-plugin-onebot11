@@ -127,7 +127,7 @@ async def handle_get_group_member_info(api: OneBotHttpApi, params: dict[str, Any
         "get_group_member_info",
         {"group_id": int(ctx.chat_id), "user_id": int(str(params["user_id"]))},
     )
-    error = validate_group_payload(member, ctx)
+    error = validate_group_payload(member, ctx, str(params["user_id"]))
     if error:
         return {"status": "permission_error", "error": error}
     return {"status": "ok", "group_id": ctx.chat_id, "member": member}

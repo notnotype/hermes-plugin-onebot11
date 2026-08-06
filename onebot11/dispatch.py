@@ -86,7 +86,11 @@ class GroupDispatcher:
             await self._start_turn(lease)
         except Exception:
             logger.exception("OneBot11 turn 启动失败: chat=%s lease=%s", chat_id, lease.lease_id)
-            await self.complete(lease.lease_id, outcome="failure", unknown=False)
+            try:
+                await self.complete(lease.lease_id, outcome="failure", unknown=False)
+            except Exception:
+                # 持久化失败时保留 durable lease，等过期恢复；不能用内存状态阻塞整群。
+                logger.exception("OneBot11 turn 启动失败后的 lease 收口失败: %s", lease.lease_id)
             raise
         return True
 
@@ -157,22 +161,25 @@ class GroupDispatcher:
                 self._active.pop(chat_id, None)
                 return False
             changed = False
-            if unknown:
-                changed = await asyncio.to_thread(
-                    self.store.mark_uncertain,
-                    active.lease,
-                    reason or "outbound result unknown",
-                )
-            elif outcome == "success":
-                changed = await asyncio.to_thread(self.store.ack, active.lease)
-            else:
-                changed = await asyncio.to_thread(
-                    self.store.release,
-                    active.lease,
-                    reason=reason,
-                    allow_after_outbound=known_failure,
-                )
-            self._active.pop(chat_id, None)
+            try:
+                if unknown:
+                    changed = await asyncio.to_thread(
+                        self.store.mark_uncertain,
+                        active.lease,
+                        reason or "outbound result unknown",
+                    )
+                elif outcome == "success":
+                    changed = await asyncio.to_thread(self.store.ack, active.lease)
+                else:
+                    changed = await asyncio.to_thread(
+                        self.store.release,
+                        active.lease,
+                        reason=reason,
+                        allow_after_outbound=known_failure,
+                    )
+            finally:
+                # SQLite 异常时 durable lease 仍在库中；只清理内存引用，避免永远卡住该群。
+                self._active.pop(chat_id, None)
         if not changed:
             logger.warning(
                 "OneBot11 lease completion was fenced or already transitioned: %s",
@@ -234,10 +241,16 @@ class GroupDispatcher:
         if error is not None:
             logger.warning("OneBot11 恢复群 %s 失败: %s", chat_id, error)
 
-    async def set_paused(self, chat_id: str, paused: bool) -> None:
-        """暂停或恢复自动 dispatch。"""
+    async def set_paused(
+        self,
+        chat_id: str,
+        paused: bool,
+        *,
+        notify_on_resume: bool = True,
+    ) -> None:
+        """暂停或恢复自动 dispatch；调用方可延迟恢复通知。"""
         await asyncio.to_thread(self.store.set_paused, str(chat_id), paused)
-        if not paused:
+        if not paused and notify_on_resume:
             await self.notify(str(chat_id))
 
     def active(self, chat_id: str) -> ActiveTurn | None:

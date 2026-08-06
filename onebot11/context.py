@@ -50,38 +50,41 @@ def build_agent_context(
     lines = ["[OneBot11 群消息上下文]"]
     if summary:
         summary_budget = min(
-            len(str(summary).encode("utf-8")), max(0, budget // 2)
+            len(str(summary).encode("utf-8")), max(0, budget // 3)
         )
         summary_text = _truncate_utf8_tail(str(summary), summary_budget)
         lines.extend(["历史摘要：", summary_text])
     lines.append("本次待处理消息：")
 
-    selected: list[str] = []
+    selected_newest_first: list[str] = []
     remaining = max(0, budget - len("\n".join(lines).encode("utf-8")) - 1)
     for index, message in reversed(list(enumerate(items))):
         line = _message_line(
             message,
             include_original=index >= max(0, len(items) - max(0, int(recent_originals))),
         )
-        line_bytes = len(line.encode("utf-8")) + (1 if selected else 0)
-        if line_bytes > remaining and not selected:
+        line_bytes = len(line.encode("utf-8")) + (1 if selected_newest_first else 0)
+        if line_bytes > remaining and not selected_newest_first:
+            # 最新消息即使很长也保留其尾部；不能因为预算不足而丢掉整批最新输入。
             line = _truncate_utf8(line, max(1, remaining))
             line_bytes = len(line.encode("utf-8"))
         if line_bytes > remaining:
             break
-        selected.append(line)
+        selected_newest_first.append(line)
         remaining -= line_bytes
 
-    omitted = len(items) - len(selected)
+    omitted = len(items) - len(selected_newest_first)
     if omitted:
         marker = f"[省略 {omitted} 条较早队列消息]"
         marker_bytes = len(marker.encode("utf-8")) + 1
-        while selected and marker_bytes > remaining:
-            remaining += len(selected.pop(0).encode("utf-8")) + (1 if selected else 0)
+        while len(selected_newest_first) > 1 and marker_bytes > remaining:
+            # selected 是“最新到最早”，只能从尾部丢弃旧消息，保留最新消息。
+            removed = selected_newest_first.pop()
+            remaining += len(removed.encode("utf-8")) + 1
         if marker_bytes <= remaining:
-            selected.append(marker)
+            selected_newest_first.append(marker)
             remaining -= marker_bytes
-    lines.extend(reversed(selected))
+    lines.extend(reversed(selected_newest_first))
     result = "\n".join(lines)
     if len(result.encode("utf-8")) <= budget:
         return result

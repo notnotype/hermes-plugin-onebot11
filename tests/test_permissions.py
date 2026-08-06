@@ -8,7 +8,9 @@ from onebot11.permissions import (
     ToolContext,
     TurnBinding,
     TurnBindingStore,
+    access_allowed,
     parse_admin_list,
+    validate_message_scope,
     validate_tool_call,
 )
 
@@ -86,3 +88,43 @@ def test_同一turn不可换绑调用者():
     store.bind(TurnBinding("session", "turn", first))
     with pytest.raises(ValueError):
         store.bind(TurnBinding("session", "turn", second))
+
+
+def test_私聊历史作用域要求同时包含用户和机器人():
+    """私聊历史缺少任一参与者时整次查询必须拒绝。"""
+    context = CallerContext(
+        user_id="2056963663",
+        chat_type="dm",
+        chat_id="2056963663",
+        self_id="10001",
+    )
+    valid = {
+        "message_type": "private",
+        "user_id": "2056963663",
+        "target_id": "10001",
+    }
+    assert validate_message_scope(valid, context) is None
+    assert validate_message_scope({**valid, "target_id": "999"}, context) is not None
+    assert validate_message_scope(
+        {"message_type": "group", "group_id": "2056963663"}, context
+    ) is not None
+
+
+def test_私聊访问策略拒绝用户和目标不一致():
+    """统一访问策略不能把一个用户身份用于另一个私聊目标。"""
+    assert not access_allowed(
+        "dm",
+        "2056963663",
+        "999",
+        allowed_groups=set(),
+        dm_policy="allowlist",
+        allowed_users={"2056963663"},
+    )
+    assert access_allowed(
+        "dm",
+        "2056963663",
+        "2056963663",
+        allowed_groups=set(),
+        dm_policy="allowlist",
+        allowed_users={"2056963663"},
+    )

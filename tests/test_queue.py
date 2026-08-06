@@ -116,6 +116,26 @@ def test_租约失败释放后按退避重新认领(tmp_path, monkeypatch):
     store.close()
 
 
+def test_退避期间恢复不会反复唤醒触发请求(tmp_path, monkeypatch):
+    """自动失败退避期间不应被恢复轮询提前重新 dispatch。"""
+    now = [1000.0]
+    monkeypatch.setattr("onebot11.queue.time.time", lambda: now[0])
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    message = _message("backoff-recovery")
+    store.enqueue(message, _trigger(message))
+    lease = store.claim("888")
+    assert lease is not None
+    assert store.release(lease)
+
+    assert store.pending_chat_ids() == ()
+    assert store.recover_trigger_requests() == ()
+
+    now[0] = 1002.1
+    assert store.pending_chat_ids() == ("888",)
+    assert len(store.recover_trigger_requests()) == 1
+    store.close()
+
+
 def test_成功出站可以确认并删除消息(tmp_path):
     """出站阶段已开始不等于结果未知；明确成功仍可 ack。"""
     store = QueueStore(tmp_path / "queue.sqlite3")

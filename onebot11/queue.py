@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_BACKOFF_SECONDS = (2.0, 4.0, 8.0)
 MAX_BACKOFF_SECONDS = 60.0
@@ -112,6 +112,7 @@ class QueueLease:
     outbound_started: bool = False
     attempts: int = 0
     failure_count: int = 0
+    revision: int = 0
 
 
 class QueueStore:
@@ -179,6 +180,10 @@ class QueueStore:
                 "PRAGMA table_info(onebot_queue_trigger)"
             ).fetchall()
         }
+        chat_columns = {
+            str(row[1])
+            for row in self._conn.execute("PRAGMA table_info(onebot_queue_chat)").fetchall()
+        }
         required_message = {
             "chat_id", "message_key", "chat_type", "user_id", "user_name", "text",
             "raw_text", "metadata_json", "seq", "byte_size", "state", "lease_id",
@@ -188,9 +193,15 @@ class QueueStore:
             "request_id", "chat_id", "message_key", "reason", "caller_user_id",
             "caller_user_name", "status", "lease_id", "created_at", "updated_at",
         }
-        if not required_message.issubset(message_columns) or not required_trigger.issubset(trigger_columns):
+        required_chat = {"chat_id", "next_seq", "summary", "paused", "updated_at"}
+        if (
+            not required_message.issubset(message_columns)
+            or not required_trigger.issubset(trigger_columns)
+            or not required_chat.issubset(chat_columns)
+        ):
             raise QueueError("OneBot11 queue schema 缺少必需列，无法安全迁移")
         additions = (
+            ("onebot_queue_chat", chat_columns, "revision", "INTEGER NOT NULL DEFAULT 0"),
             ("onebot_queue_message", message_columns, "message_id", "TEXT NOT NULL DEFAULT ''"),
             ("onebot_queue_message", message_columns, "lease_owner", "TEXT"),
             ("onebot_queue_message", message_columns, "uncertain_reason", "TEXT"),
@@ -239,7 +250,7 @@ class QueueStore:
         if "failed" not in trigger_sql:
             self._rebuild_trigger_table()
             rebuilt_legacy = True
-        if version < SCHEMA_VERSION or structure_changed or rebuilt_legacy:
+        if version < 6 or structure_changed or rebuilt_legacy:
             self._mark_legacy_leases_uncertain()
         self._conn.execute(
             """
@@ -249,7 +260,36 @@ class QueueStore:
             """
         )
         self._create_indexes()
+        self._dedupe_pending_triggers()
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_onebot_queue_trigger_pending_chat "
+            "ON onebot_queue_trigger(chat_id) WHERE status='pending'"
+        )
         self._conn.commit()
+
+    def _dedupe_pending_triggers(self) -> None:
+        """迁移旧文件时每群只保留最早的 pending trigger。"""
+        rows = self._conn.execute(
+            """
+            SELECT rowid, chat_id
+            FROM onebot_queue_trigger
+            WHERE status='pending'
+            ORDER BY chat_id, created_at, rowid
+            """
+        ).fetchall()
+        kept: set[str] = set()
+        remove: list[int] = []
+        for row in rows:
+            chat_id = str(row[1])
+            if chat_id in kept:
+                remove.append(int(row[0]))
+            else:
+                kept.add(chat_id)
+        if remove:
+            self._conn.executemany(
+                "DELETE FROM onebot_queue_trigger WHERE rowid=?",
+                [(row_id,) for row_id in remove],
+            )
 
     def _rebuild_message_table(self) -> None:
         """重建旧消息表，使 state CHECK 能安全加入 failed。"""
@@ -395,6 +435,7 @@ class QueueStore:
                 next_seq INTEGER NOT NULL DEFAULT 1,
                 summary TEXT NOT NULL DEFAULT '',
                 paused INTEGER NOT NULL DEFAULT 0,
+                revision INTEGER NOT NULL DEFAULT 0,
                 updated_at REAL NOT NULL
             )
             """,
@@ -590,7 +631,7 @@ class QueueStore:
                     ).fetchone()[0]
                 )
                 self._conn.execute(
-                    "UPDATE onebot_queue_chat SET next_seq=?, updated_at=? WHERE chat_id=?",
+                    "UPDATE onebot_queue_chat SET next_seq=?, revision=revision+1, updated_at=? WHERE chat_id=?",
                     (next_seq + 1, now, message.chat_id),
                 )
                 self._conn.execute(
@@ -633,6 +674,16 @@ class QueueStore:
         """插入触发请求；同一消息只保留最早的一次请求。"""
         if trigger is None:
             return None
+        existing_pending = self._conn.execute(
+            """
+            SELECT request_id FROM onebot_queue_trigger
+            WHERE chat_id=? AND status='pending'
+            ORDER BY created_at, rowid LIMIT 1
+            """,
+            (chat_id,),
+        ).fetchone()
+        if existing_pending is not None:
+            return str(existing_pending[0])
         self._conn.execute(
             """
             INSERT OR IGNORE INTO onebot_queue_trigger(
@@ -732,7 +783,14 @@ class QueueStore:
         """读取有待处理消息的群号，供启动恢复和旁路 trigger 使用。"""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT DISTINCT chat_id FROM onebot_queue_message WHERE state='pending' ORDER BY chat_id"
+                """
+                SELECT DISTINCT chat_id
+                FROM onebot_queue_message
+                WHERE state='pending'
+                  AND (next_attempt_at IS NULL OR next_attempt_at<=?)
+                ORDER BY chat_id
+                """,
+                (self._now(),),
             ).fetchall()
             return tuple(str(row[0]) for row in rows)
 
@@ -900,7 +958,7 @@ class QueueStore:
                     (lease_id, self._owner_id, now, chat_id, lease_id),
                 )
                 chat_row = self._conn.execute(
-                    "SELECT summary FROM onebot_queue_chat WHERE chat_id=?", (chat_id,)
+                    "SELECT summary, revision FROM onebot_queue_chat WHERE chat_id=?", (chat_id,)
                 ).fetchone()
                 self._conn.commit()
                 return QueueLease(
@@ -915,6 +973,7 @@ class QueueStore:
                     outbound_started=False,
                     attempts=max(int(row["attempts"]) for row in message_rows) + 1,
                     failure_count=max(int(row["failure_count"]) for row in message_rows),
+                    revision=int(chat_row["revision"]) if chat_row is not None else 0,
                 )
             except Exception:
                 self._conn.rollback()
@@ -1211,7 +1270,7 @@ class QueueStore:
             counts = {str(row["state"]): int(row["count"]) for row in rows}
             bytes_total = int(sum(int(row["bytes"]) for row in rows))
             chat = self._conn.execute(
-                "SELECT summary, paused, next_seq FROM onebot_queue_chat WHERE chat_id=?", (str(chat_id),)
+                "SELECT summary, paused, next_seq, revision FROM onebot_queue_chat WHERE chat_id=?", (str(chat_id),)
             ).fetchone()
             trigger = self._conn.execute(
                 "SELECT COUNT(*) FROM onebot_queue_trigger WHERE chat_id=? AND status IN ('pending','uncertain','failed')",
@@ -1290,8 +1349,18 @@ class QueueStore:
                 "uncertain_reasons": [str(row[0]) for row in reasons],
                 "paused": bool(chat["paused"]) if chat else False,
                 "next_seq": int(chat["next_seq"]) if chat else 1,
+                "latest_seq": max(0, int(chat["next_seq"]) - 1) if chat else 0,
+                "revision": int(chat["revision"]) if chat else 0,
                 "summary": str(chat["summary"]) if chat else "",
             }
+
+    def revision(self, chat_id: str) -> int:
+        """读取群消息 revision，供旁路判断检测判断期间的新消息。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT revision FROM onebot_queue_chat WHERE chat_id=?", (str(chat_id),)
+            ).fetchone()
+            return int(row[0]) if row else 0
 
     def status_for_lease(self, lease_id: str) -> dict[str, Any]:
         """读取 lease 的持久阶段，供 adapter 在 completion 时判定结果。"""
@@ -1346,7 +1415,7 @@ class QueueStore:
                     (str(chat_id),),
                 )
                 self._conn.execute(
-                    "UPDATE onebot_queue_chat SET summary='', updated_at=? WHERE chat_id=?",
+                    "UPDATE onebot_queue_chat SET summary='', revision=revision+1, updated_at=? WHERE chat_id=?",
                     (now, str(chat_id)),
                 )
                 self._conn.commit()
@@ -1439,8 +1508,10 @@ class QueueStore:
                         WHERE message.chat_id=trigger.chat_id
                           AND message.message_key=trigger.message_key
                           AND message.state='pending'
+                          AND (message.next_attempt_at IS NULL OR message.next_attempt_at<=?)
                     ) ORDER BY trigger.created_at
-                    """
+                    """,
+                    (now,),
                 ).fetchall()
                 return tuple(self._row_to_trigger(row) for row in rows)
             except Exception:

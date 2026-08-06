@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import time
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,6 +36,7 @@ from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome, SendR
 
 import adapter as adapter_module  # noqa: E402
 from adapter import OneBot11Adapter, check_requirements, register, validate_config  # noqa: E402
+from onebot11.dispatch import ActiveTurn  # noqa: E402
 from onebot11.events import InboundEvent  # noqa: E402
 
 
@@ -172,6 +174,89 @@ async def test_真实工具handler可从当前binding补齐缺失turn_id(monkeyp
         await adapter.disconnect()
 
 
+async def test_lease在工具访问HTTP前失效时拒绝新请求(monkeypatch):
+    """第一次检查通过、真正访问 API 前 lease 失效时，不能发起新查询。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    caller = adapter_module.CallerContext(
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+        role="user",
+        allowed_tools=adapter_module.READ_ONLY_TOOLS,
+        lease_id="lease-race",
+        self_id="1",
+    )
+    binding = adapter_module.TurnBinding("session-race", "turn-race", caller, "lease-race")
+    adapter._bindings.bind(binding)
+    calls: list[dict] = []
+
+    async def fake_group_info(api, params, ctx):
+        del api, params, ctx
+        calls.append({})
+        return {"status": "ok"}
+
+    monkeypatch.setitem(adapter_module._TOOL_HANDLERS, "qq_get_group_info", fake_group_info)
+    checks = iter((True, False))
+    monkeypatch.setattr(adapter, "_lease_is_current", lambda _lease_id: next(checks))
+    try:
+        result = json.loads(
+            await adapter._make_tool_handler("qq_get_group_info")(
+                {},
+                session_id="session-race",
+                turn_id="turn-race",
+            )
+        )
+        assert result == {"status": "permission_error", "error": "当前 turn lease 已失效"}
+        assert calls == []
+    finally:
+        await adapter.disconnect()
+
+
+async def test_写工具只生成确认预览不访问OneBot(monkeypatch):
+    """Agent 不能在 turn 内直接执行群管理写操作。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_SUPER_ADMINS="123",
+    )
+    caller = adapter_module.CallerContext(
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+        role="super_admin",
+        allowed_tools=adapter.role_tools["super_admin"],
+        self_id="1",
+    )
+    binding = adapter_module.TurnBinding("session-write", "turn-write", caller, None)
+    adapter._bindings.bind(binding)
+    calls: list[dict] = []
+
+    async def fail_if_called(api, tool_name, args, ctx):
+        del api, tool_name, args, ctx
+        calls.append({})
+        return {"status": "ok"}
+
+    monkeypatch.setattr(adapter_module, "handle_write_action", fail_if_called)
+    try:
+        result = json.loads(
+            await adapter._make_tool_handler("qq_set_group_ban")(
+                {"user_id": "456", "duration": 60},
+                session_id="session-write",
+                turn_id="turn-write",
+            )
+        )
+        assert result["status"] == "confirmation_required"
+        assert result["command"].startswith("/onebot confirm ")
+        assert calls == []
+    finally:
+        await adapter.disconnect()
+
+
 def test_pre_llm非OneBot平台不注入拒绝提示(monkeypatch):
     """其他平台的 turn 不应被 OneBot hook 改写。"""
     monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: object())
@@ -190,6 +275,44 @@ def test_pre_llm明确OneBot但缺少caller时fail_closed(monkeypatch):
         session_id="onebot-session", turn_id="onebot-turn", platform="onebot11"
     )
     assert result == {"context": "OneBot11 caller binding unavailable; all OneBot11 tools must be denied."}
+
+
+def test_pre_llm缺身份时清理旧binding(monkeypatch):
+    """新的 OneBot turn 缺身份时，不能继承上一个 turn 的 binding。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    caller = adapter_module.CallerContext(
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+        role="user",
+        allowed_tools=adapter_module.READ_ONLY_TOOLS,
+        self_id="1",
+    )
+    binding = adapter_module.TurnBinding("old-session", "old-turn", caller)
+    adapter._bindings.bind(binding)
+    adapter_module._CURRENT_CALLER.set(None)
+    adapter_module._CURRENT_BINDING.set(binding)
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    try:
+        result = adapter_module._pre_llm_call_hook(
+            session_id="new-session",
+            turn_id="new-turn",
+            platform="onebot11",
+        )
+        assert result == {
+            "context": "OneBot11 caller binding unavailable; all OneBot11 tools must be denied."
+        }
+        assert adapter_module._CURRENT_CALLER.get() is None
+        assert adapter_module._CURRENT_BINDING.get() is None
+        assert adapter._bindings.get("old-session", "old-turn") is None
+    finally:
+        adapter_module._CURRENT_CALLER.set(None)
+        adapter_module._CURRENT_BINDING.set(None)
+        asyncio.run(adapter.disconnect())
 
 
 def test_Hermes真实session_key群共享且私聊隔离():
@@ -216,6 +339,44 @@ def test_Hermes真实session_key群共享且私聊隔离():
     assert build_session_key(first_dm, group_sessions_per_user=False) != build_session_key(
         second_dm, group_sessions_per_user=False
     )
+
+
+async def test_DM完成按事件中的精确binding清理(monkeypatch):
+    """DM completion 不能依赖最近的 ContextVar 才能释放 caller。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    caller = adapter_module.CallerContext(
+        user_id="123",
+        chat_type="dm",
+        chat_id="123",
+        role="user",
+        allowed_tools=adapter_module.READ_ONLY_TOOLS,
+        self_id="1",
+    )
+    binding = adapter_module.TurnBinding("dm-session", "dm-turn", caller)
+    adapter._bindings.bind(binding)
+    event = SimpleNamespace(
+        metadata={
+            "onebot11_managed_context": True,
+            "onebot11_binding_key": {
+                "session_id": "dm-session",
+                "turn_id": "dm-turn",
+            },
+        },
+        media_urls=[],
+    )
+    adapter_module._CURRENT_CALLER.set(None)
+    adapter_module._CURRENT_BINDING.set(None)
+    try:
+        await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+        assert adapter._bindings.get("dm-session", "dm-turn") is None
+    finally:
+        adapter_module._CURRENT_CALLER.set(None)
+        adapter_module._CURRENT_BINDING.set(None)
+        await adapter.disconnect()
 
 
 async def test_媒体孤儿目录跨重启按TTL清理(monkeypatch, tmp_path):
@@ -315,6 +476,8 @@ async def test_群turn给触发消息加眼睛并在收尾移除(monkeypatch):
         assert await adapter._dispatcher.notify("888")
         active = adapter._dispatcher.active("888")
         assert active is not None
+        adapter._outbound_started.add(active.lease.lease_id)
+        adapter._outbound_successful.add(active.lease.lease_id)
         event = SimpleNamespace(
             metadata={"onebot11_lease_id": active.lease.lease_id},
             media_urls=[],
@@ -325,6 +488,76 @@ async def test_群turn给触发消息加眼睛并在收尾移除(monkeypatch):
             ("-1001", "128064", False),
         ]
         assert adapter._queue.status("888")["pending"] == 0
+    finally:
+        await adapter.disconnect()
+
+
+async def test_turn媒体达到总上限后不下载后续消息(monkeypatch):
+    """一个 turn 的媒体达到总上限后，后续队列消息不再发起下载。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        max_image_total_bytes="1024",
+    )
+    adapter._processing_reaction_enabled = False
+    adapter._max_media_total_bytes = 1024
+    first = adapter_module.QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1001",
+        user_id="123",
+        user_name="小明",
+        text="第一张",
+        metadata={"onebot11_images": ["http://media.invalid/first.png"]},
+        message_key="group:1001",
+    )
+    second = adapter_module.QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1002",
+        user_id="456",
+        user_name="小红",
+        text="第二张",
+        metadata={"onebot11_images": ["http://media.invalid/second.png"]},
+        message_key="group:1002",
+    )
+    adapter._queue.enqueue(
+        first,
+        adapter_module.TriggerRequest.create("888", "group:1001", "mention", "123", "小明"),
+    )
+    adapter._queue.enqueue(second)
+    downloaded: list[str] = []
+    media_dirs: list[str] = []
+
+    async def fake_download(image: str, dest_dir: str | None = None) -> str:
+        downloaded.append(image)
+        assert dest_dir is not None
+        media_dirs.append(dest_dir)
+        path = Path(dest_dir) / f"{len(downloaded)}.png"
+        path.write_bytes(b"x" * 1024)
+        return str(path)
+
+    async def fake_handle_message(_adapter, _event) -> None:
+        return None
+
+    monkeypatch.setattr(adapter, "_download_image", fake_download)
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", fake_handle_message)
+    try:
+        assert await adapter._dispatcher.notify("888")
+        assert downloaded == ["http://media.invalid/first.png"]
+        active = adapter._dispatcher.active("888")
+        assert active is not None
+        await adapter._finish_queue_turn(
+            SimpleNamespace(
+                metadata={
+                    "onebot11_lease_id": active.lease.lease_id,
+                    "onebot11_media_dir": media_dirs[0],
+                },
+                media_urls=[],
+            ),
+            ProcessingOutcome.SUCCESS,
+        )
     finally:
         await adapter.disconnect()
 
@@ -408,6 +641,590 @@ async def test_群聊默认需要at才响应(monkeypatch):
     status = adapter._queue.status("888")
     assert status["pending"] == 1
     assert status["trigger_requests"] == 0
+
+
+async def test_LLM候选入队不会在群触发锁上死锁(monkeypatch):
+    """启用旁路判断时，候选消息入队不能再次等待同一群的不可重入锁。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "groups": ["888"],
+                },
+            },
+        )
+    )
+    adapter._llm_trigger_api_supported = True
+    message = adapter_module.QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="question-1",
+        user_id="123",
+        user_name="小明",
+        text="这个问题怎么处理？",
+        message_key="group:question-1",
+    )
+    caller = adapter_module.CallerContext(
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+        allowed_tools=adapter_module.READ_ONLY_TOOLS,
+        self_id="1",
+    )
+    try:
+        await asyncio.wait_for(
+            adapter._enqueue_group_message(
+                message,
+                mentioned_self=False,
+                caller=caller,
+                user_name="小明",
+            ),
+            timeout=0.2,
+        )
+        assert adapter._trigger_states["888"].mode == "debounce"
+        assert adapter._queue.status("888")["pending"] == 1
+    finally:
+        await adapter.disconnect()
+
+
+async def test_旧Hermes辅助API会安全禁用LLM触发(monkeypatch):
+    """旧 Hermes 没有严格旁路参数时，插件不应偷偷改用主模型。"""
+    import agent.auxiliary_client as auxiliary_client
+
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+
+    async def old_async_call_llm(*, task=None, messages):
+        del task, messages
+        raise AssertionError("旧 API 不应被真正调用")
+
+    monkeypatch.setattr(auxiliary_client, "async_call_llm", old_async_call_llm)
+    adapter._llm_trigger_api_supported = None
+    try:
+        assert adapter._llm_trigger_api_ready() is False
+        assert adapter._llm_trigger_api_ready() is False
+        assert adapter._llm_trigger_api_audited is True
+    finally:
+        await adapter.disconnect()
+
+
+async def test_pause会取消旁路判断_resume恢复持久触发(monkeypatch):
+    """暂停不启动 Agent/旁路模型，恢复后再从 durable trigger 继续。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_SUPER_ADMINS="123",
+    )
+    message = adapter_module.QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="pause-1",
+        user_id="123",
+        user_name="管理员",
+        text="待处理",
+        message_key="group:pause-1",
+    )
+    adapter._queue.enqueue(
+        message,
+        adapter_module.TriggerRequest.create(
+            "888",
+            "group:pause-1",
+            "mention",
+            "123",
+            "管理员",
+        ),
+    )
+    state = adapter._trigger_state_for("888")
+    state.observe_message(
+        chat_type="group",
+        text="这个问题怎么处理？",
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=0,
+    )
+    timer = asyncio.create_task(asyncio.sleep(60))
+    adapter._trigger_timer_tasks["888"] = timer
+    notified: list[str] = []
+
+    async def fake_notify(chat_id: str) -> bool:
+        notified.append(chat_id)
+        return True
+
+    monkeypatch.setattr(adapter._dispatcher, "notify", fake_notify)
+    try:
+        assert await adapter._set_group_paused("888", True)
+        assert adapter._queue.status("888")["paused"] is True
+        assert state.mode == "idle"
+        await asyncio.sleep(0)
+        assert timer.cancelled() or timer.done()
+        assert notified == []
+
+        assert await adapter._set_group_paused("888", False)
+        assert adapter._queue.status("888")["paused"] is False
+        assert notified == ["888"]
+    finally:
+        await adapter.disconnect()
+
+
+async def test_flush在群锁内创建触发且取消旧判断(monkeypatch):
+    """flush 与 LLM 判断竞争时只留下一个 durable trigger。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_SUPER_ADMINS="123",
+    )
+    message = adapter_module.QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="flush-1",
+        user_id="456",
+        user_name="成员",
+        text="待 flush",
+        message_key="group:flush-1",
+    )
+    adapter._queue.enqueue(message)
+    state = adapter._trigger_state_for("888")
+    state.observe_message(
+        chat_type="group",
+        text="这个问题怎么处理？",
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=0,
+    )
+    cancelled: list[str] = []
+
+    async def fake_notify(chat_id: str) -> bool:
+        cancelled.append(chat_id)
+        return False
+
+    monkeypatch.setattr(adapter._dispatcher, "notify", fake_notify)
+    try:
+        has_request, started, paused = await adapter._flush_group(
+            "888",
+            caller_user_id="123",
+            caller_user_name="管理员",
+        )
+        assert (has_request, started, paused) == (True, False, False)
+        assert adapter._queue.status("888")["pending_trigger_requests"] == 1
+        assert state.mode == "idle"
+        assert cancelled == ["888"]
+    finally:
+        await adapter.disconnect()
+
+
+async def test_clear同时失效旧的活跃触发状态(monkeypatch):
+    """清空队列后不能让旧 debounce 或 engaged 状态影响下一条消息。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    message = adapter_module.QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="clear-state",
+        user_id="456",
+        user_name="成员",
+        text="这个问题怎么处理？",
+        message_key="group:clear-state",
+    )
+    adapter._queue.enqueue(message)
+    state = adapter._trigger_state_for("888")
+    action = state.observe_message(
+        chat_type="group",
+        text=message.text,
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=0,
+    )
+    assert action.kind == "schedule"
+    timer = asyncio.create_task(asyncio.sleep(60))
+    adapter._trigger_timer_tasks["888"] = timer
+    try:
+        assert await adapter._clear_group("888") == 1
+        assert state.mode == "idle"
+        assert adapter._queue.status("888")["pending"] == 0
+        await asyncio.sleep(0)
+        assert timer.cancelled() or timer.done()
+    finally:
+        await adapter.disconnect()
+
+
+async def test_completion不覆盖期间新消息的候选状态(monkeypatch):
+    """消息在 ack 前抵达时，旧 turn 收尾保留新的 debounce。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "groups": ["888"],
+                },
+            },
+        )
+    )
+    adapter._llm_trigger_api_supported = True
+    adapter._processing_reaction_enabled = False
+    first = adapter_module.QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="complete-1",
+        user_id="123",
+        user_name="成员",
+        text="原始触发",
+        message_key="group:complete-1",
+    )
+    adapter._queue.enqueue(
+        first,
+        adapter_module.TriggerRequest.create(
+            "888",
+            "group:complete-1",
+            "mention",
+            "123",
+            "成员",
+        ),
+    )
+
+    async def fake_handle_message(_adapter, _event) -> None:
+        return None
+
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", fake_handle_message)
+    original_complete = adapter._dispatcher.complete
+
+    async def complete_after_new_message(
+        lease_id: str,
+        *,
+        outcome: str,
+        unknown: bool,
+        **kwargs,
+    ) -> bool:
+        new_message = adapter_module.QueueMessage(
+            chat_id="888",
+            chat_type="group",
+            message_id="complete-2",
+            user_id="456",
+            user_name="成员2",
+            text="新消息怎么处理？",
+            message_key="group:complete-2",
+        )
+        await adapter._enqueue_group_message(
+            new_message,
+            mentioned_self=False,
+            caller=adapter_module.CallerContext(
+                user_id="456",
+                chat_type="group",
+                chat_id="888",
+                role="user",
+                allowed_tools=adapter_module.READ_ONLY_TOOLS,
+                self_id="1",
+            ),
+            user_name="成员2",
+        )
+        return await original_complete(
+            lease_id,
+            outcome=outcome,
+            unknown=unknown,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(adapter._dispatcher, "complete", complete_after_new_message)
+    try:
+        assert await adapter._dispatcher.notify("888")
+        active = adapter._dispatcher.active("888")
+        assert active is not None
+        adapter._outbound_started.add(active.lease.lease_id)
+        adapter._outbound_successful.add(active.lease.lease_id)
+        await adapter._finish_queue_turn(
+            SimpleNamespace(
+                metadata={
+                    "onebot11_lease_id": active.lease.lease_id,
+                    "onebot11_lease_revision": active.lease.revision,
+                    "onebot11_target": {"chat_type": "group", "chat_id": "888"},
+                },
+                media_urls=[],
+            ),
+            ProcessingOutcome.SUCCESS,
+        )
+        assert adapter._trigger_states["888"].mode == "debounce"
+        assert adapter._queue.status("888")["pending"] == 1
+    finally:
+        await adapter.disconnect()
+
+
+async def test_completion后普通消息进入engaged_debounce(monkeypatch):
+    """Agent turn 期间收到的普通消息在成功收口后也应进入活跃窗口 debounce。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "groups": ["888"],
+                },
+            },
+        )
+    )
+    adapter._llm_trigger_api_supported = True
+    adapter._processing_reaction_enabled = False
+    first = adapter_module.QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="complete-ordinary-1",
+        user_id="123",
+        user_name="成员",
+        text="原始触发",
+        message_key="group:complete-ordinary-1",
+    )
+    adapter._queue.enqueue(
+        first,
+        adapter_module.TriggerRequest.create(
+            "888",
+            "group:complete-ordinary-1",
+            "mention",
+            "123",
+            "成员",
+        ),
+    )
+
+    async def fake_handle_message(_adapter, _event) -> None:
+        return None
+
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", fake_handle_message)
+    original_complete = adapter._dispatcher.complete
+
+    async def complete_after_new_message(
+        lease_id: str,
+        *,
+        outcome: str,
+        unknown: bool,
+        **kwargs,
+    ) -> bool:
+        new_message = adapter_module.QueueMessage(
+            chat_id="888",
+            chat_type="group",
+            message_id="complete-ordinary-2",
+            user_id="456",
+            user_name="成员2",
+            text="普通闲聊",
+            message_key="group:complete-ordinary-2",
+        )
+        await adapter._enqueue_group_message(
+            new_message,
+            mentioned_self=False,
+            caller=adapter_module.CallerContext(
+                user_id="456",
+                chat_type="group",
+                chat_id="888",
+                role="user",
+                allowed_tools=adapter_module.READ_ONLY_TOOLS,
+                self_id="1",
+            ),
+            user_name="成员2",
+        )
+        return await original_complete(
+            lease_id,
+            outcome=outcome,
+            unknown=unknown,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(adapter._dispatcher, "complete", complete_after_new_message)
+    try:
+        assert await adapter._dispatcher.notify("888")
+        active = adapter._dispatcher.active("888")
+        assert active is not None
+        adapter._outbound_started.add(active.lease.lease_id)
+        adapter._outbound_successful.add(active.lease.lease_id)
+        await adapter._finish_queue_turn(
+            SimpleNamespace(
+                metadata={
+                    "onebot11_lease_id": active.lease.lease_id,
+                    "onebot11_lease_revision": active.lease.revision,
+                    "onebot11_target": {"chat_type": "group", "chat_id": "888"},
+                },
+                media_urls=[],
+            ),
+            ProcessingOutcome.SUCCESS,
+        )
+        state = adapter._trigger_states["888"]
+        assert state.mode == "debounce"
+        assert state.debounce_due is not None
+        assert adapter._queue.status("888")["pending"] == 1
+    finally:
+        await adapter.disconnect()
+
+
+async def test_llm忽略后仍为engaged重新挂载活跃窗口定时器(monkeypatch):
+    """旁路 ignore 不能让 engaged 状态失去到期计时。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "groups": ["888"],
+                },
+            },
+        )
+    )
+    scheduled: list[str] = []
+    monkeypatch.setattr(
+        adapter,
+        "_schedule_trigger_timer",
+        lambda chat_id: scheduled.append(str(chat_id)),
+    )
+    adapter._queue.enqueue(
+        adapter_module.QueueMessage(
+            chat_id="888",
+            chat_type="group",
+            message_id="engaged-ignore-1",
+            user_id="123",
+            user_name="成员",
+            text="这个怎么处理？",
+            message_key="group:engaged-ignore-1",
+        )
+    )
+    state = adapter._trigger_state_for("888")
+    base_time = time.monotonic()
+    state.on_turn_complete(success=True, now=base_time)
+    state.observe_message(
+        chat_type="group",
+        text="这个怎么处理？",
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=base_time + 1,
+    )
+    action = state.on_timer(now=base_time + 6)
+    assert action.kind == "judge"
+
+    try:
+        async with adapter._trigger_lock_for("888"):
+            result_action, notify, failure = await adapter._apply_llm_result_locked(
+                "888",
+                action,
+                decision="ignore",
+                wait_seconds=0,
+                observed_revision=1,
+            )
+        assert result_action is not None
+        assert result_action.reason == "llm_ignore"
+        assert notify is False
+        assert failure is None
+        assert state.mode == "engaged"
+        assert scheduled == ["888"]
+    finally:
+        await adapter.disconnect()
+
+
+async def test_llm失败后仍为engaged重新挂载活跃窗口定时器(monkeypatch):
+    """旁路失败恢复到 engaged 时同样不能丢失到期计时。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "groups": ["888"],
+                },
+            },
+        )
+    )
+    scheduled: list[str] = []
+    monkeypatch.setattr(
+        adapter,
+        "_schedule_trigger_timer",
+        lambda chat_id: scheduled.append(str(chat_id)),
+    )
+    adapter._queue.enqueue(
+        adapter_module.QueueMessage(
+            chat_id="888",
+            chat_type="group",
+            message_id="engaged-failure-1",
+            user_id="123",
+            user_name="成员",
+            text="这个怎么处理？",
+            message_key="group:engaged-failure-1",
+        )
+    )
+    state = adapter._trigger_state_for("888")
+    base_time = time.monotonic()
+    state.on_turn_complete(success=True, now=base_time)
+    state.observe_message(
+        chat_type="group",
+        text="这个怎么处理？",
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=base_time + 1,
+    )
+    action = state.on_timer(now=base_time + 6)
+    assert action.kind == "judge"
+
+    try:
+        await adapter._apply_llm_failure("888", action, failure="timeout")
+        assert state.mode == "engaged"
+        assert scheduled == ["888"]
+    finally:
+        await adapter.disconnect()
+
+
+async def test_deferred_completion不提前清理媒体(monkeypatch):
+    """Hermes deferred turn 的媒体只在最终 queue 收尾时清理。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    media_dir = Path(adapter._new_media_dir())
+    media_file = media_dir / "image.png"
+    media_file.write_bytes(b"image")
+    event = SimpleNamespace(
+        metadata={
+            "onebot11_lease_id": "deferred-lease",
+            "onebot11_defer_completion": True,
+            "onebot11_media_dir": str(media_dir),
+            "onebot11_media_paths": [str(media_file)],
+        },
+        media_urls=[],
+    )
+    try:
+        await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+        assert media_file.exists()
+        adapter._cleanup_media([str(media_file)], media_dir=str(media_dir))
+        assert not media_dir.exists()
+    finally:
+        await adapter.disconnect()
 
 
 async def test_群聊at机器人放行(monkeypatch):
@@ -699,6 +1516,177 @@ async def test_完整出站成功不会被误判为unknown(monkeypatch):
     await adapter.disconnect()
 
 
+async def test_Agent成功但没有出站仍释放队列lease(monkeypatch):
+    """Hermes 报告成功不等于 OneBot 已发送；没有出站必须保留消息待重试。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    message = adapter_module.QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="no-send",
+        user_id="123",
+        user_name="小明",
+        text="没有回复",
+        message_key="group:no-send",
+    )
+    adapter._queue.enqueue(
+        message,
+        adapter_module.TriggerRequest.create(
+            "888", "group:no-send", "mention", "123", "小明"
+        ),
+    )
+    lease = adapter._queue.claim("888")
+    assert lease is not None
+    decision = adapter._queue_completion_decision(
+        lease.lease_id, ProcessingOutcome.SUCCESS
+    )
+    assert decision[0:3] == (False, False, False)
+    assert "没有成功出站" in (decision[3] or "")
+    await adapter.disconnect()
+
+
+async def test_收尾异常仍清理binding和媒体(monkeypatch):
+    """reaction 收尾失败不能阻断 queue completion 或泄漏 turn 资源。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    adapter._processing_reaction_enabled = False
+    message = adapter_module.QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="cleanup",
+        user_id="123",
+        user_name="小明",
+        text="清理",
+        message_key="group:cleanup",
+    )
+    adapter._queue.enqueue(
+        message,
+        adapter_module.TriggerRequest.create(
+            "888", "group:cleanup", "mention", "123", "小明"
+        ),
+    )
+    lease = adapter._queue.claim("888")
+    assert lease is not None
+    assert adapter._queue.mark_outbound_started(lease)
+    adapter._outbound_successful.add(lease.lease_id)
+    media_dir = Path(adapter._new_media_dir())
+    media_file = media_dir / "image.png"
+    media_file.write_bytes(b"image")
+    caller = adapter_module.CallerContext(
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+        role="user",
+        allowed_tools=adapter_module.READ_ONLY_TOOLS,
+        lease_id=lease.lease_id,
+        self_id="1",
+    )
+    binding = adapter_module.TurnBinding("session-cleanup", "turn-cleanup", caller, lease.lease_id)
+    adapter._bindings.bind(binding)
+
+    async def fail_reaction(_lease_id: str) -> None:
+        raise RuntimeError("reaction cleanup failed")
+
+    monkeypatch.setattr(adapter, "_clear_processing_reaction", fail_reaction)
+    event = SimpleNamespace(
+        metadata={
+            "onebot11_lease_id": lease.lease_id,
+            "onebot11_media_dir": str(media_dir),
+            "onebot11_media_paths": [str(media_file)],
+        },
+        media_urls=[],
+    )
+    await adapter._finish_queue_turn(event, ProcessingOutcome.SUCCESS)
+    assert adapter._queue.status("888")["pending"] == 0
+    assert adapter._bindings.get("session-cleanup", "turn-cleanup") is None
+    assert not media_dir.exists()
+    await adapter.disconnect()
+
+
+async def test_触发状态更新异常仍清理turn资源(monkeypatch):
+    """队列完成后触发状态或下一轮通知失败，也不能泄漏 binding 和媒体。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    adapter.trigger_config = replace(
+        adapter.trigger_config,
+        llm_enabled=True,
+        llm_allowed_groups=frozenset({"888"}),
+    )
+    message = adapter_module.QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="cleanup-trigger-error",
+        user_id="123",
+        user_name="小明",
+        text="触发状态异常",
+        message_key="group:cleanup-trigger-error",
+    )
+    adapter._queue.enqueue(
+        message,
+        adapter_module.TriggerRequest.create(
+            "888", "group:cleanup-trigger-error", "mention", "123", "小明"
+        ),
+    )
+    lease = adapter._queue.claim("888")
+    assert lease is not None
+    assert adapter._queue.mark_outbound_started(lease)
+    adapter._outbound_successful.add(lease.lease_id)
+    adapter._dispatcher._active["888"] = ActiveTurn(
+        lease=lease,
+        started_at=lease.claimed_at,
+    )
+    media_dir = Path(adapter._new_media_dir())
+    media_file = media_dir / "image.png"
+    media_file.write_bytes(b"image")
+    caller = adapter_module.CallerContext(
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+        role="user",
+        allowed_tools=adapter_module.READ_ONLY_TOOLS,
+        lease_id=lease.lease_id,
+        self_id="1",
+    )
+    binding = adapter_module.TurnBinding(
+        "session-trigger-error",
+        "turn-trigger-error",
+        caller,
+        lease.lease_id,
+    )
+    adapter._bindings.bind(binding)
+
+    def fail_status(_chat_id: str) -> dict:
+        raise RuntimeError("trigger status failed")
+
+    monkeypatch.setattr(adapter._queue, "status", fail_status)
+    event = SimpleNamespace(
+        metadata={
+            "onebot11_lease_id": lease.lease_id,
+            "onebot11_lease_revision": lease.revision,
+            "onebot11_target": {"chat_type": "group", "chat_id": "888"},
+            "onebot11_media_dir": str(media_dir),
+            "onebot11_media_paths": [str(media_file)],
+        },
+        media_urls=[],
+    )
+    try:
+        with pytest.raises(RuntimeError, match="trigger status failed"):
+            await adapter._finish_queue_turn(event, ProcessingOutcome.SUCCESS)
+        assert adapter._bindings.get("session-trigger-error", "turn-trigger-error") is None
+        assert not media_dir.exists()
+    finally:
+        await adapter.disconnect()
+
+
 async def test_默认队列落在Hermes_home而不是临时文件(monkeypatch, tmp_path):
     """未显式配置时，群消息队列必须跨 adapter 重启保留。"""
     hermes_home = tmp_path / "hermes-home"
@@ -806,7 +1794,13 @@ async def test_lease不能跨群注入caller(monkeypatch):
     assert lease is not None
     monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
     caller = adapter_module._caller_from_metadata(
-        {"user_id": "123", "chat_type": "group", "chat_id": "999", "lease_id": lease.lease_id}
+        {
+            "user_id": "123",
+            "chat_type": "group",
+            "chat_id": "999",
+            "lease_id": lease.lease_id,
+            "self_id": "1",
+        }
     )
     assert caller is None
     await adapter.disconnect()

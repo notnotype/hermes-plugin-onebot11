@@ -33,6 +33,98 @@ ALL_TOOLS = READ_ONLY_TOOLS | WRITE_TOOLS
 
 
 @dataclass(frozen=True)
+class AccessPolicy:
+    """OneBot 入站和 cron 共同使用的最小访问策略。"""
+
+    allowed_groups: frozenset[str] = frozenset()
+    dm_policy: str = "disabled"
+    allowed_users: frozenset[str] = frozenset()
+    allow_all_users: bool = False
+
+    def allows(self, chat_type: str, chat_id: str, user_id: str | None = None) -> bool:
+        """判断目标是否授权；未知 DM 策略和未知目标均拒绝。"""
+        normalized_type = str(chat_type)
+        normalized_chat = str(chat_id)
+        if normalized_type == "group":
+            return not self.allowed_groups or normalized_chat in self.allowed_groups
+        if normalized_type != "dm":
+            return False
+        # OneBot 私聊目标就是对话对端；不允许用一个用户的身份访问另一个
+        # QQ 号的私聊历史或向其发送消息。
+        if user_id is None or str(user_id) != normalized_chat:
+            return False
+        if self.dm_policy == "disabled":
+            return False
+        if self.dm_policy == "allowlist":
+            return normalized_chat in self.allowed_users
+        if self.dm_policy == "open":
+            return self.allow_all_users
+        return False
+
+
+def access_allowed(
+    chat_type: str,
+    chat_id: str,
+    user_id: str | None,
+    *,
+    allowed_groups: set[str] | frozenset[str],
+    dm_policy: str,
+    allowed_users: set[str] | frozenset[str],
+    allow_all_users: bool = False,
+) -> bool:
+    """用统一纯函数执行 OneBot 消息和 cron 的授权判断。"""
+    return AccessPolicy(
+        allowed_groups=frozenset(str(item) for item in allowed_groups),
+        dm_policy=str(dm_policy).casefold(),
+        allowed_users=frozenset(str(item) for item in allowed_users),
+        allow_all_users=bool(allow_all_users),
+    ).allows(chat_type, chat_id, user_id)
+
+
+def build_access_policy(
+    extra: Mapping[str, Any],
+    environ: Mapping[str, Any] | None = None,
+) -> AccessPolicy:
+    """从 YAML extra 和显式环境映射构造统一访问策略。
+
+    环境变量只覆盖这里声明的部署字段；即使 ``dm_policy=open``，也必须
+    由 ``ONEBOT11_ALLOW_ALL_USERS`` 或 ``GATEWAY_ALLOW_ALL_USERS`` 明确放行。
+    """
+    if not isinstance(extra, Mapping):
+        raise ValueError("OneBot11 extra 必须是 mapping")
+    env = environ or {}
+
+    def setting(env_name: str, extra_name: str, default: Any = None) -> Any:
+        """读取环境覆盖，保留显式空字符串的清空语义。"""
+        if env_name in env:
+            return env[env_name]
+        return extra.get(extra_name, default)
+
+    dm_policy = str(setting("ONEBOT11_DM_POLICY", "dm_policy", "open")).strip().casefold()
+    if dm_policy not in {"open", "allowlist", "disabled"}:
+        raise ValueError(f"未知 dm_policy: {dm_policy}")
+    allow_all = parse_bool(
+        env.get("ONEBOT11_ALLOW_ALL_USERS"),
+        default=False,
+        name="ONEBOT11_ALLOW_ALL_USERS",
+    ) or parse_bool(
+        env.get("GATEWAY_ALLOW_ALL_USERS"),
+        default=False,
+        name="GATEWAY_ALLOW_ALL_USERS",
+    )
+    return AccessPolicy(
+        allowed_groups=frozenset(
+            parse_id_list(setting("ONEBOT11_ALLOWED_GROUPS", "allowed_groups"))
+        ),
+        dm_policy=dm_policy,
+        allowed_users=frozenset(
+            parse_id_list(setting("ONEBOT11_ALLOWED_USERS", "allowed_users"))
+        ),
+        allow_all_users=allow_all,
+    )
+
+
+@dataclass(frozen=True)
 class ChatTarget:
     """OneBot 出站目标，必须显式区分群和私聊。"""
 
@@ -57,6 +149,7 @@ class CallerContext:
     role: str = "user"
     allowed_tools: frozenset[str] = READ_ONLY_TOOLS
     lease_id: str | None = None
+    self_id: str = ""
 
     def target(self) -> ChatTarget:
         """返回当前调用者绑定的唯一出站目标。"""
@@ -109,6 +202,17 @@ class TurnBindingStore:
             return
         with self._lock:
             self._bindings.pop((str(session_id), str(turn_id)), None)
+
+    def discard_if_matches(self, binding: TurnBinding | None) -> bool:
+        """仅删除仍是同一对象的 binding，避免清理旧 turn 时误删新绑定。"""
+        if binding is None:
+            return False
+        with self._lock:
+            key = (str(binding.session_id), str(binding.turn_id))
+            if self._bindings.get(key) != binding:
+                return False
+            del self._bindings[key]
+            return True
 
     def snapshot(self) -> Mapping[tuple[str, str], TurnBinding]:
         """返回只读快照，供诊断测试使用。"""
@@ -214,15 +318,23 @@ def validate_message_scope(message: Mapping[str, Any], context: CallerContext) -
         participant_values.add(str(sender.get("user_id") or ""))
     if context.chat_id not in participant_values:
         return "消息不属于当前私聊"
+    if context.self_id and context.self_id not in participant_values:
+        return "消息不包含当前机器人参与者"
     return None
 
 
-def validate_group_payload(payload: Mapping[str, Any], context: CallerContext) -> str | None:
+def validate_group_payload(
+    payload: Mapping[str, Any],
+    context: CallerContext,
+    expected_user_id: str | None = None,
+) -> str | None:
     """校验群信息或成员信息响应确实属于当前群。"""
     if context.chat_type != "group":
         return "该响应只能在群聊中使用"
     if str(payload.get("group_id") or "") != context.chat_id:
         return "OneBot 响应不属于当前群"
+    if expected_user_id is not None and str(payload.get("user_id") or "") != str(expected_user_id):
+        return "OneBot 响应不属于当前群成员"
     return None
 
 

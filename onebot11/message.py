@@ -82,7 +82,15 @@ def parse_message_segments(segments: list[dict[str, Any]] | str, self_id: str | 
             elif qq:
                 result.mentioned_qq.append(qq)
         elif seg_type == "image":
-            file_id = data.get("url") or data.get("file")
+            # NapCat/LLBot 可能同时提供 file 和 url；只有可直接下载的
+            # URL 才优先，否则回退到 file 标识，避免丢掉可用媒体引用。
+            url_value = str(data.get("url") or "").strip()
+            file_value = str(data.get("file") or "").strip()
+            file_id = (
+                url_value
+                if url_value.startswith(("http://", "https://"))
+                else file_value or url_value
+            )
             if file_id:
                 result.images.append(str(file_id))
                 result.markers.append("[image]")
