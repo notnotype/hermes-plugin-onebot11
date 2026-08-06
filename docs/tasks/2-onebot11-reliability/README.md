@@ -1,7 +1,7 @@
 # OneBot 11 可靠性与安全完善
 
 - 关联需求：OneBot 11 插件整体完善计划
-- 状态：代码和本地验证完成；PR #8 待 CI/审查；Arch + LLBot 已完成指定白名单和 reaction 联调，真人并发、确认写操作和 unknown 出站仍是外部验收项
+- 状态：代码和本地验证完成；PR #8 等待 CI/审查；Arch + LLBot 已加载 0.3.1 并完成指定白名单、pending/flush、同实例 reconnect smoke 和 reaction 联调，真人并发、确认写操作和 unknown 出站仍是外部验收项
 - 开始日期：2026-08-05
 
 ## 目标
@@ -34,7 +34,7 @@
 - Hermes 集成：运行 `scripts\\verify_hermes_integration.ps1`，当前结果 `177 passed`，覆盖真实 adapter import、注册、4 个 hooks、工具 handler、shared session key、lease fencing、同实例 reconnect、配置合同、operation resolve、触发竞争、媒体孤儿清理、负数 message_id 和 reaction 生命周期。
 - 严格 auxiliary 回归：`3 passed`，覆盖新 API 的 no-fallback/单次尝试合同和旧 Hermes API 缺少参数时的安全禁用。
 - 静态检查：`.venv\\Scripts\\python.exe -m ruff check .`，当前通过。
-- Arch + LLBot 外部联调已完成指定范围：Hermes 实际加载当前插件版本，群 `1072992996` 使用 shared session，私聊白名单只有 `2056963663`；真实 WS/HTTP 连接、允许群消息触发、私聊 Agent 回复、pending 恢复、非白名单拒绝、审计和群处理 reaction（`set=true` -> 回复 -> `set=false`）均已验证。Agent 入站使用真实 WS 的合成 OneBot payload，真人 QQ 入站、双用户并发、确认写操作和 unknown 出站仍待验收。
+- Arch + LLBot 外部联调已完成指定范围：Hermes 实际加载 0.3.1，群 `1072992996` 使用 shared session，私聊白名单只有 `2056963663`；真实 WS/HTTP 连接、允许群消息触发、私聊 Agent 回复、重启后 pending 保留并由管理员 `flush` 清空、非白名单拒绝、审计和群处理 reaction（`set=true` -> 回复 -> `set=false`）均已验证。另以临时 Hermes home 直测同一 adapter reconnect 成功。Agent 入站仍使用真实 WS 的合成 OneBot payload，真人 QQ 入站、双用户并发、确认写操作和 unknown 出站仍待验收。
 
 ## 计划出入
 

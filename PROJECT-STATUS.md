@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- **阶段**：OneBot 11 可靠性、安全和分层触发已完成本地闭环；PR #8 已存在，当前分支正在补 CI packaging、同实例 reconnect、配置合同和 operation ledger 收口。
+- **阶段**：OneBot 11 可靠性、安全和分层触发已完成代码闭环；PR #8 已存在，插件本地门禁和 Arch 指定白名单复验通过，等待 CI 基础设施恢复并完成剩余真实 QQ 验收。
 - **核心合同**：群固定一个共享 session；群消息持久入队；触发后按 lease 启动单群单 turn；非幂等出站结果未知时进入 `uncertain`，不自动重放。
 - **本地验证**：协议/状态机测试通过；使用本地 Hermes 源码与其 site-packages 运行 adapter 测试通过。最终门禁命令和环境见“验证证据”。
 
@@ -30,11 +30,12 @@
 - 使用 `scripts\\verify_hermes_integration.ps1` 和本地 Hermes 源码/site-packages：全套测试 `177 passed`；覆盖 adapter hooks、工具注册、共享队列、身份绑定、shared session key、同实例 reconnect、配置合同、operation resolve、媒体清理、出站 unknown、严格 auxiliary 参数、触发竞争和 reaction 生命周期。
 - 严格 auxiliary 回归测试：`3 passed`；确认 `fallback_policy="none"`、`max_attempts=1` 和旧 API 安全降级。
 - `.venv\\Scripts\\python.exe -m ruff check .`：通过。
+- `pip install -e ".[dev]"`：在本地干净安装路径验证通过；Linux CI 失败过一次，原因是 GitHub Actions 准备 action 时返回 `Service Unavailable`，不是安装或测试错误，已重新排队。
 - 真实 Hermes 临时 `HERMES_HOME` 注册 smoke：已确认平台、9 个工具、4 个安全 hooks 和 `onebot11_trigger` auxiliary 均注册，并验证 shared session 合同、严格旁路配置和同实例 reconnect。
 
 ## 外部联调状态
 
-此前在 Arch `192.168.1.18` 使用真实 Hermes + LLBot direct compose 完成过指定白名单联调。机器人 QQ 为 `3101482118`，唯一允许群为 `1072992996`，唯一允许私聊用户为 `2056963663`；Hermes/LLBot WS 与 HTTP token 已配置一致且未记录在文档中。该次主要验证的是 0.3.0 的消息、shared session、pending 恢复和 reaction；本次 0.3.1 closeout 的 reconnect/operation ledger 仍需重新部署后复验。
+此前在 Arch `192.168.1.18` 使用真实 Hermes + LLBot direct compose 完成过指定白名单联调。机器人 QQ 为 `3101482118`，唯一允许群为 `1072992996`，唯一允许私聊用户为 `2056963663`；Hermes/LLBot WS 与 HTTP token 已配置一致且未记录在文档中。当前 Arch 插件 symlink 已切换到 `eb1fd8c`（0.3.1 closeout）。
 
 已确认：
 
@@ -43,6 +44,8 @@
 - 通过真实反向 WS 服务注入允许群消息，普通消息先进入持久 SQLite 队列，随后注入 @ 触发；队列出现单个群 lease，最终消息和 trigger request 均完成清理，滚动摘要写入。
 - 指定群收到 Hermes 回复 `OneBot11 联调成功`；允许用户 `2056963663` 收到私聊回复 `OneBot11 私聊联调成功`。
 - 已验证 pending 消息在 Hermes 重启后仍可恢复，并由管理员 `flush` 完成处理；WS/HTTP 重连行为只记录为实际联调结果，不升级为 OneBot 11 协议保证。
+- 本次 closeout 复验中，重启后指定群仍保留 1 条 pending 消息；仅向指定群注入白名单超级管理员 `/onebot flush`，消息被处理并从 SQLite 清空，审计记录了对应 `admin_command=flush`。
+- 在 Arch 临时 Hermes home 中直测同一 adapter 的 `connect → disconnect → reconnect → disconnect`，四个阶段均在 3 秒超时内完成（实际约 1–20ms）；重连后 queue/dispatcher 可以继续工作。
 - 真实 LLBot 上报的其他群消息和合成的非白名单私聊均被拒绝并写入审计；没有产生出站。
 - 在指定群用真实消息 ID `-726745341` 完成 reaction smoke：`set=true` 后收到 Hermes 群回复，再发送 `set=false`；LLBot 的 `fetch_emoji_like` 返回空列表，确认 👀 已清理。
 
@@ -50,8 +53,10 @@
 
 - 以上 Agent 入站事件使用了真实反向 WS 的合成 OneBot payload，不等同于 QQ 客户端真人发言；还未完成两名真人群成员同时触发时的外部观察。
 - 群管理写工具的预览/确认、非幂等出站断线后的 `uncertain` 与人工 resolve 尚未在真实 QQ 上执行；本地测试覆盖了状态机。
-- 0.3.1 closeout 的同实例 adapter reconnect、operation ledger `resolve action retry|discard` 和真人双成员并发尚未重新部署到 Arch。
+- 真实 QQ 的两名群成员同时触发、群管理写工具预览/确认、非幂等出站 `unknown` 以及 `resolve action retry|discard` 尚未完成；本地测试和 Arch 的队列/flush/reconnect smoke 已覆盖其持久化基础。
 - 未在本轮使用 NapCat，也未把 WS 重连重放行为提升为协议保证。
+- Hermes 全局 SIGTERM 关闭日志仍偶发出现 `onebot11 disconnect timed out after 5.0s`；空 adapter 直测没有复现，日志同时包含 Discord/Weixin 的关闭期错误，当前作为 Hermes 多平台 shutdown 观察项，不据此修改 OneBot 插件。
+- Hermes strict auxiliary 修改已在独立干净 worktree 提交并通过 3 个测试，但当前远端 `NousResearch/hermes-agent` 对本账号无写权限，尚未能推送或创建独立 PR。
 
 ## 约束与取舍
 
