@@ -19,7 +19,6 @@ import tempfile
 import time
 import uuid
 from collections.abc import Mapping
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -62,7 +61,6 @@ is_numeric_message_id = _proto.http_api.is_numeric_message_id
 AuditLog = _proto.audit.AuditLog
 ConfirmationStore = _proto.confirm.ConfirmationStore
 ToolContext = _proto.permissions.ToolContext
-build_role_tools = _proto.permissions.build_role_tools
 build_access_policy = _proto.permissions.build_access_policy
 parse_admin_list = _proto.permissions.parse_admin_list
 parse_bool = _proto.permissions.parse_bool
@@ -80,7 +78,6 @@ handle_write_action = _proto.tools.handle_write_action
 READ_TOOL_NAMES = _proto.tools.READ_TOOL_NAMES
 TOOL_SCHEMAS = _proto.tools.TOOL_SCHEMAS
 WRITE_TOOL_NAMES = _proto.tools.WRITE_TOOL_NAMES
-build_trigger_config = _proto.triggers.build_trigger_config
 build_llm_trigger_input = _proto.triggers.build_llm_trigger_input
 LayeredTriggerState = _proto.triggers.LayeredTriggerState
 TriggerAction = _proto.triggers.TriggerAction
@@ -88,6 +85,7 @@ parse_llm_decision = _proto.triggers.parse_llm_decision
 build_agent_context = _proto.context.build_agent_context
 should_trigger = _proto.triggers.should_trigger
 ReverseWsServer = _proto.ws_server.ReverseWsServer
+parse_runtime_config = _proto.config.parse_runtime_config
 
 logger = logging.getLogger(__name__)
 _PLATFORM_NAME = "onebot11"
@@ -145,26 +143,7 @@ def _resolve_hermes_home() -> Path:
 
 def _effective_extra(extra: Mapping[str, Any]) -> dict[str, Any]:
     """合并 OneBot 部署环境覆盖，保留显式空值的 fail-closed 语义。"""
-    effective = dict(extra)
-    env_to_extra = {
-        "ONEBOT11_HTTP_API": "http_api",
-        "ONEBOT11_SELF_ID": "self_id",
-        "ONEBOT11_ACCESS_TOKEN": "access_token",
-        "ONEBOT11_WS_PORT": "ws_port",
-        "ONEBOT11_WS_HOST": "ws_host",
-        "ONEBOT11_DM_POLICY": "dm_policy",
-        "ONEBOT11_ALLOWED_USERS": "allowed_users",
-        "ONEBOT11_ALLOWED_GROUPS": "allowed_groups",
-        "ONEBOT11_REQUIRE_MENTION": "require_mention",
-        "ONEBOT11_SUPER_ADMINS": "super_admins",
-        "ONEBOT11_ADMINS": "admins",
-        "ONEBOT11_QUEUE_DB": "queue_db_path",
-        "ONEBOT11_HOME_CHANNEL_TYPE": "home_channel_type",
-    }
-    for env_name, extra_name in env_to_extra.items():
-        if env_name in os.environ:
-            effective[extra_name] = os.environ[env_name]
-    return effective
+    return _proto.config.effective_extra(extra, os.environ)
 
 
 def _serializable_caller(context: CallerContext) -> dict[str, Any]:
@@ -221,47 +200,28 @@ class OneBot11Adapter(BasePlatformAdapter):
 
     def __init__(self, config: PlatformConfig) -> None:
         """读取并校验配置，初始化协议客户端和群级状态机。"""
-        extra = _effective_extra(config.extra if isinstance(config.extra, Mapping) else {})
-        configured_mode = str(extra.get("session_mode", "shared")).casefold()
-        if configured_mode != "shared" or parse_bool(
-            extra.get("group_sessions_per_user"), default=False, name="group_sessions_per_user"
-        ):
-            raise ValueError("OneBot11 群 session 只允许 session_mode=shared")
+        runtime = parse_runtime_config(
+            config.extra if isinstance(config.extra, Mapping) else {},
+            os.environ,
+        )
+        extra = runtime.extra
         extra["session_mode"] = "shared"
         extra["group_sessions_per_user"] = False
         config.extra = extra
         super().__init__(config=config, platform=_platform())
 
-        try:
-            self.ws_port = int(os.getenv("ONEBOT11_WS_PORT") or extra.get("ws_port", 18880))
-        except (TypeError, ValueError) as exc:
-            raise ValueError("ONEBOT11_WS_PORT 必须是 1-65535 范围内的整数") from exc
-        if not 0 <= self.ws_port <= 65535:
-            raise ValueError("ONEBOT11_WS_PORT 必须是 0-65535 范围内的整数")
-        self.ws_host = str(os.getenv("ONEBOT11_WS_HOST") or extra.get("ws_host", "127.0.0.1")).strip()
-        self.access_token = str(
-            os.getenv("ONEBOT11_ACCESS_TOKEN") or extra.get("access_token", "")
-        ).strip()
-        http_api = str(os.getenv("ONEBOT11_HTTP_API") or extra.get("http_api") or "").strip()
-        self.self_id = str(os.getenv("ONEBOT11_SELF_ID") or extra.get("self_id") or "").strip()
-        if not self.self_id:
-            raise ValueError("ONEBOT11_SELF_ID 未配置")
-        if http_api:
-            parse_http_base_url(http_api)
-        if self.ws_host not in {"127.0.0.1", "::1", "localhost"} and not self.access_token:
-            raise ValueError("WS 非 loopback 地址必须配置 ONEBOT11_ACCESS_TOKEN")
-        if http_api and not _is_loopback_url(http_api) and not self.access_token:
-            raise ValueError("HTTP API 非本机地址必须配置 ONEBOT11_ACCESS_TOKEN")
+        self.ws_port = runtime.ws_port
+        self.ws_host = runtime.ws_host
+        self.access_token = runtime.access_token
+        http_api = runtime.http_api
+        self._http_api = http_api
+        self.self_id = runtime.self_id
 
-        self._access_policy = build_access_policy(extra, os.environ)
+        self._access_policy = runtime.access_policy
         self.dm_policy = self._access_policy.dm_policy
         self.allowed_users = set(self._access_policy.allowed_users)
         self.allowed_groups = set(self._access_policy.allowed_groups)
-        self.require_mention = parse_bool(
-            os.getenv("ONEBOT11_REQUIRE_MENTION") if os.getenv("ONEBOT11_REQUIRE_MENTION") is not None else extra.get("require_mention"),
-            default=True,
-            name="require_mention",
-        )
+        self.require_mention = runtime.trigger_config.require_mention
         raw_super_admins = os.getenv("ONEBOT11_SUPER_ADMINS")
         if raw_super_admins is None:
             raw_super_admins = os.getenv("ONEBOT11_ADMINS")
@@ -270,19 +230,10 @@ class OneBot11Adapter(BasePlatformAdapter):
         if raw_super_admins is None:
             raw_super_admins = extra.get("admins")
         self.super_admins = parse_id_list(raw_super_admins)
-        self.role_tools = build_role_tools(extra)
-        self._processing_reaction_enabled = parse_bool(
-            extra.get("processing_reaction_enabled"),
-            default=True,
-            name="processing_reaction_enabled",
-        )
-        self._processing_reaction_emoji_id = str(
-            extra.get("processing_reaction_emoji_id", _PROCESSING_REACTION_EMOJI_ID)
-        ).strip()
-        if not self._processing_reaction_emoji_id:
-            raise ValueError("processing_reaction_emoji_id 不能为空")
-        parsed_trigger_config = build_trigger_config(extra)
-        self.trigger_config = replace(parsed_trigger_config, require_mention=self.require_mention)
+        self.role_tools = runtime.role_tools
+        self._processing_reaction_enabled = runtime.processing_reaction_enabled
+        self._processing_reaction_emoji_id = runtime.processing_reaction_emoji_id
+        self.trigger_config = runtime.trigger_config
         self._last_trigger_at: dict[str, float] = {}
         self._llm_trigger_tasks: dict[str, asyncio.Task[None]] = {}
         self._trigger_timer_tasks: dict[str, asyncio.Task[None]] = {}
@@ -294,55 +245,52 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._llm_trigger_loop: asyncio.AbstractEventLoop | None = None
         self._llm_trigger_route_logged = False
 
-        media_hosts = parse_id_list(extra.get("media_allowed_hosts"))
-        media_ports = {int(item) for item in parse_id_list(extra.get("media_allowed_ports"))}
         self._api = OneBotHttpApi(
             base_url=http_api,
             token=self.access_token,
-            timeout=float(extra.get("http_timeout_seconds", 10)),
-            max_retries=int(extra.get("query_max_retries", 1)),
-            max_response_bytes=int(extra.get("http_max_response_bytes", 1_000_000)),
-            allowed_media_hosts=media_hosts,
-            allowed_media_ports=media_ports,
-            max_media_bytes=int(extra.get("max_image_bytes", 8_000_000)),
-            max_redirects=int(extra.get("max_image_redirects", 3)),
+            timeout=runtime.http_timeout_seconds,
+            max_retries=runtime.query_max_retries,
+            max_response_bytes=runtime.http_max_response_bytes,
+            allowed_media_hosts=set(runtime.media_allowed_hosts),
+            allowed_media_ports=set(runtime.media_allowed_ports),
+            max_media_bytes=runtime.max_image_bytes,
+            max_redirects=runtime.max_image_redirects,
         )
-        self._max_media_total_bytes = max(1024, int(extra.get("max_image_total_bytes", 16_000_000)))
-        self._max_images_per_message = max(
-            0, min(32, int(extra.get("max_images_per_message", 4)))
-        )
+        self._max_media_total_bytes = runtime.max_image_total_bytes
+        self._max_images_per_message = runtime.max_images_per_message
 
         self._hermes_home = _resolve_hermes_home()
-        queue_path = os.getenv("ONEBOT11_QUEUE_DB") or extra.get("queue_db_path")
+        queue_path = runtime.queue_db_path
         if not queue_path:
             queue_path = str(self._hermes_home / "onebot11" / "queue.sqlite3")
         self._queue = QueueStore(
             queue_path,
-            max_messages=int(extra.get("queue_max_messages", 1000)),
-            max_queue_bytes=int(extra.get("queue_max_bytes", 2_000_000)),
-            max_message_bytes=int(extra.get("queue_max_message_bytes", 32_000)),
-            max_original_bytes=int(extra.get("queue_max_original_bytes", 8_000)),
-            max_summary_bytes=int(extra.get("queue_max_summary_bytes", 16_000)),
-            recent_originals=int(extra.get("queue_recent_originals", 3)),
-            dedupe_ttl_seconds=float(extra.get("queue_dedupe_ttl_seconds", 7 * 24 * 3600)),
-            max_attempts=int(extra.get("queue_max_attempts", 3)),
+            max_messages=runtime.queue_max_messages,
+            max_queue_bytes=runtime.queue_max_bytes,
+            max_message_bytes=runtime.queue_max_message_bytes,
+            max_original_bytes=runtime.queue_max_original_bytes,
+            max_summary_bytes=runtime.queue_max_summary_bytes,
+            recent_originals=runtime.queue_recent_originals,
+            dedupe_ttl_seconds=runtime.queue_dedupe_ttl_seconds,
+            max_attempts=runtime.queue_max_attempts,
         )
-        self._agent_input_bytes = max(4_096, min(256 * 1024, int(extra.get("agent_input_bytes", 64 * 1024))))
-        self._agent_recent_originals = max(0, int(extra.get("agent_recent_originals", 3)))
+        self._agent_input_bytes = runtime.agent_input_bytes
+        self._agent_recent_originals = runtime.agent_recent_originals
         self._dispatcher = GroupDispatcher(
             self._queue,
             self._start_queue_turn,
-            lease_seconds=float(extra.get("queue_lease_seconds", 120)),
-            recovery_poll_seconds=float(extra.get("queue_recovery_poll_seconds", 5)),
+            lease_seconds=runtime.queue_lease_seconds,
+            heartbeat_seconds=runtime.queue_heartbeat_seconds,
+            recovery_poll_seconds=runtime.queue_recovery_poll_seconds,
             can_dispatch=self._can_dispatch_chat,
             on_lease_lost=self._on_lease_lost,
         )
         self._bindings = TurnBindingStore()
-        self._confirmations = ConfirmationStore(float(extra.get("confirm_ttl_seconds", 60)))
-        audit_path = extra.get("audit_path") or (
+        self._confirmations = ConfirmationStore(runtime.confirm_ttl_seconds)
+        audit_path = runtime.audit_path or (
             str(self._hermes_home / "onebot11" / "audit.jsonl")
         )
-        self._audit = AuditLog(audit_path, max_bytes=int(extra.get("audit_max_bytes", 2_000_000)))
+        self._audit = AuditLog(audit_path, max_bytes=runtime.audit_max_bytes)
         self._ws: ReverseWsServer | None = None
         self._chat_types: dict[str, str] = {}
         self._targets: dict[str, ChatTarget | None] = {}
@@ -352,15 +300,12 @@ class OneBot11Adapter(BasePlatformAdapter):
         media_root.mkdir(parents=True, exist_ok=True)
         self._media_root = media_root.resolve()
         self._media_prefix = media_prefix
-        self._media_orphan_ttl = max(
-            60.0, float(extra.get("media_orphan_ttl_seconds", 24 * 3600))
-        )
+        self._media_orphan_ttl = runtime.media_orphan_ttl_seconds
         self._media_dir = tempfile.mkdtemp(prefix=media_prefix, dir=str(self._media_root))
         self._unknown_leases: set[str] = set()
         self._outbound_started: set[str] = set()
         self._outbound_successful: set[str] = set()
         self._outbound_known_failure: set[str] = set()
-        self._unknown_operations: set[str] = set()
         self._processing_reaction_message_ids: dict[str, str] = {}
         self._fenced_leases: set[str] = set()
         self._lease_session_keys: dict[str, str] = {}
@@ -387,6 +332,16 @@ class OneBot11Adapter(BasePlatformAdapter):
         if not self._api_base():
             self._set_fatal_error("config_missing", "ONEBOT11_HTTP_API 未配置", retryable=False)
             return False
+        await self._cancel_trigger_tasks()
+        await self._clear_all_processing_reactions()
+        self._reset_reconnect_state()
+        if self._queue.closed:
+            self._queue.reopen()
+        await self._dispatcher.reopen()
+        if self._ws is not None:
+            await self._ws.stop()
+            self._ws = None
+        self._closed = False
         self._ws = ReverseWsServer(
             port=self.ws_port,
             token=self.access_token,
@@ -407,11 +362,10 @@ class OneBot11Adapter(BasePlatformAdapter):
 
     def _api_base(self) -> str:
         """读取 HTTP API 地址。"""
-        return os.getenv("ONEBOT11_HTTP_API") or str((self.config.extra or {}).get("http_api", ""))
+        return self._http_api
 
-    async def disconnect(self) -> None:
-        """停止 WS、heartbeat、HTTP 会话并回收本插件创建的媒体文件。"""
-        self._closed = True
+    async def _cancel_trigger_tasks(self) -> None:
+        """取消旁路判断和定时任务，避免旧状态在 reconnect 后回写。"""
         trigger_tasks = list(self._llm_trigger_tasks.values())
         self._llm_trigger_tasks.clear()
         timer_tasks = list(self._trigger_timer_tasks.values())
@@ -422,16 +376,48 @@ class OneBot11Adapter(BasePlatformAdapter):
             task.cancel()
         if trigger_tasks or timer_tasks:
             await asyncio.gather(*trigger_tasks, *timer_tasks, return_exceptions=True)
+
+    def _reset_reconnect_state(self) -> None:
+        """丢弃只存在内存中的 engaged/debounce/judging 状态。"""
+        self._last_trigger_at.clear()
+        self._trigger_states.clear()
+        self._trigger_state_locks.clear()
+        self._llm_trigger_api_supported = None
+        self._llm_trigger_api_audited = False
+        self._llm_trigger_semaphore = None
+        self._llm_trigger_loop = None
+        self._llm_trigger_route_logged = False
+        self._fenced_leases.clear()
+        self._unknown_leases.clear()
+        self._outbound_started.clear()
+        self._outbound_successful.clear()
+        self._outbound_known_failure.clear()
+        self._lease_session_keys.clear()
+        self._pending_completions.clear()
+        self._processing_reaction_message_ids.clear()
+        self._bindings.clear()
+
+    async def disconnect(self) -> None:
+        """停止 WS、heartbeat、HTTP 会话并回收本插件创建的媒体文件。"""
+        self._closed = True
+        await self._cancel_trigger_tasks()
         cancel_background = getattr(self, "cancel_background_tasks", None)
         if callable(cancel_background):
             await cancel_background()
         await self._dispatcher.close()
+        try:
+            await self._clear_all_processing_reactions()
+        except Exception:
+            logger.warning("OneBot11 disconnect 清理 reaction 失败", exc_info=True)
         if self._ws is not None:
             await self._ws.stop()
             self._ws = None
         await self._api.close()
         self._cleanup_media()
-        self._queue.close()
+        if not self._queue.closed:
+            await asyncio.to_thread(self._queue.abandon_owner_leases)
+            self._queue.close()
+        self._bindings.clear()
         self._mark_disconnected()
 
     async def _on_ws_event(self, raw: dict) -> None:
@@ -997,9 +983,14 @@ class OneBot11Adapter(BasePlatformAdapter):
                 "llm_trigger_skip",
                 {
                     "chat_id": normalized,
+                    "candidate_type": action.candidate_type or "candidate",
                     "reason": "provider_missing" if not route else "hermes_api_unsupported",
                     "pending": int(status.get("pending", 0)),
-                    "rate_limited": False,
+                    "input_bytes": 0,
+                    "duration_ms": 0,
+                    "decision": "ignore",
+                    "wait_seconds": 0,
+                    "concurrency_waited": False,
                 },
             )
             return
@@ -1294,6 +1285,10 @@ class OneBot11Adapter(BasePlatformAdapter):
         action: TriggerAction,
         *,
         failure: str,
+        pending: int = 0,
+        input_bytes: int = 0,
+        duration_ms: int = 0,
+        concurrency_waited: bool = False,
     ) -> None:
         """在群锁内处理取消/失败结果，避免旧 task 污染新状态。"""
         normalized = str(chat_id)
@@ -1326,11 +1321,13 @@ class OneBot11Adapter(BasePlatformAdapter):
             {
                 "chat_id": normalized,
                 "candidate_type": action.candidate_type or "candidate",
+                "pending": int(pending),
+                "input_bytes": int(input_bytes),
                 "decision": "ignore",
                 "wait_seconds": 0,
-                "duration_ms": 0,
+                "duration_ms": int(duration_ms),
                 "failure": "stale_judgement" if stale else failure,
-                "rate_limited": False,
+                "concurrency_waited": bool(concurrency_waited),
             },
         )
 
@@ -1343,7 +1340,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         decision_name = "ignore"
         wait_seconds = 0
         failure = ""
-        rate_limited = False
+        concurrency_waited = False
         messages_count = 0
         input_bytes = 0
         notify = False
@@ -1395,7 +1392,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                                 from agent.auxiliary_client import async_call_llm
 
                                 semaphore = self._llm_trigger_semaphore_for_loop()
-                                rate_limited = semaphore.locked()
+                                concurrency_waited = semaphore.locked()
                                 # 释放群锁后再等待模型，允许新消息入队并推进
                                 # dirty_revision；这里仅把调用参数复制出来。
                                 request = (
@@ -1464,7 +1461,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                         "decision": decision_name,
                         "wait_seconds": wait_seconds,
                         "duration_ms": int((time.monotonic() - started_at) * 1000),
-                        "rate_limited": rate_limited,
+                        "concurrency_waited": concurrency_waited,
                     },
                 )
             if notify:
@@ -1490,6 +1487,10 @@ class OneBot11Adapter(BasePlatformAdapter):
                     normalized,
                     action,
                     failure=failure,
+                    pending=messages_count,
+                    input_bytes=input_bytes,
+                    duration_ms=int((time.monotonic() - started_at) * 1000),
+                    concurrency_waited=concurrency_waited,
                 )
             current = self._llm_trigger_tasks.get(normalized)
             if current is asyncio.current_task():
@@ -1707,6 +1708,11 @@ class OneBot11Adapter(BasePlatformAdapter):
                 message_id,
                 exc,
             )
+
+    async def _clear_all_processing_reactions(self) -> None:
+        """断开前尽力移除所有内存中登记的 👀 reaction。"""
+        for lease_id in list(self._processing_reaction_message_ids):
+            await self._clear_processing_reaction(lease_id)
 
     def _lease_is_current(self, lease_id: str | None) -> bool:
         """检查当前 turn 是否仍持有 queue lease。"""
@@ -2340,24 +2346,6 @@ class OneBot11Adapter(BasePlatformAdapter):
                 },
             )
             return {"status": "permission_error", "error": authorization_error}
-        fingerprint = self._operation_fingerprint(
-            confirmation.tool_name,
-            confirmation.params,
-            chat_type=confirmation.chat_type,
-            chat_id=confirmation.chat_id,
-        )
-        if fingerprint in self._unknown_operations:
-            self._audit.record(
-                "unknown_blocked",
-                {
-                    "tool": confirmation.tool_name,
-                    "user_id": confirmation.user_id,
-                    "chat_type": confirmation.chat_type,
-                    "chat_id": confirmation.chat_id,
-                    "operation": fingerprint,
-                },
-            )
-            return {"status": "unknown", "error": "同一管理动作已有未知结果，禁止重复执行"}
         if caller.user_id not in self.super_admins or not self._chat_access_allowed(
             caller.chat_type, caller.chat_id, caller.user_id
         ):
@@ -2372,25 +2360,86 @@ class OneBot11Adapter(BasePlatformAdapter):
                 },
             )
             return {"status": "permission_error", "error": "当前操作者或目标已不再授权"}
+        fingerprint = self._operation_fingerprint(
+            confirmation.tool_name,
+            confirmation.params,
+            chat_type=confirmation.chat_type,
+            chat_id=confirmation.chat_id,
+        )
+        operation_start = await asyncio.to_thread(
+            self._queue.start_operation,
+            fingerprint=fingerprint,
+            tool_name=confirmation.tool_name,
+            chat_type=confirmation.chat_type,
+            chat_id=confirmation.chat_id,
+            caller_user_id=confirmation.user_id,
+            params=dict(confirmation.params),
+        )
+        if operation_start.blocked:
+            self._audit.record(
+                "unknown_blocked",
+                {
+                    "tool": confirmation.tool_name,
+                    "user_id": confirmation.user_id,
+                    "chat_type": confirmation.chat_type,
+                    "chat_id": confirmation.chat_id,
+                    "operation_id": operation_start.operation.operation_id,
+                    "fingerprint": fingerprint[:12],
+                },
+            )
+            return {
+                "status": "unknown",
+                "operation_id": operation_start.operation.operation_id,
+                "error": "同一管理动作已有未知结果，禁止重复执行",
+            }
+        operation_id = operation_start.operation.operation_id
         try:
             result = await handle_write_action(self._api, confirmation.tool_name, dict(confirmation.params), caller)
+        except asyncio.CancelledError:
+            await asyncio.to_thread(
+                self._queue.finish_operation,
+                operation_id,
+                "unknown",
+                reason="管理动作 task 被取消，结果未知",
+            )
+            raise
         except OneBotApiError as exc:
             result = {"status": "unknown" if exc.unknown_outcome else "error", "error": str(exc)}
-            if exc.unknown_outcome:
-                self._unknown_operations.add(fingerprint)
-                self._audit.record(
-                    "unknown",
-                    {
-                        "tool": confirmation.tool_name,
-                        "user_id": confirmation.user_id,
-                        "chat_type": confirmation.chat_type,
-                        "chat_id": confirmation.chat_id,
-                        "operation": fingerprint,
-                    },
-                )
-        if result.get("status") == "unknown":
-            self._unknown_operations.add(fingerprint)
-        self._audit.record("execute", {"tool": confirmation.tool_name, "user_id": caller.user_id, "chat_type": caller.chat_type, "chat_id": caller.chat_id, "status": result.get("status")})
+            await asyncio.to_thread(
+                self._queue.finish_operation,
+                operation_id,
+                "unknown" if exc.unknown_outcome else "known_failed",
+                reason=str(exc),
+            )
+        except Exception as exc:
+            result = {"status": "unknown", "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+            await asyncio.to_thread(
+                self._queue.finish_operation,
+                operation_id,
+                "unknown",
+                reason=str(exc),
+            )
+        else:
+            result_status = "succeeded" if result.get("status") == "ok" else "known_failed"
+            await asyncio.to_thread(
+                self._queue.finish_operation,
+                operation_id,
+                result_status,
+                reason=str(result.get("error") or "")[:512] or None,
+            )
+        result["operation_id"] = operation_id
+        self._audit.record(
+            "execute",
+            {
+                "tool": confirmation.tool_name,
+                "user_id": caller.user_id,
+                "chat_type": caller.chat_type,
+                "chat_id": caller.chat_id,
+                "operation_id": operation_id,
+                "fingerprint": fingerprint[:12],
+                "status": result.get("status"),
+            },
+        )
         return result
 
     async def _handle_admin_command(self, event: _proto.events.InboundEvent) -> None:
@@ -2410,7 +2459,7 @@ class OneBot11Adapter(BasePlatformAdapter):
             )
             await self._send_direct(event, "当前目标不再满足 OneBot11 访问策略")
             return
-        parts = event.text.strip().split(maxsplit=2)
+        parts = event.text.strip().split()
         command = parts[1].casefold() if len(parts) > 1 else "status"
         chat_id = event.chat_id
         self._audit.record(
@@ -2419,7 +2468,12 @@ class OneBot11Adapter(BasePlatformAdapter):
         )
         try:
             if command == "confirm" and len(parts) >= 3:
-                confirmation = self._confirmations.consume(parts[2], user_id=event.user_id, chat_type=event.chat_type, chat_id=chat_id)
+                confirmation = self._confirmations.consume(
+                    parts[2],
+                    user_id=event.user_id,
+                    chat_type=event.chat_type,
+                    chat_id=chat_id,
+                )
                 if confirmation is None:
                     self._audit.record(
                         "permission_denied",
@@ -2444,6 +2498,18 @@ class OneBot11Adapter(BasePlatformAdapter):
                     if trigger_state is not None
                     else {"mode": "idle", "llm_calls": 0, "llm_failures": 0}
                 )
+                status["operations"] = [
+                    self._queue.operation_summary(record)
+                    for record in await asyncio.to_thread(
+                        self._queue.operation_records,
+                        chat_id,
+                    )
+                ]
+                status["unknown_operations"] = await asyncio.to_thread(
+                    self._queue.unknown_operation_count,
+                    chat_id,
+                )
+                status["auxiliary_events"] = self._aux_event_count
                 await self._send_direct(event, json.dumps(status, ensure_ascii=False))
             elif command == "flush":
                 if event.chat_type != "group":
@@ -2478,29 +2544,96 @@ class OneBot11Adapter(BasePlatformAdapter):
                     await self._send_direct(event, "当前群不再满足 OneBot11 访问策略")
                     return
                 await self._send_direct(event, f"群 {chat_id} 已{'暂停' if command == 'pause' else '恢复'}自动 dispatch")
-            elif command == "resolve" and len(parts) >= 3 and parts[2] in {"retry", "discard"}:
-                if event.chat_type != "group":
-                    await self._send_direct(event, "resolve 只能作用于当前群队列")
-                    return
-                count = await asyncio.to_thread(self._queue.resolve_uncertain, chat_id, parts[2])
-                if parts[2] == "retry":
-                    status = await asyncio.to_thread(self._queue.status, chat_id)
-                    if count and int(status.get("pending_trigger_requests", 0)) == 0:
-                        await asyncio.to_thread(
-                            self._queue.create_trigger,
-                            chat_id,
-                            "admin_resolve_retry",
-                            event.user_id,
-                            event.user_name,
+            elif command == "resolve":
+                if len(parts) >= 5 and parts[2].casefold() == "action":
+                    if event.chat_type != "group":
+                        await self._send_direct(event, "resolve action 只能作用于当前群")
+                        return
+                    action = parts[3].casefold()
+                    if action not in {"retry", "discard"}:
+                        await self._send_direct(event, "用法: /onebot resolve action retry|discard OPERATION_ID")
+                        return
+                    record = await asyncio.to_thread(
+                        self._queue.resolve_operation,
+                        parts[4],
+                        action,
+                        chat_type=event.chat_type,
+                        chat_id=chat_id,
+                        caller_user_id=event.user_id,
+                    )
+                    if record is None:
+                        await self._send_direct(event, "operation 不存在、已属于其他群或不是同一超级管理员")
+                        return
+                    expected = "retry_armed" if action == "retry" else "discarded"
+                    self._audit.record(
+                        "admin_resolve_action",
+                        {
+                            "operation_id": record.operation_id,
+                            "chat_type": event.chat_type,
+                            "chat_id": chat_id,
+                            "user_id": event.user_id,
+                            "action": action,
+                            "status": record.status,
+                        },
+                    )
+                    if record.status != expected:
+                        await self._send_direct(
+                            event,
+                            f"operation 当前状态为 {record.status}，只有 unknown 才能执行 {action}",
                         )
-                    await self._dispatcher.notify(chat_id)
-                self._audit.record(
-                    "admin_resolve",
-                    {"chat_type": event.chat_type, "chat_id": chat_id, "user_id": event.user_id, "action": parts[2], "count": count},
-                )
-                await self._send_direct(event, f"已处理 uncertain/failed 消息 {count} 条: {parts[2]}（retry 可能重复执行）")
+                        return
+                    if action == "retry":
+                        await self._send_direct(
+                            event,
+                            f"已解除 operation {record.operation_id} 的重复执行阻断；请重新让 Hermes 生成预览并确认，可能重复执行。",
+                        )
+                    else:
+                        await self._send_direct(
+                            event,
+                            f"已放弃 operation {record.operation_id}；不会再次访问 OneBot。",
+                        )
+                elif len(parts) >= 3 and parts[2].casefold() in {"retry", "discard"}:
+                    if event.chat_type != "group":
+                        await self._send_direct(event, "resolve 只能作用于当前群队列")
+                        return
+                    action = parts[2].casefold()
+                    count = await asyncio.to_thread(self._queue.resolve_uncertain, chat_id, action)
+                    if action == "retry":
+                        status = await asyncio.to_thread(self._queue.status, chat_id)
+                        if count and int(status.get("pending_trigger_requests", 0)) == 0:
+                            await asyncio.to_thread(
+                                self._queue.create_trigger,
+                                chat_id,
+                                "admin_resolve_retry",
+                                event.user_id,
+                                event.user_name,
+                            )
+                        await self._dispatcher.notify(chat_id)
+                    self._audit.record(
+                        "admin_resolve",
+                        {
+                            "chat_type": event.chat_type,
+                            "chat_id": chat_id,
+                            "user_id": event.user_id,
+                            "action": action,
+                            "count": count,
+                        },
+                    )
+                    await self._send_direct(
+                        event,
+                        f"已处理 uncertain/failed 消息 {count} 条: {action}（retry 可能重复执行）",
+                    )
+                else:
+                    await self._send_direct(
+                        event,
+                        "用法: /onebot resolve action retry|discard OPERATION_ID",
+                    )
             else:
-                await self._send_direct(event, "用法: /onebot status|queue|flush|clear|pause|resume|resolve retry|resolve discard|confirm TOKEN")
+                await self._send_direct(
+                    event,
+                    "用法: /onebot status|queue|flush|clear|pause|resume|"
+                    "resolve retry|resolve discard|resolve action retry|discard OPERATION_ID|confirm TOKEN",
+                )
         except Exception as exc:
             logger.warning("OneBot11 管理命令失败", exc_info=True)
             await self._send_direct(event, f"命令失败: {type(exc).__name__}: {str(exc)[:200]}")
@@ -2721,61 +2854,9 @@ def validate_config(config: Any) -> bool:
     if not isinstance(extra, Mapping):
         return False
     try:
-        effective = _effective_extra(extra)
-        http_api = str(effective.get("http_api") or "").strip()
-        self_id = str(effective.get("self_id") or "").strip()
-        if not http_api:
-            return False
-        parse_http_base_url(http_api)
-        if not self_id:
-            return False
-        if str(effective.get("session_mode", "shared")).casefold() != "shared":
-            return False
-        if parse_bool(
-            effective.get("group_sessions_per_user"),
-            default=False,
-            name="group_sessions_per_user",
-        ):
-            return False
-        ws_port = int(effective.get("ws_port", 18880))
-        if not 0 <= ws_port <= 65535:
-            return False
-        ws_host = str(effective.get("ws_host") or "127.0.0.1").strip()
-        token = str(effective.get("access_token") or "").strip()
-        if ws_host not in {"127.0.0.1", "::1", "localhost"} and not token:
-            return False
-        if not _is_loopback_url(http_api) and not token:
-            return False
-        build_access_policy(effective, os.environ)
-        build_role_tools(effective)
-        build_trigger_config(effective)
-        parse_bool(effective.get("processing_reaction_enabled"), default=True, name="processing_reaction_enabled")
-        if not str(effective.get("processing_reaction_emoji_id", _PROCESSING_REACTION_EMOJI_ID)).strip():
-            return False
-        for name, default in (
-            ("queue_max_messages", 1000),
-            ("queue_max_bytes", 2_000_000),
-            ("queue_max_message_bytes", 32_000),
-            ("queue_max_original_bytes", 8_000),
-            ("queue_max_summary_bytes", 16_000),
-            ("queue_recent_originals", 3),
-            ("queue_max_attempts", 3),
-            ("max_images_per_message", 4),
-            ("max_image_bytes", 8_000_000),
-            ("max_image_total_bytes", 16_000_000),
-            ("max_image_redirects", 3),
-        ):
-            value = int(effective.get(name, default))
-            if value < 0 or (name not in {"queue_recent_originals", "max_image_redirects"} and value == 0):
-                return False
-        for port in parse_id_list(effective.get("media_allowed_ports")):
-            if not 1 <= int(port) <= 65535:
-                return False
-        home_type = effective.get("home_channel_type")
-        if home_type is not None and str(home_type) not in {"group", "dm"}:
-            return False
+        parse_runtime_config(extra, os.environ, require_http_api=True)
         return True
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return False
 
 

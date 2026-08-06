@@ -135,7 +135,7 @@ LLM trigger 默认关闭，启用时必须同时配置明确的旁路 `provider`
 3. **会话范围**：工具和出站目标都绑定当前 `(session_id, turn_id)`，群里只能查/操作本群。
 4. **写操作**：模型第一次调用只返回 `/onebot confirm TOKEN`；确认命令在入站层执行，不进入 session 或队列。
 
-群级运维命令由超级管理员直接发送：`/onebot status`、`queue`、`flush`、`clear`、`pause`、`resume`、`resolve retry|discard` 和 `confirm TOKEN`。`clear` 不删除 Hermes session 历史，但会同时失效当前群旧的 debounce/活跃触发状态；`uncertain` 和 `failed` 都不会自动重试，必须明确 resolve。
+群级运维命令由超级管理员直接发送：`/onebot status`、`queue`、`flush`、`clear`、`pause`、`resume`、`resolve retry|discard`、`resolve action retry|discard OPERATION_ID` 和 `confirm TOKEN`。`clear` 不删除 Hermes session 历史，但会同时失效当前群旧的 debounce/活跃触发状态；`uncertain` 和 `failed` 都不会自动重试，必须明确 resolve。管理动作 `unknown` 的 `retry` 只解除重复执行阻断，之后仍需重新生成预览并确认，不会直接重放。
 
 ## 开发
 
@@ -148,6 +148,16 @@ pip install -e ".[dev]"
 pytest -q
 ruff check .
 ```
+
+需要真实 Hermes gateway 的 adapter、hooks、shared session 和 strict auxiliary 验收时，运行：
+
+```powershell
+.\scripts\verify_hermes_integration.ps1 `
+  -HermesSource C:\path\to\hermes-agent `
+  -HermesAuxiliarySource C:\path\to\hermes-agent-auxiliary-no-fallback
+```
+
+该命令使用临时 `HERMES_HOME`，不会把测试队列、审计或 session 写入真实 Hermes home。CI 只负责插件可安装、协议/状态机测试和 Ruff；Hermes 组合测试是本地验收证据。
 
 ## License
 

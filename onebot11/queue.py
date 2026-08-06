@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_BACKOFF_SECONDS = (2.0, 4.0, 8.0)
 MAX_BACKOFF_SECONDS = 60.0
@@ -115,6 +115,32 @@ class QueueLease:
     revision: int = 0
 
 
+@dataclass(frozen=True)
+class OperationRecord:
+    """非幂等管理动作的持久化状态。"""
+
+    operation_id: str
+    fingerprint: str
+    tool_name: str
+    chat_type: str
+    chat_id: str
+    caller_user_id: str
+    params: Mapping[str, Any]
+    status: str
+    reason: str | None
+    created_at: float
+    updated_at: float
+
+
+@dataclass(frozen=True)
+class OperationStart:
+    """管理动作开始结果；未知动作不会被重复发出。"""
+
+    started: bool
+    blocked: bool
+    operation: OperationRecord
+
+
 class QueueStore:
     """基于 SQLite WAL 的持久队列存储。"""
 
@@ -148,11 +174,17 @@ class QueueStore:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._owner_id = uuid.uuid4().hex
-        self._conn = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._closed = False
+        self._conn = self._open_connection()
         self._migrate()
+
+    def _open_connection(self) -> sqlite3.Connection:
+        """打开一个新的 SQLite 连接并启用可靠队列所需的 pragma。"""
+        connection = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=NORMAL")
+        return connection
 
     def _migrate(self) -> None:
         """创建当前 schema 或从已知旧版本迁移。"""
@@ -265,7 +297,21 @@ class QueueStore:
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_onebot_queue_trigger_pending_chat "
             "ON onebot_queue_trigger(chat_id) WHERE status='pending'"
         )
+        self._recover_started_operations()
         self._conn.commit()
+
+    def _recover_started_operations(self) -> None:
+        """进程启动后把没有结算的管理动作标记为未知。"""
+        self._conn.execute(
+            """
+            UPDATE onebot_operation
+            SET status='unknown',
+                reason=COALESCE(reason, '进程恢复时管理动作结果未知'),
+                updated_at=?
+            WHERE status='started'
+            """,
+            (self._now(),),
+        )
 
     def _dedupe_pending_triggers(self) -> None:
         """迁移旧文件时每群只保留最早的 pending trigger。"""
@@ -486,10 +532,38 @@ class QueueStore:
                 UNIQUE(chat_id, message_key)
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS onebot_operation (
+                operation_id TEXT PRIMARY KEY,
+                fingerprint TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                chat_type TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                caller_user_id TEXT NOT NULL,
+                params_json TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(
+                    status IN (
+                        'started','succeeded','known_failed','unknown',
+                        'retry_armed','discarded'
+                    )
+                ),
+                reason TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """,
         )
         for statement in statements:
             self._conn.execute(statement)
         self._create_indexes()
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_onebot_operation_fingerprint "
+            "ON onebot_operation(fingerprint, updated_at)"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_onebot_operation_chat "
+            "ON onebot_operation(chat_type, chat_id, updated_at)"
+        )
         self._conn.commit()
 
     def _now(self) -> float:
@@ -1116,6 +1190,187 @@ class QueueStore:
         """出站结果未知时停止自动重试，转入人工处理状态。"""
         return self._change_lease_state(lease, "uncertain", "uncertain", reason=str(reason)[:512])
 
+    def start_operation(
+        self,
+        *,
+        fingerprint: str,
+        tool_name: str,
+        chat_type: str,
+        chat_id: str,
+        caller_user_id: str,
+        params: Mapping[str, Any],
+    ) -> OperationStart:
+        """持久化管理动作开始标记，并阻断仍处于未知状态的重复动作。"""
+        if chat_type not in {"group", "dm"}:
+            raise ValueError(f"未知 operation chat_type: {chat_type!r}")
+        params_json = json.dumps(
+            dict(params),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        with self._lock:
+            try:
+                self._transaction()
+                existing = self._conn.execute(
+                    """
+                    SELECT * FROM onebot_operation
+                    WHERE fingerprint=? AND status IN ('started','unknown')
+                    ORDER BY updated_at DESC LIMIT 1
+                    """,
+                    (str(fingerprint),),
+                ).fetchone()
+                if existing is not None:
+                    self._conn.commit()
+                    return OperationStart(
+                        started=False,
+                        blocked=True,
+                        operation=self._row_to_operation(existing),
+                    )
+                now = self._now()
+                operation_id = uuid.uuid4().hex[:16]
+                self._conn.execute(
+                    """
+                    INSERT INTO onebot_operation(
+                        operation_id,fingerprint,tool_name,chat_type,chat_id,
+                        caller_user_id,params_json,status,created_at,updated_at
+                    ) VALUES (?,?,?,?,?,?,?,'started',?,?)
+                    """,
+                    (
+                        operation_id,
+                        str(fingerprint),
+                        str(tool_name),
+                        str(chat_type),
+                        str(chat_id),
+                        str(caller_user_id),
+                        params_json,
+                        now,
+                        now,
+                    ),
+                )
+                row = self._conn.execute(
+                    "SELECT * FROM onebot_operation WHERE operation_id=?",
+                    (operation_id,),
+                ).fetchone()
+                self._conn.commit()
+                if row is None:
+                    raise QueueError("管理动作台账写入后无法读取")
+                return OperationStart(
+                    started=True,
+                    blocked=False,
+                    operation=self._row_to_operation(row),
+                )
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def finish_operation(
+        self,
+        operation_id: str,
+        status: str,
+        *,
+        reason: str | None = None,
+    ) -> bool:
+        """结算已开始的管理动作；未知结果不会被转换为成功。"""
+        if status not in {"succeeded", "known_failed", "unknown"}:
+            raise ValueError("非法管理动作结算状态")
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE onebot_operation
+                SET status=?, reason=?, updated_at=?
+                WHERE operation_id=? AND status='started'
+                """,
+                (status, str(reason or "")[:512] or None, self._now(), str(operation_id)),
+            )
+            self._conn.commit()
+            return cursor.rowcount > 0
+
+    def resolve_operation(
+        self,
+        operation_id: str,
+        action: str,
+        *,
+        chat_type: str,
+        chat_id: str,
+        caller_user_id: str,
+    ) -> OperationRecord | None:
+        """由同一群同一管理员把 unknown 台账置为 retry_armed 或 discarded。"""
+        if action not in {"retry", "discard"}:
+            raise ValueError("管理动作只能 resolve retry 或 discard")
+        with self._lock:
+            try:
+                self._transaction()
+                row = self._conn.execute(
+                    "SELECT * FROM onebot_operation WHERE operation_id=?",
+                    (str(operation_id),),
+                ).fetchone()
+                if row is None:
+                    self._conn.commit()
+                    return None
+                if (
+                    str(row["chat_type"]) != str(chat_type)
+                    or str(row["chat_id"]) != str(chat_id)
+                    or str(row["caller_user_id"]) != str(caller_user_id)
+                ):
+                    self._conn.commit()
+                    return None
+                target_status = "retry_armed" if action == "retry" else "discarded"
+                if str(row["status"]) == "unknown":
+                    self._conn.execute(
+                        """
+                        UPDATE onebot_operation
+                        SET status=?, reason=?, updated_at=?
+                        WHERE operation_id=? AND status='unknown'
+                        """,
+                        (
+                            target_status,
+                            f"管理员明确 {action}，等待后续预览确认"
+                            if action == "retry"
+                            else "管理员明确 discard",
+                            self._now(),
+                            str(operation_id),
+                        ),
+                    )
+                updated = self._conn.execute(
+                    "SELECT * FROM onebot_operation WHERE operation_id=?",
+                    (str(operation_id),),
+                ).fetchone()
+                self._conn.commit()
+                return self._row_to_operation(updated) if updated is not None else None
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def operation_records(self, chat_id: str, limit: int = 20) -> tuple[OperationRecord, ...]:
+        """读取当前目标最近的管理动作台账，不返回 token。"""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM onebot_operation
+                WHERE chat_id=?
+                ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                (str(chat_id), max(1, min(100, int(limit)))),
+            ).fetchall()
+            return tuple(self._row_to_operation(row) for row in rows)
+
+    def unknown_operation_count(self, chat_id: str | None = None) -> int:
+        """统计仍需人工处理的未知管理动作。"""
+        with self._lock:
+            if chat_id is None:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) FROM onebot_operation WHERE status='unknown'"
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) FROM onebot_operation WHERE chat_id=? AND status='unknown'",
+                    (str(chat_id),),
+                ).fetchone()
+            return int(row[0] if row else 0)
+
     def _change_lease_state(
         self,
         lease: QueueLease | str,
@@ -1577,7 +1832,141 @@ class QueueStore:
             created_at=float(row["created_at"]),
         )
 
+    def _row_to_operation(self, row: sqlite3.Row) -> OperationRecord:
+        """把 SQLite 行转换为不可变管理动作记录。"""
+        try:
+            params = json.loads(str(row["params_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            params = {}
+        return OperationRecord(
+            operation_id=str(row["operation_id"]),
+            fingerprint=str(row["fingerprint"]),
+            tool_name=str(row["tool_name"]),
+            chat_type=str(row["chat_type"]),
+            chat_id=str(row["chat_id"]),
+            caller_user_id=str(row["caller_user_id"]),
+            params=params if isinstance(params, Mapping) else {},
+            status=str(row["status"]),
+            reason=str(row["reason"]) if row["reason"] is not None else None,
+            created_at=float(row["created_at"]),
+            updated_at=float(row["updated_at"]),
+        )
+
+    def operation_summary(self, operation: OperationRecord) -> dict[str, Any]:
+        """生成不含完整参数的管理动作状态摘要。"""
+        safe_params: dict[str, str] = {}
+        visible_keys = {"message_id", "user_id", "duration", "reject_add_request", "enable"}
+        for key in sorted(operation.params):
+            safe_params[str(key)] = (
+                str(operation.params[key])[:64]
+                if str(key) in visible_keys
+                else "<redacted>"
+            )
+        return {
+            "operation_id": operation.operation_id,
+            "fingerprint": operation.fingerprint[:12],
+            "tool": operation.tool_name,
+            "target": {"chat_type": operation.chat_type, "chat_id": operation.chat_id},
+            "caller_user_id": operation.caller_user_id,
+            "status": operation.status,
+            "reason": operation.reason,
+            "created_at": operation.created_at,
+            "updated_at": operation.updated_at,
+            "params_summary": safe_params,
+        }
+
+    def reopen(self) -> None:
+        """重新打开同一路径数据库并更换 owner，隔离旧 task。"""
+        with self._lock:
+            if not self._closed:
+                return
+            self._conn = self._open_connection()
+            self._owner_id = uuid.uuid4().hex
+            self._closed = False
+            self._migrate()
+
+    def abandon_owner_leases(self) -> dict[str, int]:
+        """断开时结算当前 owner 的 lease，避免旧 turn 在重连后复活。"""
+        with self._lock:
+            try:
+                self._transaction()
+                now = self._now()
+                lease_rows = self._conn.execute(
+                    """
+                    SELECT lease_id,
+                           MAX(CASE WHEN outbound_started=1
+                                    OR lease_phase='outbound_started'
+                                    OR lease_until IS NULL THEN 1 ELSE 0 END) AS uncertain
+                    FROM onebot_queue_message
+                    WHERE state='leased' AND lease_owner=?
+                    GROUP BY lease_id
+                    """,
+                    (self._owner_id,),
+                ).fetchall()
+                pending = 0
+                uncertain = 0
+                reason = "adapter 断开时出站结果未知，需管理员确认"
+                for row in lease_rows:
+                    lease_id = str(row["lease_id"])
+                    is_uncertain = bool(row["uncertain"])
+                    if is_uncertain:
+                        self._conn.execute(
+                            """
+                            UPDATE onebot_queue_message
+                            SET state='uncertain', lease_id=NULL, lease_until=NULL,
+                                lease_owner=NULL, lease_phase='uncertain',
+                                outbound_started=1, uncertain_reason=?, updated_at=?
+                            WHERE lease_id=? AND lease_owner=? AND state='leased'
+                            """,
+                            (reason, now, lease_id, self._owner_id),
+                        )
+                        self._conn.execute(
+                            """
+                            UPDATE onebot_queue_trigger
+                            SET status='uncertain', lease_id=NULL, lease_owner=NULL,
+                                uncertain_reason=?, updated_at=?
+                            WHERE lease_id=? AND lease_owner=? AND status='claimed'
+                            """,
+                            (reason, now, lease_id, self._owner_id),
+                        )
+                        uncertain += 1
+                    else:
+                        self._conn.execute(
+                            """
+                            UPDATE onebot_queue_message
+                            SET state='pending', lease_id=NULL, lease_until=NULL,
+                                lease_owner=NULL, lease_phase='pending',
+                                outbound_started=0, next_attempt_at=NULL,
+                                uncertain_reason=NULL, failure_reason=NULL, updated_at=?
+                            WHERE lease_id=? AND lease_owner=? AND state='leased'
+                            """,
+                            (now, lease_id, self._owner_id),
+                        )
+                        self._conn.execute(
+                            """
+                            UPDATE onebot_queue_trigger
+                            SET status='pending', lease_id=NULL, lease_owner=NULL,
+                                uncertain_reason=NULL, updated_at=?
+                            WHERE lease_id=? AND lease_owner=? AND status='claimed'
+                            """,
+                            (now, lease_id, self._owner_id),
+                        )
+                        pending += 1
+                self._conn.commit()
+                return {"pending": pending, "uncertain": uncertain}
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    @property
+    def closed(self) -> bool:
+        """返回连接是否已关闭。"""
+        return self._closed
+
     def close(self) -> None:
         """关闭 SQLite 连接。"""
         with self._lock:
+            if self._closed:
+                return
             self._conn.close()
+            self._closed = True

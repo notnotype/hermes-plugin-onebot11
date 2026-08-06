@@ -286,3 +286,12 @@ class GroupDispatcher:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self._active.clear()
+
+    async def reopen(self) -> None:
+        """为同一 adapter 的 reconnect 清空内存状态并重新允许 dispatch。"""
+        self._closed = False
+        self._active.clear()
+        self._heartbeat_tasks.clear()
+        self._recovery_dispatch_tasks.clear()
+        self._locks.clear()

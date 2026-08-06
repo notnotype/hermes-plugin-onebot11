@@ -267,8 +267,8 @@ wheels = [
 
 [[package]]
 name = "hermes-onebot11"
-version = "0.3.0"
-source = { virtual = "." }
+version = "0.3.1"
+source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
 ]

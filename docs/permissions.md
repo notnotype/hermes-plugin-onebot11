@@ -47,7 +47,7 @@ platforms:
 
 写工具（撤回、禁言、踢人、全员禁言）只能作用于当前群，普通用户永远拒绝。首次调用只产生预览和短期 `/onebot confirm TOKEN`，不会立即执行；确认命令必须由同一超级管理员在同一群发送，令牌单次消费且不写入审计日志。确认命令在 adapter 入站层直接处理，不会进入 Hermes session 或消息队列。
 
-确认令牌和“已知结果未知”的管理动作指纹只保存在当前 adapter 进程内存中。进程重启会让旧令牌失效，也会清空旧的动作阻断记录；审计只保留不含 token 的摘要。重启后重新生成预览属于新的人工操作，不能把它当作旧 unknown 动作已经解决。
+确认令牌仍只保存在当前 adapter 进程内存中，进程重启会让旧令牌失效；但管理动作台账持久化在同一个队列 SQLite 中。进程恢复会把遗留的 `started` 标记为 `unknown`，同一 fingerprint 在 `unknown` 状态下禁止重复调用。`/onebot resolve action retry OPERATION_ID` 只把动作置为 `retry_armed`，随后必须重新生成预览并再次确认；`discard` 只记录放弃，不访问 OneBot。审计只保留 operation id、fingerprint 摘要、工具、目标和结果，不记录 token、完整参数或媒体 URL。
 
 ## 身份传递
 
@@ -70,13 +70,13 @@ failed --管理员 retry--> pending
 failed --管理员 discard--> deleted
 ```
 
-消息入队允许至少一次；OneBot 非幂等 HTTP 请求（发送、撤回、禁言、踢人、全员禁言）不自动重试。连接断开、非 JSON 响应、超时、5xx 或部分分块成功时，结果可能是 `unknown`，插件不会重新执行整轮 Agent，必须由管理员 `/onebot resolve retry|discard` 明确处理。lease 一旦写入出站 marker，任何明确错误也不会自动 release；`retry` 仍可能再次执行动作，因此只应在确认目标端没有执行后使用。完成 ack/release 只有在 SQLite 原子状态转换成功后才会推进下一轮。
+消息入队允许至少一次；OneBot 非幂等 HTTP 请求（发送、撤回、禁言、踢人、全员禁言）不自动重试。连接断开、非 JSON 响应、超时、5xx 或部分分块成功时，结果可能是 `unknown`，插件不会重新执行整轮 Agent，必须由管理员 `/onebot resolve retry|discard` 明确处理。lease 一旦写入出站 marker，任何明确错误也不会自动 release；队列消息的 `retry` 仍可能再次执行动作，因此只应在确认目标端没有执行后使用。管理动作台账的 `retry` 只解除该动作 fingerprint 的阻断，不会直接调用 API。完成 ack/release 只有在 SQLite 原子状态转换成功后才会推进下一轮。
 
 ## 运维命令
 
 超级管理员可在目标群发送：
 
-`/onebot status`、`/onebot queue`、`/onebot flush`、`/onebot clear`、`/onebot pause`、`/onebot resume`、`/onebot resolve retry`、`/onebot resolve discard`、`/onebot confirm TOKEN`。
+`/onebot status`、`/onebot queue`、`/onebot flush`、`/onebot clear`、`/onebot pause`、`/onebot resume`、`/onebot resolve retry`、`/onebot resolve discard`、`/onebot resolve action retry OPERATION_ID`、`/onebot resolve action discard OPERATION_ID`、`/onebot confirm TOKEN`。
 
 `pause` 只停止自动 dispatch，消息继续入队；`clear` 清理 pending 消息和滚动摘要但不删除 Hermes session 历史，活动 lease、`uncertain` 或 `failed` 必须先显式处理。
 

@@ -2,6 +2,7 @@
 
 from . import (
     audit,
+    config,
     confirm,
     context,
     dispatch,
@@ -18,7 +19,14 @@ from .context import build_agent_context
 from .dispatch import ActiveTurn, GroupDispatcher
 from .message import ParsedMessage, parse_message_segments
 from .permissions import CallerContext, ChatTarget, TurnBinding, TurnBindingStore
-from .queue import QueueLease, QueueMessage, QueueStore, TriggerRequest
+from .queue import (
+    OperationRecord,
+    OperationStart,
+    QueueLease,
+    QueueMessage,
+    QueueStore,
+    TriggerRequest,
+)
 
 __all__ = [
     "events",
@@ -30,6 +38,7 @@ __all__ = [
     "triggers",
     "confirm",
     "audit",
+    "config",
     "context",
     "tools",
     "ws_server",
@@ -43,6 +52,8 @@ __all__ = [
     "QueueMessage",
     "QueueStore",
     "TriggerRequest",
+    "OperationRecord",
+    "OperationStart",
     "ActiveTurn",
     "GroupDispatcher",
     "build_agent_context",

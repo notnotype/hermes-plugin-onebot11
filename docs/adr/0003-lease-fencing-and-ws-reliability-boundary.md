@@ -17,7 +17,7 @@
 
 本插件不增加原始 WS spool，因此持久化前的网络重连重放行为只作为实际框架的 best-effort 观察，不升级为 OneBot 11 协议保证，也不宣称输入 exactly-once。
 
-确认写操作的令牌和 unknown 动作阻断记录属于 adapter 进程内存状态；重启会使令牌失效并清空阻断记录。持久化的是队列、lease 阶段和审计摘要，不把管理动作参数或 token 扩展成永久操作 tombstone。
+确认写操作的 token 仍是 adapter 进程内存状态，重启会使 token 失效；管理动作的 `started/unknown/retry_armed/discarded` 状态则持久化在同一个队列 SQLite operation ledger 中。持久化台账不记录 token，审计也不记录完整参数或媒体 URL。
 
 ## 原因
 
@@ -25,4 +25,4 @@ OneBot 11 没有可供插件依赖的非幂等请求幂等键。网络断开时�
 
 ## 影响
 
-输入消息是至少一次语义；非幂等出站是 unknown-safe 语义。管理员必须通过 `/onebot resolve retry|discard` 明确处理 uncertain/failed 队列。默认队列、审计和媒体目录写入 Hermes home，测试或部署可用显式路径隔离。
+输入消息是至少一次语义；非幂等出站是 unknown-safe 语义。管理员必须通过 `/onebot resolve retry|discard` 处理队列消息，或通过 `/onebot resolve action retry|discard OPERATION_ID` 处理管理动作台账。默认队列、审计和媒体目录写入 Hermes home，测试或部署可用显式路径隔离。

@@ -1,7 +1,7 @@
 # OneBot 11 可靠性与安全完善
 
 - 关联需求：OneBot 11 插件整体完善计划
-- 状态：代码和本地验证完成；已完成 Arch + LLBot 指定白名单及群处理 reaction 指示器联调；剩余真人并发、确认写操作和 unknown 出站为外部验收项
+- 状态：代码和本地验证完成；PR #8 待 CI/审查；Arch + LLBot 已完成指定白名单和 reaction 联调，真人并发、确认写操作和 unknown 出站仍是外部验收项
 - 开始日期：2026-08-05
 
 ## 目标
@@ -18,24 +18,26 @@
 3. 触发器：Unicode `casefold` 关键词、@、always、问句/记忆候选、5 秒 trailing debounce、60 秒活跃窗口和显式 auxiliary LLM 三态判断；模型失败按不触发。
 4. 权限：普通用户默认只读，超级管理员列表和角色工具并集；群管理写工具预览 + 同群同管理员短期单次确认。
 5. 协议可靠性：WS 有界接收、同 chat 顺序、inflight 限制、失败关闭连接；HTTP 查询有限重试，非幂等动作永不自动重试；媒体 SSRF/类型/大小限制；支持 LLBot reaction action。
-6. 生命周期：部分发送、连接中断、取消或 turn 在发送后失败均进入 `uncertain`；群 turn 默认显示 👀，收尾时尽力清理；确认命令在 adapter 入站层处理。
+6. 生命周期：部分发送、连接中断、取消或 turn 在发送后失败均进入 `uncertain`；同一 adapter reconnect 会重新打开 SQLite/dispatcher，内存 active 状态回到 idle；群 turn 默认显示 👀，收尾时尽力清理；确认命令在 adapter 入站层处理。
+7. 管理动作台账：确认后先持久化 `started`；崩溃恢复为 `unknown`，同 fingerprint 阻断重复调用；管理员通过 operation id 明确 `retry_armed` 或 `discarded`。
 
 ## 关键决策
 
 - 群不自动把旧 per-user 历史合并到 shared session，见 [ADR-0001](../../adr/0001-shared-group-session.md)。
 - OneBot 11 非幂等动作无法保证 exactly-once；未知结果不自动重试，见 [ADR-0002](../../adr/0002-onebot-unknown-outcome.md)。
 - lease fencing 和持久化前的 WS 可靠性边界见 [ADR-0003](../../adr/0003-lease-fencing-and-ws-reliability-boundary.md)。
+- reconnect、管理动作台账和 CI/本地验收边界见 [ADR-0005](../../adr/0005-reconnect-operation-ledger-and-verification.md)。
 
 ## 验证
 
-- 本地协议和状态机：`.venv\\Scripts\\python.exe -m pytest -q`，当前结果 `109 passed, 1 skipped`；没有 Hermes 依赖时只跳过需要 Hermes 运行时的 adapter 集成测试。
-- Hermes 集成：把本地 Hermes 源码和其 `site-packages` 放入测试环境后运行全套测试，当前结果 `168 passed`，覆盖真实 adapter import、注册、4 个 hooks、工具 handler、shared session key、lease fencing、触发竞争、媒体孤儿清理、负数 message_id 和 reaction 生命周期。
+- 本地协议和状态机：`.venv\\Scripts\\python.exe -m pytest -q`，当前结果 `115 passed, 1 skipped`；没有 Hermes 依赖时只跳过需要 Hermes 运行时的 adapter 集成测试。
+- Hermes 集成：运行 `scripts\\verify_hermes_integration.ps1`，当前结果 `177 passed`，覆盖真实 adapter import、注册、4 个 hooks、工具 handler、shared session key、lease fencing、同实例 reconnect、配置合同、operation resolve、触发竞争、媒体孤儿清理、负数 message_id 和 reaction 生命周期。
 - 严格 auxiliary 回归：`3 passed`，覆盖新 API 的 no-fallback/单次尝试合同和旧 Hermes API 缺少参数时的安全禁用。
 - 静态检查：`.venv\\Scripts\\python.exe -m ruff check .`，当前通过。
-- Arch + LLBot 外部联调已完成指定范围：Hermes 实际加载 0.3.0 插件，群 `1072992996` 使用 shared session，私聊白名单只有 `2056963663`；真实 WS/HTTP 连接、允许群消息触发、私聊 Agent 回复、pending 恢复、非白名单拒绝、审计和群处理 reaction（`set=true` -> 回复 -> `set=false`）均已验证。Agent 入站使用真实 WS 的合成 OneBot payload，真人 QQ 入站、双用户并发、确认写操作和 unknown 出站仍待验收。
+- Arch + LLBot 外部联调已完成指定范围：Hermes 实际加载当前插件版本，群 `1072992996` 使用 shared session，私聊白名单只有 `2056963663`；真实 WS/HTTP 连接、允许群消息触发、私聊 Agent 回复、pending 恢复、非白名单拒绝、审计和群处理 reaction（`set=true` -> 回复 -> `set=false`）均已验证。Agent 入站使用真实 WS 的合成 OneBot payload，真人 QQ 入站、双用户并发、确认写操作和 unknown 出站仍待验收。
 
 ## 计划出入
 
 - 已完成原计划第一、第二阶段的本地实现，并增加了 WS 处理失败主动断开、媒体总大小限制、跨重启孤儿目录清理和非 OneBot hook 隔离。
-- 语义摘要仍保持确定性摘要为主；`onebot11_summary` auxiliary、自动语义压缩和运行时自优化不在本轮实现范围内。审计和基础运维命令已纳入当前实现，真实 QQ 上的管理写操作仍待验收。
+- 语义摘要仍保持确定性摘要为主；`onebot11_summary` auxiliary、自动语义压缩和运行时自优化不在本轮实现范围内。审计、基础运维命令和持久管理动作台账已纳入当前实现，真实 QQ 上的管理写操作仍待验收。
 - 本轮联调中的测试消息只发送到用户指定的群 `1072992996` 和用户 `2056963663`；远端保留了配置备份和移出插件扫描目录的旧 worktree 回滚 symlink。

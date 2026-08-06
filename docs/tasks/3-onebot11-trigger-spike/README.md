@@ -42,7 +42,7 @@
 - 旁路结果：严格接受 `trigger|wait|ignore` 三态；`wait` 只等待真实新消息，不创建 lease 或空轮询。
 - 活跃窗口：成功 Agent turn 后 idle 60 秒，最长连续 300 秒，最多 3 次 LLM 仲裁；失败、取消和 uncertain 不进入 engaged。
 - 竞争处理：每群最多一个判断任务；判断期间的队列 revision 变化会重新安排一次，硬触发会使旧结果失效。
-- 兼容性：旁路调用只接受显式 provider/model 和群 allowlist，并固定 `fallback_policy=none`、`max_attempts=1`。旧 Hermes auxiliary API 缺少参数时安全跳过。
+- 兼容性：旁路调用只接受显式 provider/model 和群 allowlist，并固定 `fallback_policy=none`、`max_attempts=1`。Hermes strict auxiliary 改动单独交付；旧 Hermes auxiliary API 缺少参数时安全跳过。
 
 Hermes 自优化只适合生成配置 diff/建议并由管理员审核，不允许运行时修改 Python、权限、白名单或自动启用关键词。本任务不实现自优化执行链路、RAG 或向量库。
 
@@ -52,4 +52,4 @@ Hermes 自优化只适合生成配置 diff/建议并由管理员审核，不允�
 
 ## 计划出入
 
-spike 没有接真实 provider；生产代码通过 Hermes auxiliary API 接入显式旁路 provider/model，并把 provider fallback 与隐式重试关掉。没有加入 RAG、向量库、自动语义压缩或运行时自优化。活跃窗口仍是内存状态，重启后回到 idle，只恢复 SQLite 消息和显式 trigger request。
+spike 没有接真实 provider；生产代码通过 Hermes auxiliary API 接入显式旁路 provider/model，并把 provider fallback 与隐式重试关掉。Hermes 侧的 strict 参数和 OneBot 插件分成两个 PR，插件在旧 API 上安全禁用 LLM trigger。没有加入 RAG、向量库、自动语义压缩或运行时自优化。活跃窗口仍是内存状态，重启后回到 idle，只恢复 SQLite 消息和显式 trigger request。

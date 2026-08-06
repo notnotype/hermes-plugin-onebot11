@@ -243,3 +243,89 @@ def test_队列保留调用方提供的原文(tmp_path):
     assert store.enqueue(message).inserted
     assert store.peek("888")[0].raw_text == "[CQ:face,id=1]规范化正文"
     store.close()
+
+
+def test_同实例close后reopen可以继续读写(tmp_path):
+    """adapter reconnect 复用同一路径时，SQLite 连接和 owner 都恢复。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    message = _message("reopen-1")
+    store.enqueue(message)
+    store.close()
+    store.reopen()
+    assert store.peek("888")[0].message_id == "reopen-1"
+    assert store.enqueue(_message("reopen-2")).inserted
+    store.close()
+
+
+def test_断开结算未出站和已出站lease(tmp_path):
+    """断开时未开始出站的 turn 可恢复，已写 marker 的 turn 必须 uncertain。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    first = _message("disconnect-pending", chat_id="888")
+    second = _message("disconnect-uncertain", chat_id="889")
+    store.enqueue(first, _trigger(first))
+    store.enqueue(second, _trigger(second))
+    first_lease = store.claim("888")
+    assert first_lease is not None
+    assert store.abandon_owner_leases() == {"pending": 1, "uncertain": 0}
+    uncertain = store.claim("889")
+    assert uncertain is not None
+    assert store.mark_outbound_started(uncertain)
+    assert store.abandon_owner_leases() == {"pending": 0, "uncertain": 1}
+    assert store.status("889")["uncertain"] == 1
+    store.close()
+
+
+def test_管理动作台账崩溃恢复和人工resolve(tmp_path):
+    """started 重启后变 unknown，retry 只解除阻断，不直接执行动作。"""
+    path = tmp_path / "queue.sqlite3"
+    store = QueueStore(path)
+    started = store.start_operation(
+        fingerprint="fingerprint-1",
+        tool_name="qq_set_group_ban",
+        chat_type="group",
+        chat_id="888",
+        caller_user_id="123",
+        params={"user_id": "456", "duration": 60},
+    )
+    assert started.started
+    operation_id = started.operation.operation_id
+    store.close()
+
+    reopened = QueueStore(path)
+    assert reopened.operation_records("888")[0].status == "unknown"
+    blocked = reopened.start_operation(
+        fingerprint="fingerprint-1",
+        tool_name="qq_set_group_ban",
+        chat_type="group",
+        chat_id="888",
+        caller_user_id="123",
+        params={"user_id": "456", "duration": 60},
+    )
+    assert blocked.blocked
+    armed = reopened.resolve_operation(
+        operation_id,
+        "retry",
+        chat_type="group",
+        chat_id="888",
+        caller_user_id="123",
+    )
+    assert armed is not None and armed.status == "retry_armed"
+    retried = reopened.start_operation(
+        fingerprint="fingerprint-1",
+        tool_name="qq_set_group_ban",
+        chat_type="group",
+        chat_id="888",
+        caller_user_id="123",
+        params={"user_id": "456", "duration": 60},
+    )
+    assert retried.started
+    assert reopened.finish_operation(retried.operation.operation_id, "succeeded")
+    assert reopened.unknown_operation_count("888") == 0
+    assert reopened.resolve_operation(
+        operation_id,
+        "discard",
+        chat_type="group",
+        chat_id="999",
+        caller_user_id="123",
+    ) is None
+    reopened.close()

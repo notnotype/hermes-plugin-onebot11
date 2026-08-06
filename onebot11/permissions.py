@@ -219,6 +219,11 @@ class TurnBindingStore:
         with self._lock:
             return MappingProxyType(dict(self._bindings))
 
+    def clear(self) -> None:
+        """清理 reconnect 前遗留的所有短生命周期绑定。"""
+        with self._lock:
+            self._bindings.clear()
+
 
 def parse_bool(value: Any, *, default: bool | None = None, name: str = "配置") -> bool:
     """严格解析布尔配置，拒绝 ``bool('false')`` 造成的 fail-open。"""

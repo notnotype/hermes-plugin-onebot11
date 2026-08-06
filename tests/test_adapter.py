@@ -38,6 +38,7 @@ import adapter as adapter_module  # noqa: E402
 from adapter import OneBot11Adapter, check_requirements, register, validate_config  # noqa: E402
 from onebot11.dispatch import ActiveTurn  # noqa: E402
 from onebot11.events import InboundEvent  # noqa: E402
+from onebot11.queue import QueueMessage  # noqa: E402
 
 
 def _make_adapter(monkeypatch, **env) -> OneBot11Adapter:
@@ -84,9 +85,38 @@ def test_连接生命周期(monkeypatch):
     assert not adapter.is_connected
 
 
+async def test_同一adapter断开后可以重连并继续使用队列(monkeypatch, tmp_path):
+    """Hermes 重用同一 adapter 时，queue/dispatcher 不能保留 closed 状态。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_QUEUE_DB=str(tmp_path / "queue.sqlite3"),
+    )
+    await adapter.connect()
+    await adapter.disconnect()
+    assert adapter._queue.closed
+
+    await adapter.connect(is_reconnect=True)
+    assert not adapter._queue.closed
+    assert not adapter._dispatcher._closed
+    message = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="reconnect-message",
+        user_id="123",
+        user_name="小明",
+        text="重连后继续入队",
+        message_key="group:reconnect-message",
+    )
+    assert adapter._queue.enqueue(message).inserted
+    assert adapter._queue.peek("888")[0].text == "重连后继续入队"
+    await adapter.disconnect()
+
+
 def test_缺HTTP配置时connect失败(monkeypatch):
     adapter = _make_adapter(monkeypatch, ONEBOT11_SELF_ID="1")  # 没有 ONEBOT11_HTTP_API
-    assert not asyncio.get_event_loop().run_until_complete(adapter.connect())
+    assert not asyncio.run(adapter.connect())
 
 
 async def test_群聊事件转MessageEvent带前缀(monkeypatch):
@@ -1893,6 +1923,51 @@ async def test_resolve_retry缺少trigger时补建管理员触发(monkeypatch):
     await adapter.disconnect()
 
 
+async def test_resolve_action只解除管理动作阻断不直接重放(monkeypatch):
+    """operation retry 只 armed，后续仍需新的预览和确认。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_SUPER_ADMINS="123",
+    )
+    started = adapter._queue.start_operation(
+        fingerprint="operation-fingerprint",
+        tool_name="qq_set_group_ban",
+        chat_type="group",
+        chat_id="888",
+        caller_user_id="123",
+        params={"user_id": "456", "duration": 60},
+    )
+    assert started.started
+    assert adapter._queue.finish_operation(
+        started.operation.operation_id,
+        "unknown",
+        reason="网络响应未知",
+    )
+    responses: list[str] = []
+
+    async def fake_send_direct(_event, text: str) -> None:
+        responses.append(text)
+
+    monkeypatch.setattr(adapter, "_send_direct", fake_send_direct)
+    await adapter._handle_admin_command(
+        InboundEvent(
+            text=f"/onebot resolve action retry {started.operation.operation_id}",
+            chat_id="888",
+            chat_type="group",
+            user_id="123",
+            user_name="管理员",
+            message_id="resolve-action",
+        )
+    )
+    assert responses and "重新让 Hermes 生成预览" in responses[0]
+    record = adapter._queue.operation_records("888")[0]
+    assert record.status == "retry_armed"
+    assert adapter._queue.unknown_operation_count("888") == 0
+    await adapter.disconnect()
+
+
 def test_check_requirements(monkeypatch):
     """依赖检查不读取部署配置；配置合同由 validate_config 负责。"""
     assert check_requirements()
@@ -1908,6 +1983,22 @@ def test_validate_config支持YAML配置且拒绝非法HTTP地址(monkeypatch):
     assert validate_config(config)
     config.extra["http_api"] = "http://user:pass@127.0.0.1:3000"
     assert not validate_config(config)
+
+
+def test_validate_config与构造函数共享数值合同(monkeypatch):
+    """validate_config 不能接受构造函数会拒绝的 queue 数值。"""
+    monkeypatch.delenv("ONEBOT11_HTTP_API", raising=False)
+    monkeypatch.delenv("ONEBOT11_SELF_ID", raising=False)
+    config = SimpleNamespace(
+        extra={
+            "http_api": "http://127.0.0.1:3000",
+            "self_id": "1",
+            "queue_lease_seconds": "not-a-number",
+        }
+    )
+    assert not validate_config(config)
+    with pytest.raises(ValueError):
+        OneBot11Adapter(PlatformConfig(enabled=True, extra=config.extra))
 
 
 async def test_空列表环境变量覆盖YAML权限配置(monkeypatch):

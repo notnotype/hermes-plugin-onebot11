@@ -1,10 +1,10 @@
 [project]
 name = "hermes-onebot11"
-version = "0.3.0"
+version = "0.3.1"
 description = "OneBot 11 (QQ) platform adapter plugin for Hermes Agent"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = "MIT"
 authors = [{ name = "notnotype" }]
 dependencies = [
     "aiohttp>=3.9",
@@ -16,6 +16,17 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.7",
 ]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["adapter"]
+
+[tool.setuptools.packages.find]
+include = ["onebot11*"]
+exclude = ["tests*", "spikes*", ".agent*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
