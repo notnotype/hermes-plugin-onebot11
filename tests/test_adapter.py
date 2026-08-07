@@ -114,6 +114,67 @@ async def test_同一adapter断开后可以重连并继续使用队列(monkeypat
     await adapter.disconnect()
 
 
+async def test_活动turn重连时旧heartbeat和managed_send被fence(monkeypatch, tmp_path):
+    """同实例 reconnect 必须结算旧 lease，旧 task 不能在新 owner 下出站。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_QUEUE_DB=str(tmp_path / "queue.sqlite3"),
+    )
+    await adapter.connect()
+    message = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="active-reconnect",
+        user_id="123",
+        user_name="小明",
+        text="重连前活动",
+        message_key="group:active-reconnect",
+    )
+    adapter._queue.enqueue(
+        message,
+        adapter_module.TriggerRequest.create(
+            "888",
+            "group:active-reconnect",
+            "mention",
+            "123",
+            "小明",
+        ),
+    )
+    lease = adapter._queue.claim("888")
+    assert lease is not None
+    adapter._queue.set_paused("888", True)
+    adapter._dispatcher._active["888"] = ActiveTurn(
+        lease=lease,
+        started_at=lease.claimed_at,
+    )
+    heartbeat = asyncio.create_task(adapter._dispatcher._heartbeat(lease))
+    adapter._dispatcher._heartbeat_tasks["888"] = heartbeat
+    old_event = SimpleNamespace(
+        metadata={
+            "onebot11_managed_context": True,
+            "onebot11_lease_id": lease.lease_id,
+        }
+    )
+    adapter_module._CURRENT_EVENT.set(old_event)
+    try:
+        await adapter.connect(is_reconnect=True)
+        assert heartbeat.done()
+        assert adapter._dispatcher.active("888") is None
+        assert adapter._queue.status("888")["pending"] == 1
+        result = await adapter.send(
+            "888",
+            "旧 task 不得发送",
+            metadata=old_event.metadata,
+        )
+        assert not result.success
+        assert result.error_kind == "fenced"
+    finally:
+        adapter_module._CURRENT_EVENT.set(None)
+        await adapter.disconnect()
+
+
 def test_缺HTTP配置时connect失败(monkeypatch):
     adapter = _make_adapter(monkeypatch, ONEBOT11_SELF_ID="1")  # 没有 ONEBOT11_HTTP_API
     assert not asyncio.run(adapter.connect())
@@ -1535,6 +1596,90 @@ async def test_send未连接返回失败(monkeypatch):
     adapter = _make_adapter(monkeypatch, ONEBOT11_HTTP_API="http://127.0.0.1:3000", ONEBOT11_SELF_ID="1")
     result = await adapter.send("888", "你好")
     assert not result.success
+
+
+async def test_standalone_cron只发送到明确允许的home群(monkeypatch):
+    """live cron 必须使用明确的群目标，并重新应用 OneBot 访问策略。"""
+    calls: list[tuple[str, str, str]] = []
+
+    async def fake_send_message(
+        _api,
+        target_id: str,
+        content: str,
+        *,
+        chat_type: str,
+        reply_to: str | None = None,
+    ) -> str:
+        del reply_to
+        calls.append((target_id, content, chat_type))
+        return "cron-message-1"
+
+    monkeypatch.setattr(adapter_module.OneBotHttpApi, "send_message", fake_send_message)
+    result = await adapter_module._standalone_send(
+        SimpleNamespace(
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "home_channel": "1072992996",
+                "home_channel_type": "group",
+                "allowed_groups": ["1072992996"],
+            }
+        ),
+        "1072992996",
+        "cron 内容",
+    )
+    assert result == {"success": True, "message_id": "cron-message-1"}
+    assert calls == [("1072992996", "cron 内容", "group")]
+
+
+async def test_standalone_cron缺少目标类型时拒绝且不出站(monkeypatch):
+    """cron 不能根据目标号码形状猜测群或私聊。"""
+    called = False
+
+    async def fail_if_called(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("非法 cron 目标不应访问 OneBot")
+
+    monkeypatch.setattr(adapter_module.OneBotHttpApi, "send_message", fail_if_called)
+    result = await adapter_module._standalone_send(
+        SimpleNamespace(
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "home_channel": "1072992996",
+                "allowed_groups": ["1072992996"],
+            }
+        ),
+        "1072992996",
+        "cron 内容",
+    )
+    assert "home_channel_type" in result["error"]
+    assert called is False
+
+
+async def test_standalone_cron缺少message_id标记unknown(monkeypatch):
+    """OneBot 成功响应缺少 message_id 时不能假报成功。"""
+    async def empty_message_id(*_args, **_kwargs) -> str:
+        return ""
+
+    monkeypatch.setattr(adapter_module.OneBotHttpApi, "send_message", empty_message_id)
+    result = await adapter_module._standalone_send(
+        SimpleNamespace(
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "home_channel": "2056963663",
+                "home_channel_type": "dm",
+                "dm_policy": "allowlist",
+                "allowed_users": ["2056963663"],
+            }
+        ),
+        "2056963663",
+        "cron 内容",
+    )
+    assert result["status"] == "unknown"
+    assert "message_id" in result["error"]
 
 
 async def test_直接handle_message仍执行访问策略(monkeypatch):

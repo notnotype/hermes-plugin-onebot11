@@ -11,7 +11,10 @@
 | 私聊关闭 | 直接丢弃，不进入队列或 session | `ONEBOT11_DM_POLICY=disabled` |
 | 私聊开放 | 只有显式 allow-all 才接受；没有 allow-all 时 fail-closed | `ONEBOT11_DM_POLICY=open` + `ONEBOT11_ALLOW_ALL_USERS=true`，或 `GATEWAY_ALLOW_ALL_USERS=true` |
 
-未知 `dm_policy`、`group_sessions_per_user=true` 或非 `shared` session 配置都会拒绝启动。插件声明 `enforces_own_access_policy=True`，通过 adapter 访问策略的消息会以 `role_authorized=True` 进入 Hermes，避免被网关默认 allowlist 再次误拒绝。
+未知 `dm_policy`、`group_sessions_per_user=true` 或非 `shared` session 配置都会拒绝启动。插件声明 `enforces_own_access_policy=True`，
+通过 adapter 访问策略的消息会以 `role_authorized=True` 进入 Hermes，避免被网关默认 allowlist 再次误拒绝。
+`extra`、roles、旁路模型和数值边界由 adapter 构造与 `validate_config()` 共用同一解析器；
+显式错误类型不会被 `or {}` 静默吞掉。
 
 群消息即使没有 @、关键词或 `always` trigger，也会先写入 SQLite 队列；这保证触发时能拿到上次触发以来的上下文。没有 trigger 不会启动 Agent turn。
 
@@ -58,6 +61,8 @@ platforms:
 ## 队列与不确定结果
 
 群队列是持久 SQLite 状态机；同一群始终只保留一个 pending trigger。旧 lease 在失败、恢复或断开结算时如果遇到后来创建的 pending trigger，会合并旧请求，不因唯一索引冲突而卡住；曾经被认领但仍 pending 的消息保留恢复入口。
+@、关键词、always 和管理员 flush 属于硬触发，会更新 trigger anchor、触发者和权限主体，并清除当前 anchor 的退避；
+普通恢复或 LLM trigger 不能覆盖更高优先级的硬触发。
 
 ```text
 pending -> leased(agent_running) -> acked/deleted
@@ -71,6 +76,8 @@ failed --管理员 discard--> deleted
 ```
 
 消息入队允许至少一次；OneBot 非幂等 HTTP 请求（发送、撤回、禁言、踢人、全员禁言）不自动重试。连接断开、非 JSON 响应、超时、5xx 或部分分块成功时，结果可能是 `unknown`，插件不会重新执行整轮 Agent，必须由管理员 `/onebot resolve retry|discard` 明确处理。lease 一旦写入出站 marker，任何明确错误也不会自动 release；队列消息的 `retry` 仍可能再次执行动作，因此只应在确认目标端没有执行后使用。管理动作台账的 `retry` 只解除该动作 fingerprint 的阻断，不会直接调用 API。完成 ack/release 只有在 SQLite 原子状态转换成功后才会推进下一轮。
+
+主动 disconnect 不增加失败次数；只有过期的明确 `agent_running` lease 才消耗有限恢复预算。lease phase 缺失或未知时统一进入 `uncertain`，不自动重放。
 
 ## 运维命令
 
@@ -90,7 +97,15 @@ failed --管理员 discard--> deleted
 - 旁路模型必须显式配置 provider、model 和群 allowlist，并且 Hermes auxiliary API 必须支持 `fallback_policy`、`max_attempts`。插件固定使用 `fallback_policy=none`、`max_attempts=1`；旧 API 会安全跳过，绝不调用主 Agent 作为隐式 fallback。
 - 模型只能返回 `{"decision":"trigger|wait|ignore","wait_seconds":0}`。`wait` 的 `wait_seconds` 只能为 `5/10/30/60`，`trigger` 和 `ignore` 必须为 `0`；非法 JSON、超时、模型错误均按 `ignore`，消息留在 pending，不创建 lease。
 - 成功 turn 后进入最多 60 秒 idle 活跃窗口，最长连续活跃时间 300 秒，最多 3 次 LLM 仲裁；重启后 active/engaged 状态回到 idle，只恢复 SQLite 消息和显式 durable trigger。
+- status 中的 debounce/wait/engaged 时间以剩余秒数展示；LLM 审计区分实际 semaphore 等待时长、模型失败和结果未知。
 
 群历史摘要通过 Hermes 支持的 `channel_prompt` 临时注入，当前批次才写入普通 user transcript；摘要被标记为“不可信群消息数据”，其中的指令不能覆盖系统规则。旧 Hermes 没有该字段时退回有界单文本模式，并写入审计。
 
 这些规则只决定“是否启动一轮 Agent”，不改变角色权限。实际工具调用仍必须通过当前 `(session_id, turn_id)` binding、访问策略和 lease fencing。
+
+## Home channel cron
+
+定时任务第一阶段只保证显式配置的 `home_channel`。如果配置了目标 ID，必须同时配置
+`home_channel_type=group|dm`；群目标仍检查 `allowed_groups`，私聊目标仍检查 DM policy 和
+`allowed_users`。没有明确类型、目标不在白名单或发送响应缺少 `message_id` 时 fail-closed/unknown，
+不会根据 QQ 号长度猜测目标类型。

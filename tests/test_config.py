@@ -89,3 +89,52 @@ def test角色未知工具直接拒绝():
         parse_runtime_config(
             _extra(roles={"user": {"tools": ["qq_not_a_real_tool"]}})
         )
+
+
+def test显式空超级管理员工具与错误角色类型区分():
+    """空工具集合是合法配置；列表角色和未知工具必须 fail-closed。"""
+    runtime = parse_runtime_config(
+        _extra(roles={"super_admin": {"tools": []}})
+    )
+    assert runtime.role_tools["super_admin"] == frozenset()
+    with pytest.raises(ValueError):
+        parse_runtime_config(_extra(roles={"super_admin": []}))
+    with pytest.raises(ValueError):
+        parse_runtime_config(_extra(roles=[]))
+
+
+def test_llm_trigger结构和旁路路由必须严格():
+    """LLM trigger 不能用空列表或非字符串 provider/model 绕过校验。"""
+    with pytest.raises(ValueError):
+        parse_runtime_config(_extra(llm_trigger=[]))
+    with pytest.raises(ValueError):
+        parse_runtime_config(
+            _extra(
+                llm_trigger={
+                    "enabled": True,
+                    "provider": 123,
+                    "model": "model",
+                    "groups": ["888"],
+                }
+            )
+        )
+    with pytest.raises(ValueError):
+        parse_runtime_config(
+            _extra(
+                llm_trigger={
+                    "enabled": True,
+                    "groups": ["888"],
+                }
+            )
+        )
+
+
+def test_home_channel必须显式声明目标类型():
+    """cron home target 不能根据 QQ 号形状猜测群或私聊。"""
+    with pytest.raises(ValueError):
+        parse_runtime_config(_extra(home_channel="1072992996"))
+    runtime = parse_runtime_config(
+        _extra(home_channel="1072992996", home_channel_type="group")
+    )
+    assert runtime.home_channel == "1072992996"
+    assert runtime.home_channel_type == "group"

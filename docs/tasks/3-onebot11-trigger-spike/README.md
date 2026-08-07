@@ -42,6 +42,7 @@
 - 旁路结果：严格接受 `trigger|wait|ignore` 三态；`wait` 使用 `5/10/30/60` 秒，只等待真实新消息，不创建 lease 或空轮询；`trigger/ignore` 的 `wait_seconds` 必须为 `0`。
 - 活跃窗口：成功 Agent turn 后 idle 60 秒，最长连续 300 秒，最多 3 次 LLM 仲裁；失败、取消和 uncertain 不进入 engaged。
 - 竞争处理：每群最多一个判断任务；判断期间的队列 revision 变化会重新安排一次，硬触发会使旧结果失效。
+- waiting 状态也受当前活跃窗口的仲裁上限约束；达到上限后只等待硬触发或管理员 flush，不再消耗旁路模型调用。
 - 兼容性：旁路调用只接受显式 provider/model 和群 allowlist，并固定 `fallback_policy=none`、`max_attempts=1`。Hermes strict auxiliary 改动单独交付；旧 Hermes auxiliary API 缺少参数时安全跳过。
 - 上下文：群当前批次作为普通 user message，滚动摘要优先通过 `channel_prompt` 临时注入；旧 Hermes 明确退回有界文本模式。摘要不会作为每轮普通 user transcript 重复累积。
 

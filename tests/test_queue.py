@@ -63,6 +63,8 @@ def test_恢复不抢占仍有效的其他进程租约(tmp_path, monkeypatch):
     assert other.claim("888") is None
 
     now[0] = 1031.0
+    assert other.recover_trigger_requests() == ()
+    now[0] = 1033.1
     recovered = other.recover_trigger_requests()
     assert len(recovered) == 1
     assert recovered[0].request_id == lease.trigger.request_id
@@ -106,9 +108,10 @@ def test_租约失败释放后按退避重新认领(tmp_path, monkeypatch):
     store.enqueue(message, _trigger(message))
     lease = store.claim("888")
     assert lease is not None
-    assert store.release(lease)
+    assert store.release(lease, reason="明确失败")
     assert store.status("888")["pending"] == 1
     assert store.status("888")["failure_count"] == 1
+    assert store.status("888")["failure_reasons"] == ["明确失败"]
     assert store.claim("888") is None
     monkeypatch.setattr("onebot11.queue.time.time", lambda: lease.claimed_at + 2.1)
     retried = store.claim("888")
@@ -398,6 +401,87 @@ def test_resolve_retry与已有pending_trigger合并(tmp_path):
     later = _message("merge-resolve-later")
     store.enqueue(later, _trigger(later))
 
+    assert store.resolve_uncertain("888", "retry") == 1
+    assert store.status("888")["pending_trigger_requests"] == 1
+    store.close()
+
+
+def test_hard_trigger覆盖旧恢复请求并清除退避(tmp_path):
+    """新的 @/关键词/flush 必须 retarget 最新消息并立即解除退避。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    first = _message("hard-first")
+    second = _message("hard-second")
+    store.enqueue(first)
+    store.enqueue(second)
+    store.create_trigger("888", "queue_recovery", "old-user", "旧用户", first.message_key)
+    store._conn.execute(
+        "UPDATE onebot_queue_message SET next_attempt_at=999999 WHERE message_key=?",
+        (second.message_key,),
+    )
+    store._conn.commit()
+
+    store.create_trigger("888", "mention", "new-user", "新用户", second.message_key)
+
+    trigger = store._conn.execute(
+        """
+        SELECT message_key, reason, caller_user_id, caller_user_name
+        FROM onebot_queue_trigger
+        WHERE chat_id=? AND status='pending'
+        """,
+        ("888",),
+    ).fetchone()
+    assert tuple(trigger) == ("group:hard-second", "mention", "new-user", "新用户")
+    assert store._conn.execute(
+        "SELECT next_attempt_at FROM onebot_queue_message WHERE message_key=?",
+        (second.message_key,),
+    ).fetchone()[0] is None
+    store.close()
+
+
+def test_unknown_phase的release和恢复都进入uncertain(tmp_path, monkeypatch):
+    """未知 phase 不能被当成无副作用失败自动重放。"""
+    now = [1000.0]
+    monkeypatch.setattr("onebot11.queue.time.time", lambda: now[0])
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    message = _message("unknown-phase")
+    store.enqueue(message, _trigger(message))
+    lease = store.claim("888", lease_seconds=5)
+    assert lease is not None
+    store._conn.execute(
+        "UPDATE onebot_queue_message SET lease_phase='mystery' WHERE lease_id=?",
+        (lease.lease_id,),
+    )
+    store._conn.commit()
+    assert store.release(lease, reason="cannot classify") is True
+    assert store.status("888")["uncertain"] == 1
+    store.close()
+
+    reopened = QueueStore(tmp_path / "queue-recovery.sqlite3")
+    recovery_message = _message("unknown-recovery")
+    reopened.enqueue(recovery_message, _trigger(recovery_message))
+    recovery_lease = reopened.claim("888", lease_seconds=5)
+    assert recovery_lease is not None
+    reopened._conn.execute(
+        "UPDATE onebot_queue_message SET lease_phase='mystery' WHERE lease_id=?",
+        (recovery_lease.lease_id,),
+    )
+    reopened._conn.commit()
+    now[0] = 1006.0
+    assert reopened.recover_trigger_requests() == ()
+    assert reopened.status("888")["uncertain"] == 1
+    reopened.close()
+
+
+def test_resolve_retry没有旧trigger时补建恢复入口(tmp_path):
+    """旧文件只有 uncertain 消息时，人工 retry 仍能恢复 durable trigger。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    message = _message("retry-without-trigger")
+    store.enqueue(message, _trigger(message))
+    lease = store.claim("888")
+    assert lease is not None
+    assert store.mark_uncertain(lease, "unknown")
+    store._conn.execute("DELETE FROM onebot_queue_trigger WHERE chat_id=?", ("888",))
+    store._conn.commit()
     assert store.resolve_uncertain("888", "retry") == 1
     assert store.status("888")["pending_trigger_requests"] == 1
     store.close()

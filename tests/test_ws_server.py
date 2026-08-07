@@ -110,6 +110,24 @@ async def test_畸形JSON不崩(server):
     assert received == []
 
 
+def test_self_id参与事件去重键():
+    """多个 bot 共用 WS 时，同一 message_id 不能互相去重。"""
+    srv = ReverseWsServer(port=0, token="", on_event=lambda _raw: None)
+    base = {
+        "post_type": "message",
+        "message_type": "group",
+        "message_id": 99,
+        "group_id": 888,
+        "user_id": 7,
+    }
+    assert srv._event_key({**base, "self_id": "bot-a"}) != srv._event_key(
+        {**base, "self_id": "bot-b"}
+    )
+    assert srv._event_key({**base, "self_id": "bot-a"}) == srv._event_key(
+        {**base, "self_id": "bot-a"}
+    )
+
+
 async def test_事件处理失败关闭连接允许上游重放():
     """事件未能持久化时关闭来源连接，避免消息静默丢失。"""
     async def fail(_raw: dict) -> None:

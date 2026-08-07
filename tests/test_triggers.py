@@ -265,6 +265,26 @@ def test_wait不创建lease且只等待新消息():
     assert state.arbitration_count == 0
 
 
+def test_wait状态也受活跃窗口仲裁上限约束():
+    """waiting 不应绕过 engaged 的旁路调用预算。"""
+    state = LayeredTriggerState(
+        TriggerConfig(debounce_seconds=1, engaged_max_arbitrations=1)
+    )
+    state.on_turn_complete(success=True, now=0)
+    state.arbitration_count = 1
+    state.mode = "waiting"
+    state.wait_until = 10
+    action = state.observe_message(
+        chat_type="group",
+        text="继续刚才的话题",
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=5,
+    )
+    assert action.reason == "arbitration_limit"
+
+
 def test_wait从engaged到期后保留剩余活跃窗口():
     """等待结束后恢复 engaged，adapter 仍可依据 engaged_until 继续计时。"""
     state = LayeredTriggerState(
@@ -411,3 +431,20 @@ def test_llm输入预算小于提示词仍不超限():
     )
     prompt = build_llm_trigger_input("", (message,), max_bytes=8)
     assert len(prompt.encode("utf-8")) <= 8
+
+
+def test_llm输入预算足够时保留完整JSON合同并裁剪最新正文():
+    """正常配置预算下不能为了巨型最新消息截断严格输出合同。"""
+    message = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="latest-large",
+        user_id="2",
+        user_name="新用户",
+        text="最新问题？" + ("很长" * 1000),
+        seq=2,
+    )
+    prompt = build_llm_trigger_input("", (message,), max_bytes=512)
+    assert len(prompt.encode("utf-8")) <= 512
+    assert '{"decision":"trigger","wait_seconds":0}' in prompt
+    assert "最新问题？" in prompt

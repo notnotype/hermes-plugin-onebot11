@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- **阶段**：OneBot 11 可靠性、安全和分层触发已完成代码闭环；closeout commit `f1b0b8b` 已部署到 Arch 并完成受限 smoke，仍等待两名真人并发、群管理写操作和 PR 审查。
+- **阶段**：OneBot 11 可靠性、安全和分层触发已完成代码闭环；当前分支已收口 lease 恢复、硬触发 retarget、配置 fail-closed、home cron 和 reconnect fencing。Arch 既有 smoke 证据仍不能替代本轮新提交的重新部署验收。
 - **核心合同**：群固定一个共享 session；群消息持久入队；触发后按 lease 启动单群单 turn；非幂等出站结果未知时进入 `uncertain`，不自动重放。
 - **本地验证**：协议/状态机测试通过；使用本地 Hermes 源码与其 site-packages 运行 adapter 测试通过。最终门禁命令和环境见“验证证据”。
 
@@ -26,12 +26,12 @@
 
 ## 验证证据
 
-- `.venv\\Scripts\\python.exe -m pytest -q`：`128 passed, 1 skipped`；纯插件环境只跳过需要 Hermes gateway 的 adapter 集成测试。
-- 使用 `scripts\\verify_hermes_integration.ps1` 或 `scripts/verify_hermes_integration.py` 和本地 Hermes 源码/strict auxiliary worktree：全套测试 `194 passed`；覆盖 adapter hooks、工具注册、共享队列、身份绑定、shared session key、同实例 reconnect、配置合同、pending trigger 合并、completion recovery、上下文分段、raw self_id、operation resolve、媒体清理、出站 unknown、严格 auxiliary 参数、触发竞争和 reaction 生命周期。
-- 严格 auxiliary 回归测试：`3 passed`；确认 `fallback_policy="none"`、`max_attempts=1` 和旧 API 安全降级。
+- `.venv\\Scripts\\python.exe -m pytest -q`：`138 passed, 1 skipped`；跳过项是没有 Hermes gateway 的 adapter 集成测试。
 - `.venv\\Scripts\\python.exe -m ruff check .`：通过。
-- `pip install -e ".[dev]"`：在本地干净安装路径验证通过；PR #8 的 Linux CI 初次因 GitHub Actions `Service Unavailable` 失败，重新运行后已通过。
-- 真实 Hermes 临时 `HERMES_HOME` 注册 smoke：已确认平台、9 个工具、4 个安全 hooks 和 `onebot11_trigger` auxiliary 均注册，并验证 shared session 合同、严格旁路配置和同实例 reconnect；旧 Hermes 组合也验证为安全禁用 strict LLM trigger。
+- `pip install -e ".[dev]"`：Windows 临时干净 venv 安装通过；`import onebot11` 通过。Linux 安装仍由 PR #8 CI 负责。
+- `scripts/verify_hermes_integration.py` + Arch 本地 Hermes `91937a6`：`208 passed`，smoke 通过，`strict_auxiliary=False`；旧 auxiliary API 缺严格参数时 LLM trigger 安全禁用。
+- 同一脚本注入 Hermes strict auxiliary worktree：`208 passed`，strict auxiliary 回归 `3 passed`，smoke 通过，`tools=9 hooks=4 strict_auxiliary=True reconnect=True`。
+- 真实 Hermes 临时 `HERMES_HOME` 注册 smoke：已确认平台、9 个工具、4 个安全 hooks 和 `onebot11_trigger` auxiliary 均注册，并验证 shared session 合同、严格旁路配置、pending trigger 恢复、home cron 和同实例 reconnect；旧 Hermes 组合也验证为安全禁用 strict LLM trigger。
 
 ## 外部联调状态
 

@@ -12,6 +12,7 @@ Hermes 可能复用同一个 OneBot adapter 实例调用 `connect(is_reconnect=T
 - `QueueStore` 在断开后可以 reopen 同一路径 SQLite，并更换 owner id；
 - disconnect 先取消背景任务和 heartbeat，再把当前 owner 的 lease 原子结算；
 - 尚未开始非幂等出站的 lease 回到 `pending`，已开始或阶段未知的 lease 进入 `uncertain`；
+- 正常主动断开不增加失败次数；只有过期且明确处于 `agent_running` 的 lease 才按 2/4/8 秒退避消耗最多 3 次恢复预算，达到上限进入 `failed`；
 - dispatcher 的活动 lease、debounce、judging 和 engaged 状态只存在内存，reconnect 后清空并回到 idle；
 - SQLite 消息、滚动摘要和显式 durable trigger request 保留并重新恢复；
 - 旧 task 即使延迟取消，也必须被 lease fencing 拒绝新的工具和出站请求。

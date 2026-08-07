@@ -229,6 +229,8 @@ async def _smoke(
     instance = adapter.OneBot11Adapter(config)
     if instance.config.extra.get("group_sessions_per_user") is not False:
         raise AssertionError("OneBot11 没有强制 shared group session")
+    if not instance.splits_long_messages:
+        raise AssertionError("OneBot11 cron 输出没有交给 adapter 分块")
     try:
         if not await instance.connect():
             raise AssertionError("adapter connect smoke 失败")
@@ -237,6 +239,82 @@ async def _smoke(
             raise AssertionError("adapter reconnect smoke 失败")
         if instance._queue.closed or instance._dispatcher._closed:
             raise AssertionError("reconnect 后 queue/dispatcher 仍是 closed")
+
+        # 持久 trigger 不依赖入站历史；暂停群避免 smoke 启动真实 Agent，
+        # 只验证断开/重连后消息和 durable request 都还在。
+        from onebot11.queue import QueueMessage, TriggerRequest
+
+        pending = QueueMessage(
+            chat_id="888",
+            chat_type="group",
+            message_id="integration-pending",
+            user_id="123",
+            user_name="smoke",
+            text="pending recovery",
+            message_key="group:integration-pending",
+        )
+        instance._queue.enqueue(
+            pending,
+            TriggerRequest.create(
+                "888",
+                "group:integration-pending",
+                "mention",
+                "123",
+                "smoke",
+            ),
+        )
+        instance._queue.set_paused("888", True)
+        await instance.disconnect()
+        if not await instance.connect(is_reconnect=True):
+            raise AssertionError("pending trigger reconnect smoke 失败")
+        pending_status = instance._queue.status("888")
+        if (
+            pending_status.get("pending") != 1
+            or pending_status.get("pending_trigger_requests") != 1
+        ):
+            raise AssertionError("reconnect 后 pending message/trigger 未恢复")
+        instance._queue.clear("888")
+
+        # standalone cron 不依赖当前 session 或入站历史；用本地 monkeypatch
+        # 验证目标类型和允许群合同，不访问真实 OneBot endpoint。
+        captured: list[tuple[str, str, str]] = []
+        original_send_message = adapter.OneBotHttpApi.send_message
+
+        async def fake_send_message(
+            api: object,
+            target_id: str,
+            content: str,
+            *,
+            chat_type: str,
+            reply_to: str | None = None,
+        ) -> str:
+            del api, reply_to
+            captured.append((target_id, content, chat_type))
+            return "cron-smoke-1"
+
+        adapter.OneBotHttpApi.send_message = fake_send_message
+        try:
+            cron_config = PlatformConfig(
+                enabled=True,
+                extra={
+                    "http_api": "http://127.0.0.1:3000",
+                    "self_id": "1",
+                    "home_channel": "1072992996",
+                    "home_channel_type": "group",
+                    "allowed_groups": ["1072992996"],
+                },
+            )
+            cron_result = await adapter._standalone_send(
+                cron_config,
+                "1072992996",
+                "cron smoke",
+            )
+        finally:
+            adapter.OneBotHttpApi.send_message = original_send_message
+        if cron_result.get("success") is not True or captured != [
+            ("1072992996", "cron smoke", "group")
+        ]:
+            raise AssertionError(f"home cron smoke 失败: {cron_result!r} {captured!r}")
     finally:
         await instance.disconnect()
 

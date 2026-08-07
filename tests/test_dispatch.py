@@ -72,6 +72,8 @@ async def test_其他进程退出后lease到期自动恢复(tmp_path, monkeypatc
     dispatcher = GroupDispatcher(store, start_turn, recovery_poll_seconds=0.05)
     assert await dispatcher.recover() == []
     now[0] = 1006.0
+    await asyncio.sleep(0.1)
+    now[0] = 1008.1
     await asyncio.wait_for(started.wait(), timeout=1)
     assert len(recovered) == 1
     assert recovered[0].lease_id != lease.lease_id
@@ -129,5 +131,27 @@ async def test_持久化完成失败不会报告完成(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "ack", lambda _lease: False)
     assert not await dispatcher.complete(captured[0].lease_id, outcome="success", unknown=False)
     assert dispatcher.active("888") is None
+    await dispatcher.close()
+    store.close()
+
+
+async def test_reopen会取消旧heartbeat和恢复任务(tmp_path):
+    """dispatcher reopen 不能只清空字典，旧后台 task 必须真正结束。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    message = _message("reopen")
+    store.enqueue(
+        message,
+        TriggerRequest.create("888", "group:reopen", "mention", "1", "用户1"),
+    )
+    lease = store.claim("888")
+    assert lease is not None
+    dispatcher = GroupDispatcher(store, lambda _lease: asyncio.sleep(0))
+    dispatcher._active["888"] = ActiveTurn(lease, lease.claimed_at)
+    heartbeat = asyncio.create_task(dispatcher._heartbeat(lease))
+    dispatcher._heartbeat_tasks["888"] = heartbeat
+    await dispatcher.reopen()
+    assert heartbeat.done()
+    assert dispatcher.active("888") is None
+    assert not dispatcher._closed
     await dispatcher.close()
     store.close()

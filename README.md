@@ -5,7 +5,7 @@
 ## 它能做什么
 
 - **私聊**：和机器人一对一聊天,每条消息都会回复。
-- **群聊**：整群共享一个 Hermes session；允许的消息先进入持久 SQLite 队列，再由 @、关键词、`always` 或分层 LLM trigger 触发一轮处理。
+- **群聊**：整群共享一个 Hermes session；允许的消息先进入持久 SQLite 队列，再由 @、关键词、`always` 或分层 LLM trigger 触发一轮处理。硬触发会覆盖旧的普通恢复/LLM trigger 和退避。
 - **连续对话**：成功回复后进入最多 60 秒的活跃窗口；窗口内普通消息经过 5 秒 trailing debounce，再交给低成本旁路模型判断是否回复，单窗口最多仲裁 3 次。
 - **处理指示器**：群 turn 认领后给触发消息添加 👀，Hermes turn 收尾时自动移除；没有真实消息 ID 或 QQ 框架不支持该扩展时按 best-effort 跳过，不影响回复。
 - **上下文**：队列有条数、字节数和单条消息上限，确认后形成滚动摘要，并保留最近消息原文；当前批次作为普通 user message，摘要优先通过 Hermes `channel_prompt` 临时注入，不重复写入 shared session transcript。旧 Hermes 不支持时退回有界文本模式并记录审计。
@@ -75,6 +75,7 @@ hermes plugins install notnotype/hermes-plugin-onebot11
 | `ONEBOT11_ALLOW_ALL_USERS` | 空 | 明确允许 `dm_policy=open` 的私聊；也可使用 `GATEWAY_ALLOW_ALL_USERS=true` |
 | `ONEBOT11_QUEUE_DB` | Hermes home | SQLite 队列路径；未配置时使用 Hermes home 下的 `onebot11/queue.sqlite3` |
 | `ONEBOT11_HOME_CHANNEL` | 空 | 定时任务目标 ID；必须同时在 `platforms.onebot11.extra.home_channel_type` 指定 `group` 或 `dm` |
+| `ONEBOT11_HOME_CHANNEL_TYPE` | 空 | 定时任务目标类型：`group` 或 `dm`；不会根据 QQ 号形状猜测 |
 
 启动网关时带上环境变量即可,例如：
 
@@ -94,6 +95,8 @@ platforms:
     extra:
       session_mode: shared
       group_sessions_per_user: false
+      home_channel: "1072992996"
+      home_channel_type: group
       queue_lease_seconds: 120
       queue_recovery_poll_seconds: 5
       queue_max_messages: 1000
@@ -120,7 +123,9 @@ platforms:
       processing_reaction_emoji_id: "128064"  # LLBot 的 👀
 ```
 
-`queue_recovery_poll_seconds` 只负责发现已过期 lease，不会抢占仍有效的 lease。
+`queue_recovery_poll_seconds` 只负责发现已过期 lease，不会抢占仍有效的 lease。正常主动断开时，
+未开始出站的 lease 回到 pending 且不消耗失败预算；只有过期的明确 `agent_running` lease
+才按最多 3 次的 2/4/8 秒退避恢复，达到上限进入 `failed`。出站已开始、阶段未知或租约阶段缺失进入 `uncertain`。
 LLM trigger 默认关闭，启用时必须同时配置明确的旁路 `provider`、`model` 和群 allowlist；每群最多一个判断任务，使用 5 秒 debounce 和全局并发上限。判断调用固定使用 `fallback_policy=none`、`max_attempts=1`，不支持这两个 Hermes auxiliary 参数的旧版本会安全禁用 LLM trigger，不回退主模型。缺少模型、超时或返回非法 JSON 都按“不触发”处理。
 旁路模型只接受 `{"decision":"trigger|wait|ignore","wait_seconds":0}`；`wait` 时 `wait_seconds` 只能是 `5/10/30/60`，`trigger` 和 `ignore` 必须使用 `0`。非法结果保留队列消息，不创建 lease。
 `media_orphan_ttl_seconds` 到期后由下一次 adapter 启动或 turn 收尾清理遗留媒体目录。
@@ -134,6 +139,9 @@ LLM trigger 默认关闭，启用时必须同时配置明确的旁路 `provider`
 2. **谁能用工具**：`super_admins` 对应超级管理员；普通用户默认只有当前目标范围内的只读工具。
 3. **会话范围**：工具和出站目标都绑定当前 `(session_id, turn_id)`，群里只能查/操作本群。
 4. **写操作**：模型第一次调用只返回 `/onebot confirm TOKEN`；确认命令在入站层执行，不进入 session 或队列。
+
+同一批群消息可能来自多个用户，但权限主体始终是创建 durable trigger 的触发用户；
+其他用户消息只作为不可信上下文，不会把普通用户升级为超级管理员，也不会改变当前群目标。
 
 群级运维命令由超级管理员直接发送：`/onebot status`、`queue`、`flush`、`clear`、`pause`、`resume`、`resolve retry|discard`、`resolve action retry|discard OPERATION_ID` 和 `confirm TOKEN`。`clear` 不删除 Hermes session 历史，但会同时失效当前群旧的 debounce/活跃触发状态；`uncertain` 和 `failed` 都不会自动重试，必须明确 resolve。管理动作 `unknown` 的 `retry` 只解除重复执行阻断，之后仍需重新生成预览并确认，不会直接重放。
 
@@ -165,7 +173,10 @@ python scripts/verify_hermes_integration.py \
   --hermes-auxiliary-source /path/to/hermes-agent-auxiliary-no-fallback
 ```
 
-该命令使用临时 `HERMES_HOME`，会真实收集平台、9 个工具、4 个 hooks、`onebot11_trigger` auxiliary，并执行 shared session/reconnect smoke；不会把测试队列、审计或 session 写入真实 Hermes home。CI 只负责插件可安装、`onebot11/` 协议/状态机测试和 Ruff；Hermes 组合测试是本地验收证据。纯插件环境只保证 `import onebot11`，根目录 `adapter.py` 需要 Hermes gateway 依赖。
+该命令使用临时 `HERMES_HOME`，会真实收集平台、9 个工具、4 个 hooks、`onebot11_trigger` auxiliary，
+并执行 shared session、pending trigger 恢复、显式 home cron 和 reconnect smoke；不会把测试队列、
+审计或 session 写入真实 Hermes home。CI 只负责插件可安装、`onebot11/` 协议/状态机测试和 Ruff；
+Hermes 组合测试是本地验收证据。纯插件环境只保证 `import onebot11`，根目录 `adapter.py` 需要 Hermes gateway 依赖。
 
 ## License
 
