@@ -1,8 +1,12 @@
 """SQLite 队列的租约、恢复和去重合同测试。"""
 
 import sqlite3
+import threading
+import time
 
-from onebot11.queue import QueueMessage, QueueStore, TriggerRequest
+import pytest
+
+from onebot11.queue import QueueError, QueueMessage, QueueStore, TriggerRequest
 
 
 def _message(message_id: str, *, chat_id: str = "888", text: str = "消息") -> QueueMessage:
@@ -87,6 +91,29 @@ def test_恢复不抢占仍有效的其他进程租约(tmp_path, monkeypatch):
     assert other.claim("888") is not None
     owner.close()
     other.close()
+
+
+def test_恢复白名单在修改lease前过滤目标(tmp_path, monkeypatch):
+    """允许恢复的群转 pending，未授权群的 lease 和 trigger 保持不变。"""
+    now = [1000.0]
+    monkeypatch.setattr("onebot11.queue.time.time", lambda: now[0])
+    path = tmp_path / "queue.sqlite3"
+    owner = QueueStore(path)
+    recovery = QueueStore(path)
+    for chat_id in ("888", "777"):
+        message = _message(chat_id, chat_id=chat_id)
+        owner.enqueue(message, _trigger(message))
+        assert owner.claim(chat_id, lease_seconds=5) is not None
+    now[0] = 1006.0
+
+    recovered = recovery.recover_trigger_requests({"888"})
+    assert [item.chat_id for item in recovered] == ["888"]
+    assert recovery.status("888")["pending"] == 1
+    assert recovery.status("888")["pending_trigger_requests"] == 1
+    assert recovery.status("777")["leased"] == 1
+    assert recovery.status("777")["pending_trigger_requests"] == 0
+    owner.close()
+    recovery.close()
 
 
 def test_clear保留消息去重事实(tmp_path):
@@ -324,13 +351,93 @@ def test_v7旧格式保留revision并补齐当前扩展(tmp_path):
     migrated.close()
 
 
-def test_未知更高schema仍然拒绝启动(tmp_path):
-    """schema 8 及以上不能被当前插件猜测迁移。"""
+def test_v7迁移补齐LLM判断列(tmp_path):
+    """schema 7 文件升级后应具备持久 LLM 游标和退避列。"""
     path = tmp_path / "queue.sqlite3"
     store = QueueStore(path)
     store.close()
     connection = sqlite3.connect(path)
-    connection.execute("PRAGMA user_version=8")
+    connection.execute("PRAGMA user_version=7")
+    connection.commit()
+    connection.close()
+
+    migrated = QueueStore(path)
+    columns = {
+        str(row[1])
+        for row in migrated._conn.execute(
+            "PRAGMA table_info(onebot_queue_chat)"
+        ).fetchall()
+    }
+    assert {
+        "llm_judged_seq",
+        "llm_next_attempt_at",
+        "llm_failure_count",
+        "llm_last_error",
+    }.issubset(columns)
+    migrated.close()
+
+
+def test_llm判断游标和退避持久化(tmp_path, monkeypatch):
+    """LLM false 不重复判断；失败有退避且下一次重启仍可读取。"""
+    now = [1000.0]
+    monkeypatch.setattr("onebot11.queue.time.time", lambda: now[0])
+    path = tmp_path / "queue.sqlite3"
+    store = QueueStore(path)
+    store.enqueue(_message("llm"))
+    assert store.llm_judgment("888")["judged_seq"] == 0
+    store.mark_llm_judged("888", 1)
+    assert store.llm_judgment("888") == {
+        "judged_seq": 1,
+        "next_attempt_at": None,
+        "failure_count": 0,
+        "last_error": None,
+    }
+    store.mark_llm_failure("888", 1, "timeout")
+    state = store.llm_judgment("888")
+    assert state["judged_seq"] == 1
+    assert state["failure_count"] == 1
+    assert state["next_attempt_at"] == 1002.0
+    store.close()
+
+    reopened = QueueStore(path)
+    assert reopened.llm_judgment("888")["next_attempt_at"] == 1002.0
+    reopened.close()
+
+
+def test关闭等待已进入SQLite操作且关闭后拒绝新操作(tmp_path):
+    """close 不得抢先关闭正在执行的同步操作，也不得让新操作碰到 sqlite。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    entered = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+
+    def blocking_operation() -> None:
+        with store._operation():
+            entered.set()
+            release.wait(timeout=2)
+
+    worker = threading.Thread(target=blocking_operation)
+    worker.start()
+    assert entered.wait(timeout=1)
+    closer = threading.Thread(target=lambda: (store.close(), finished.set()))
+    closer.start()
+    time.sleep(0.05)
+    assert not finished.is_set()
+    release.set()
+    worker.join(timeout=1)
+    closer.join(timeout=1)
+    assert finished.is_set()
+    with pytest.raises(QueueError, match="QueueStore 已关闭"):
+        store.peek("888")
+
+
+def test_未知更高schema仍然拒绝启动(tmp_path):
+    """schema 9 及以上不能被当前插件猜测迁移。"""
+    path = tmp_path / "queue.sqlite3"
+    store = QueueStore(path)
+    store.close()
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA user_version=9")
     connection.commit()
     connection.close()
 

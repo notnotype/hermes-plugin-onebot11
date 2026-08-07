@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import sys
+import threading
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -393,6 +394,330 @@ async def test_群turn给触发消息加眼睛并在收尾移除(monkeypatch):
         assert adapter._queue.status("888")["pending"] == 0
     finally:
         await adapter.disconnect()
+
+
+async def test_reaction落盘失败时不调用set_true(monkeypatch):
+    """无法持久化清理目标时，不能先向 OneBot 添加 👀。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    message = adapter_module.QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1001",
+        user_id="123",
+        user_name="小明",
+        text="触发",
+        message_key="group:1001",
+    )
+    adapter._queue.enqueue(
+        message,
+        adapter_module.TriggerRequest.create("888", "group:1001", "mention", "123", "小明"),
+    )
+    lease = adapter._queue.claim("888")
+    assert lease is not None
+    calls: list[bool] = []
+
+    def broken_record(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    async def fake_reaction(_message_id: str, _emoji_id: str, *, enabled: bool) -> None:
+        calls.append(enabled)
+
+    monkeypatch.setattr(adapter._queue, "record_reaction", broken_record)
+    monkeypatch.setattr(adapter._api, "set_message_emoji_like", fake_reaction)
+    try:
+        assert await adapter._set_processing_reaction(lease, enabled=True) is None
+        assert calls == []
+    finally:
+        await adapter.disconnect()
+
+
+async def test_reaction_unset成功但删除状态失败使用有限退避(monkeypatch):
+    """远端 unset 成功而本地删除失败时，不能无限立即重复 unset。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    adapter._queue.record_reaction("lease-reaction", "888", "1001")
+    adapter._queue.mark_reaction_set("lease-reaction")
+
+    async def fake_reaction(_message_id: str, _emoji_id: str, *, enabled: bool) -> None:
+        assert enabled is False
+
+    def broken_delete(_lease_id: str) -> bool:
+        raise OSError("state delete failed")
+
+    monkeypatch.setattr(adapter._api, "set_message_emoji_like", fake_reaction)
+    monkeypatch.setattr(adapter._queue, "delete_reaction", broken_delete)
+    try:
+        await adapter._unset_reaction(adapter._queue.reaction("lease-reaction"))
+        record = adapter._queue.reaction("lease-reaction")
+        assert record is not None
+        assert record.attempts == 1
+        assert record.next_attempt_at is not None
+    finally:
+        await adapter.disconnect()
+
+
+async def test_llm_false的同一批消息只判断一次(monkeypatch):
+    """持久游标阻止恢复轮询对相同 pending 批次反复调用旁路模型。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "sidecar",
+                    "model": "judge",
+                    "groups": ["888"],
+                },
+            },
+        )
+    )
+    message = adapter_module.QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="llm-false",
+        user_id="123",
+        user_name="小明",
+        text="不需要回复",
+        message_key="group:llm-false",
+    )
+    adapter._queue.enqueue(message)
+    calls = 0
+
+    async def fake_call(**_kwargs):
+        nonlocal calls
+        calls += 1
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="false"))]
+        )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.auxiliary_client",
+        SimpleNamespace(async_call_llm=fake_call),
+    )
+    try:
+        await adapter._judge_llm_trigger("888")
+        await adapter._judge_llm_trigger("888")
+        assert calls == 1
+        assert adapter._queue.status("888")["llm_judged_seq"] == 1
+    finally:
+        await adapter.disconnect()
+
+
+async def test_llm_trigger失败使用持久退避(monkeypatch):
+    """旁路模型失败不会被恢复轮询快速打爆，退避状态跨读取保留。"""
+    now = [1000.0]
+    monkeypatch.setattr(adapter_module.time, "time", lambda: now[0])
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "sidecar",
+                    "model": "judge",
+                    "groups": ["888"],
+                },
+            },
+        )
+    )
+    adapter._queue.enqueue(
+        adapter_module.QueueMessage(
+            chat_id="888",
+            chat_type="group",
+            message_id="llm-error",
+            user_id="123",
+            user_name="小明",
+            text="等待模型",
+            message_key="group:llm-error",
+        )
+    )
+    calls = 0
+
+    async def broken_call(**_kwargs):
+        nonlocal calls
+        calls += 1
+        raise TimeoutError("judge timeout")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "agent.auxiliary_client",
+        SimpleNamespace(async_call_llm=broken_call),
+    )
+    try:
+        await adapter._judge_llm_trigger("888")
+        await adapter._judge_llm_trigger("888")
+        assert calls == 1
+        assert adapter._queue.status("888")["llm_failure_count"] == 1
+        now[0] = 1002.1
+        await adapter._judge_llm_trigger("888")
+        assert calls == 2
+    finally:
+        await adapter.disconnect()
+
+
+async def test_未授权群恢复不修改持久触发状态(monkeypatch):
+    """恢复路径在白名单过滤后不能为旧群创建 cooldown trigger。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_ALLOWED_GROUPS="888",
+    )
+    message = adapter_module.QueueMessage(
+        chat_id="777",
+        chat_type="group",
+        message_id="old",
+        user_id="123",
+        user_name="小明",
+        text="旧消息",
+        message_key="group:old",
+        metadata={"onebot11_cooldown_candidate": True},
+    )
+    adapter._queue.enqueue(message)
+    try:
+        assert await adapter._dispatcher.recover() == []
+        status = adapter._queue.status("777")
+        assert status["pending"] == 1
+        assert status["pending_trigger_requests"] == 0
+    finally:
+        await adapter.disconnect()
+
+
+async def test_unknown后新确认令牌允许管理员再次明确执行(monkeypatch):
+    """unknown 不自动重试，但新的人工确认令牌可以再次执行。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_SUPER_ADMINS="123",
+    )
+    calls = 0
+
+    async def fake_write(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"status": "unknown", "error": "timeout"}
+        return {"status": "ok"}
+
+    monkeypatch.setattr(adapter_module, "handle_write_action", fake_write)
+
+    def issue_and_consume():
+        issued = adapter._confirmations.issue(
+            "qq_set_group_ban",
+            {"user_id": "456", "duration": 60},
+            user_id="123",
+            chat_type="group",
+            chat_id="888",
+        )
+        return adapter._confirmations.consume(
+            issued.token,
+            user_id="123",
+            chat_type="group",
+            chat_id="888",
+        )
+
+    try:
+        first = await adapter._execute_confirmed(issue_and_consume())
+        second = await adapter._execute_confirmed(issue_and_consume())
+        assert first["status"] == "unknown"
+        assert "warning" in first
+        assert second["status"] == "ok"
+        assert calls == 2
+    finally:
+        await adapter.disconnect()
+
+
+async def test_adapter关闭后工具和确认入口都fail_closed(monkeypatch):
+    """disconnect 一开始 fencing 后，旧 turn 不能再调用工具或执行确认。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_SUPER_ADMINS="123",
+    )
+    adapter_module._CURRENT_CALLER.set(
+        adapter_module.CallerContext(user_id="123", chat_type="group", chat_id="888")
+    )
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    confirmation = adapter._confirmations.issue(
+        "qq_set_group_ban",
+        {"user_id": "456", "duration": 60},
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+    )
+    await adapter.disconnect()
+    try:
+        hook_result = adapter_module._pre_tool_call_hook(
+            tool_name="terminal",
+            session_id="session",
+            turn_id="turn",
+            args={},
+        )
+        handler_result = json.loads(
+            await adapter._make_tool_handler("qq_get_group_info")(
+                {}, session_id="session", turn_id="turn"
+            )
+        )
+        confirmed = await adapter._execute_confirmed(confirmation)
+        assert hook_result is not None and hook_result["action"] == "block"
+        assert handler_result["status"] == "permission_error"
+        assert confirmed["status"] == "permission_error"
+    finally:
+        adapter_module._CURRENT_CALLER.set(None)
+        adapter_module._CURRENT_BINDING.set(None)
+
+
+async def test_adapter关闭等待已进入的to_thread_queue操作(monkeypatch):
+    """disconnect 不能先关 SQLite 再让已进入线程继续访问。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    entered = threading.Event()
+    release = threading.Event()
+    original_now = adapter._queue._now
+
+    def slow_now():
+        entered.set()
+        release.wait(timeout=2)
+        return original_now()
+
+    monkeypatch.setattr(adapter._queue, "_now", slow_now)
+    operation = asyncio.create_task(asyncio.to_thread(adapter._queue.peek, "888"))
+    assert await asyncio.to_thread(entered.wait, 1)
+    disconnect = asyncio.create_task(adapter.disconnect())
+    await asyncio.sleep(0.05)
+    assert not disconnect.done()
+    release.set()
+    assert await operation == ()
+    await disconnect
+
+
+def test_image同时含file和url只选择一个下载源():
+    """诊断字段保留两者，但实际 images 列表只保留 URL。"""
+    from onebot11.message import parse_message_segments
+
+    result = parse_message_segments(
+        [{"type": "image", "data": {"file": "file-id", "url": "https://example.com/a.png"}}]
+    )
+    assert result.images == ["https://example.com/a.png"]
+    assert result.image_urls == ["https://example.com/a.png"]
+    assert result.image_files == ["file-id"]
 
 
 async def test_私聊策略disabled不进入(monkeypatch):

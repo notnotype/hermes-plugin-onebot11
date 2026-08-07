@@ -1,7 +1,7 @@
 # OneBot 11 上下文物化与细粒度权限
 
 - 关联 issue：[#6](https://github.com/notnotype/hermes-plugin-onebot11/issues/6)
-- 状态：本地实现和安全收口完成；Arch + LLBot 既有版本联调完成，本轮新增恢复/媒体边界尚待重新部署验收
+- 状态：v0.3.1 本地实现和安全收口完成，等待 PR #7 合并后最终复审；Arch + LLBot 既有 v0.3.0 联调完成，本轮新增场景尚待重新部署验收
 - 开始日期：2026-08-06
 
 ## 用户需求
@@ -28,6 +28,7 @@
 7. 记录 Hermes 当前版本没有 `pre_provider_request`；插件仅在宿主公开该 hook 时注册动态 request copy 适配器。
 8. 在 Arch `192.168.1.18` 部署 `0.3.0`，用真实反向 WS/HTTP 链路完成指定群、指定私聊、shared session、slash、reaction、权限拒绝和白名单负向验证。
 9. 收口入站/cron/恢复统一白名单、持久 cooldown、LLM 判断重唤醒、reaction unset 恢复、shutdown fencing、delegate_task 禁止和 OneBot `get_image` 受控本地复制。
+10. 为 v0.3.1 增加 QueueStore v8 LLM 游标、关闭生命周期保护、恢复白名单参数、unknown 新确认令牌行为和图片单源选择。
 
 ## 变更文件
 
@@ -44,15 +45,16 @@
 
 ## 验证结果
 
-- 纯插件环境：`pytest -q` -> `108 passed, 1 skipped`；跳过项是没有 Hermes `gateway` 依赖的 adapter 集成测试。
+- 纯插件环境：`pytest -q` -> `114 passed, 1 skipped`；跳过项是没有 Hermes `gateway` 依赖的 adapter 集成测试。
 - 纯插件环境：`ruff check .` 通过。
-- 接入本机 Hermes 源码和依赖：`pytest -q` -> `163 passed`，adapter 集成测试不再因缺少 Hermes gateway 而跳过。
+- 接入本机 Hermes 源码和 site-packages：`pytest -q` -> `178 passed`，adapter 集成测试不再因缺少 Hermes gateway 而跳过。
 - 已覆盖 batch 重复注入、UTF-8 字节预算、最近原文、动态文本标记、角色优先级、wildcard 拒绝、通用 Hermes 工具门禁、权限配置写入保护、群 slash 旁路和危险命令拒绝。
 - Hermes 临时 `HERMES_HOME` smoke 已完成：平台、12 个 OneBot 工具、4 个现有安全 hooks 和 `onebot11_trigger` auxiliary 均注册；当前 Hermes 没有 `pre_provider_request`，因此动态上下文仍是上游接口待办。
 - Arch + LLBot 外部联调已完成：配置只允许群 `1072992996` 和私聊用户 `2056963663`；共享 key 为 `agent:main:onebot11:group:1072992996`，两个群用户计算结果一致。
 - 外部链路已验证：`/context` 不进队列；`/status` 标注 `chat_type=group` 且不回传旧 summary；普通用户 `/whoami` 只有当前范围只读工具；普通用户调用 `terminal` 被 hook/handler 拒绝；群 turn 的 reaction 按 `set=true -> 回复 -> set=false` 完成；允许私聊正常回复；非白名单群和私聊只有 `access_denied` 审计且无出站。
 - 外部消息使用真实反向 WS 的合成 OneBot payload，未冒充真人 QQ 客户端输入；群管理写操作预览/确认、unknown 出站人工 resolve 和 Hermes 上游接口仍未在本 Task 外部验证。
 - 本轮新增的持久 cooldown、reaction 重启清理、cron 负向和 get_image 本地根目录安全测试已在本地覆盖；尚未重新部署到 Arch。
+- v0.3.1 代码变更已通过本地 Hermes 门禁；PR 合并后仍需从干净 master 复审，再重新部署 Arch 验证 cooldown 自动恢复、reaction 重启清理、shutdown fencing 和 unknown 新确认令牌。
 
 ## 后续 TODO
 

@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- **阶段**：OneBot 11 可靠性与安全收口已实现本地闭环；Task 4 的上下文/角色权限改动已完成本地门禁，既有 Arch + LLBot 联调通过，但本轮新增恢复/媒体边界尚待重新部署。
+- **阶段**：OneBot 11 v0.3.1 可靠性与安全收口已完成代码和本地门禁，等待 PR #7 合并后从干净 master 做最终复审；Arch + LLBot 当前仍运行既有 v0.3.0，v0.3.1 新增场景尚待重新部署。
 - **核心合同**：群固定一个共享 session；群消息持久入队；触发后按 lease 启动单群单 turn；非幂等出站结果未知时进入 `uncertain`，不自动重放。
 - **本地验证**：协议/状态机测试通过；使用本地 Hermes 源码与其 site-packages 运行 adapter 测试通过。最终门禁命令和环境见“验证证据”。
 
@@ -26,8 +26,8 @@
 
 ## 验证证据
 
-- 纯插件依赖：`uv run --extra dev pytest -q`：`108 passed, 1 skipped`；没有 Hermes 依赖的环境会跳过 adapter 集成文件。
-- 使用本地 Hermes 实例的源码和依赖：全套测试 `163 passed`，覆盖 adapter hooks、工具注册、共享队列、身份绑定、shared session key、cooldown/reaction 恢复、get_image 根目录、出站 unknown、角色权限和群 slash command。
+- 纯插件依赖：`pytest -q`：`114 passed, 1 skipped`；没有 Hermes 依赖的环境会跳过 adapter 集成文件。
+- 使用本地 Hermes 源码与 site-packages：全套测试 `178 passed`，覆盖 adapter hooks、关闭 fencing、QueueStore v8、共享队列、身份绑定、shared session key、cooldown/LLM/reaction 恢复、get_image 根目录、出站 unknown、角色权限和群 slash command。
 - 本轮 Arch + LLBot：服务加载 `0.3.0`；群 `1072992996` 和私聊 `2056963663` 是唯一出站目标。已验证 `/context` 旁路、紧凑 `/status`、普通用户高风险工具拒绝、shared session key、群 reaction 生命周期、允许私聊回复，以及非白名单群/私聊 fail-closed。
 - `.venv\\Scripts\\python.exe -m ruff check .`：通过。
 - 真实 Hermes 临时 `HERMES_HOME` 注册 smoke：已确认平台、12 个 OneBot 工具、4 个现有安全 hooks 和 `onebot11_trigger` auxiliary 均注册；shared session 默认桥接返回 `group_sessions_per_user=false`。当前 Hermes 没有 `pre_provider_request`，动态 request-only 上下文仍待上游接口。
@@ -47,7 +47,7 @@ Task 4 新增证据：
 
 已确认：
 
-- Hermes 实际加载当前 0.2.0 插件，`session=shared`，WS 监听和 LLBot 反向 WS 自动重连均成功。
+- Hermes 实际加载既有 0.3.0 插件，`session=shared`，WS 监听和 LLBot 反向 WS 自动重连均成功；v0.3.1 尚未重新部署。
 - OneBot `get_login_info`、目标群/用户查询、群消息和私聊测试发送均返回 `retcode=0`，出站目标只有上述群和用户。
 - 通过真实 WS 服务注入允许群 @ 事件，消息进入持久 SQLite 队列，Agent 回复 `OneBot11联调成功` 并成功发回目标群；允许用户私聊回复 `OneBot11私聊成功`。
 - 不带 @ 的消息在 pending 中持久化；重启 Hermes 后仍在队列，管理员 `flush` 后完成处理并清空消息/trigger。

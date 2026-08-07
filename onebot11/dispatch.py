@@ -38,6 +38,8 @@ class GroupDispatcher:
         recovery_poll_seconds: float = 5.0,
         cooldown_seconds: float = 0.0,
         can_dispatch: Callable[[str], bool] | None = None,
+        recovery_chat_ids: Callable[[], set[str] | frozenset[str] | tuple[str, ...] | None]
+        | None = None,
         on_lease_lost: Callable[[QueueLease], Awaitable[None]] | None = None,
         on_recovery_tick: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
@@ -49,6 +51,7 @@ class GroupDispatcher:
         self.recovery_poll_seconds = max(0.05, float(recovery_poll_seconds))
         self.cooldown_seconds = max(0.0, float(cooldown_seconds))
         self._can_dispatch = can_dispatch or (lambda _chat_id: True)
+        self._recovery_chat_ids = recovery_chat_ids
         self._on_lease_lost = on_lease_lost
         self._on_recovery_tick = on_recovery_tick
         self._locks: dict[str, asyncio.Lock] = {}
@@ -139,6 +142,8 @@ class GroupDispatcher:
         reason: str | None = None,
     ) -> bool:
         """按真实处理结果确认、释放或标记 uncertain，不在此处启动下一轮。"""
+        if self._closed:
+            return False
         lease_id = str(lease_id)
         active: ActiveTurn | None = None
         chat_id: str | None = None
@@ -189,11 +194,16 @@ class GroupDispatcher:
         if self._closed:
             return []
         self._ensure_recovery_loop()
-        requests = await asyncio.to_thread(self.store.recover_trigger_requests)
+        allowed_chat_ids = self._recovery_scope()
+        requests = await asyncio.to_thread(
+            self.store.recover_trigger_requests,
+            allowed_chat_ids,
+        )
         due_requests = await asyncio.to_thread(
             self.store.recover_due_triggers,
             None,
             self.cooldown_seconds,
+            allowed_chat_ids,
         )
         requests = (*requests, *due_requests)
         if self._on_recovery_tick is not None:
@@ -214,11 +224,16 @@ class GroupDispatcher:
         try:
             while not self._closed:
                 await asyncio.sleep(self.recovery_poll_seconds)
-                requests = await asyncio.to_thread(self.store.recover_trigger_requests)
+                allowed_chat_ids = self._recovery_scope()
+                requests = await asyncio.to_thread(
+                    self.store.recover_trigger_requests,
+                    allowed_chat_ids,
+                )
                 due_requests = await asyncio.to_thread(
                     self.store.recover_due_triggers,
                     None,
                     self.cooldown_seconds,
+                    allowed_chat_ids,
                 )
                 if self._on_recovery_tick is not None:
                     await self._on_recovery_tick()
@@ -270,15 +285,33 @@ class GroupDispatcher:
             None,
         )
 
-    async def close(self) -> None:
-        """立即 fencing 内存活动 lease，再停止 heartbeat 和恢复任务。"""
-        self._closed = True
+    def _recovery_scope(self) -> set[str] | frozenset[str] | tuple[str, ...] | None:
+        """读取恢复允许目标；策略读取失败时返回空集合并 fail-closed。"""
+        if self._recovery_chat_ids is None:
+            return None
+        try:
+            result = self._recovery_chat_ids()
+        except Exception:
+            logger.warning("OneBot11 恢复白名单读取失败，跳过本轮恢复", exc_info=True)
+            return set()
+        return result if result is not None else set()
+
+    def fence_active(self) -> tuple[QueueLease, ...]:
+        """立即隔离所有内存活动 lease，供 adapter 在断开开始时调用。"""
+        leases: list[QueueLease] = []
         for chat_id, active in list(self._active.items()):
+            leases.append(active.lease)
             self._active[chat_id] = ActiveTurn(
                 lease=active.lease,
                 started_at=active.started_at,
                 lease_lost=True,
             )
+        return tuple(leases)
+
+    async def close(self) -> None:
+        """立即 fencing 内存活动 lease，再停止 heartbeat 和恢复任务。"""
+        self._closed = True
+        self.fence_active()
         recovery = self._recovery_task
         self._recovery_task = None
         if recovery is not None:

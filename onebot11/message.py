@@ -98,8 +98,9 @@ def parse_message_segments(segments: list[dict[str, Any]] | str, self_id: str | 
             if url:
                 result.images.append(url)
                 result.image_urls.append(url)
-            if file_id and file_id != url:
+            elif file_id:
                 result.images.append(file_id)
+            if file_id:
                 result.image_files.append(file_id)
             if url or file_id:
                 result.markers.append("[image]")
