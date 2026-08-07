@@ -329,3 +329,75 @@ def test_管理动作台账崩溃恢复和人工resolve(tmp_path):
         caller_user_id="123",
     ) is None
     reopened.close()
+
+
+def test_release与已有pending_trigger合并(tmp_path):
+    """旧 lease 释放时不能与后来的同群 trigger 冲突或丢失重试入口。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    first = _message("merge-release")
+    store.enqueue(first, _trigger(first))
+    lease = store.claim("888")
+    assert lease is not None
+    later = _message("merge-release-later")
+    store.enqueue(later, _trigger(later))
+
+    assert store.release(lease, reason="agent failed")
+    assert store.status("888")["pending_trigger_requests"] == 1
+    followup = store.claim("888")
+    assert followup is not None
+    assert [item.message_id for item in followup.messages] == ["merge-release-later"]
+    assert store.ack(followup)
+    assert store.status("888")["pending_trigger_requests"] == 1
+
+    store.close()
+
+
+def test_recover与已有pending_trigger合并(tmp_path, monkeypatch):
+    """过期 lease 恢复时应保留唯一 pending trigger。"""
+    now = [1000.0]
+    monkeypatch.setattr("onebot11.queue.time.time", lambda: now[0])
+    path = tmp_path / "queue.sqlite3"
+    owner = QueueStore(path)
+    other = QueueStore(path)
+    first = _message("merge-recover")
+    owner.enqueue(first, _trigger(first))
+    lease = owner.claim("888", lease_seconds=5)
+    assert lease is not None
+    later = _message("merge-recover-later")
+    owner.enqueue(later, _trigger(later))
+
+    now[0] = 1006.0
+    assert len(other.recover_trigger_requests()) == 1
+    assert other.status("888")["pending_trigger_requests"] == 1
+    owner.close()
+    other.close()
+
+
+def test_abandon与已有pending_trigger合并(tmp_path):
+    """断开结算未出站 lease 时不能把同群 trigger 撞成唯一索引错误。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    first = _message("merge-abandon")
+    store.enqueue(first, _trigger(first))
+    assert store.claim("888") is not None
+    later = _message("merge-abandon-later")
+    store.enqueue(later, _trigger(later))
+
+    assert store.abandon_owner_leases() == {"pending": 1, "uncertain": 0}
+    assert store.status("888")["pending_trigger_requests"] == 1
+    store.close()
+
+
+def test_resolve_retry与已有pending_trigger合并(tmp_path):
+    """管理员 retry uncertain 消息时，旧 trigger 与新 trigger 必须合并。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    first = _message("merge-resolve")
+    store.enqueue(first, _trigger(first))
+    lease = store.claim("888")
+    assert lease is not None
+    assert store.mark_uncertain(lease, "unknown")
+    later = _message("merge-resolve-later")
+    store.enqueue(later, _trigger(later))
+
+    assert store.resolve_uncertain("888", "retry") == 1
+    assert store.status("888")["pending_trigger_requests"] == 1
+    store.close()

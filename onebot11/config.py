@@ -6,8 +6,10 @@
 
 from __future__ import annotations
 
+import ipaddress
 import math
 import os
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -17,6 +19,7 @@ from .permissions import (
     AccessPolicy,
     build_access_policy,
     build_role_tools,
+    parse_admin_list,
     parse_bool,
     parse_id_list,
 )
@@ -36,6 +39,7 @@ class RuntimeConfig:
     ws_port: int
     access_token: str
     access_policy: AccessPolicy
+    super_admins: frozenset[str]
     role_tools: dict[str, frozenset[str]]
     trigger_config: TriggerConfig
     processing_reaction_enabled: bool
@@ -197,6 +201,37 @@ def _optional_string(value: Any, *, name: str) -> str | None:
     return result or None
 
 
+def _host(value: Any, *, name: str) -> str:
+    """严格解析 WS 监听地址，拒绝 URL、端口、路径和空白。"""
+    if not isinstance(value, str):
+        raise ValueError(f"{name} 必须是 hostname 或 IP 字符串")
+    if value != value.strip() or not value or any(char.isspace() for char in value):
+        raise ValueError(f"{name} 必须是 hostname 或 IP，不能包含空白")
+    try:
+        ipaddress.ip_address(value)
+        return value
+    except ValueError:
+        pass
+    if "/" in value or ":" in value or "://" in value:
+        raise ValueError(f"{name} 不能包含 URL、端口或路径")
+    if not re.fullmatch(
+        r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*",
+        value,
+    ):
+        raise ValueError(f"{name} 不是合法 hostname 或 IP")
+    return value
+
+
+def _is_loopback_host(value: str) -> bool:
+    """判断 WS host 是否为本机回环地址。"""
+    if value.casefold() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
 def parse_runtime_config(
     extra: Mapping[str, Any],
     environ: Mapping[str, Any] | None = None,
@@ -225,12 +260,9 @@ def parse_runtime_config(
         raise ValueError("OneBot11 不允许 group_sessions_per_user=true")
 
     ws_port = _int(effective.get("ws_port"), name="ws_port", default=18880, minimum=0, maximum=65535)
-    ws_host = _string(effective.get("ws_host"), name="ws_host", default="127.0.0.1")
-    if not ws_host:
-        raise ValueError("ws_host 不能为空")
+    ws_host = _host(effective.get("ws_host", "127.0.0.1"), name="ws_host")
     access_token = _string(effective.get("access_token"), name="access_token")
-    loopback_hosts = {"127.0.0.1", "::1", "localhost"}
-    if ws_host not in loopback_hosts and not access_token:
+    if not _is_loopback_host(ws_host) and not access_token:
         raise ValueError("WS 非 loopback 地址必须配置 ONEBOT11_ACCESS_TOKEN")
     if http_api and not is_loopback_http_url(http_api) and not access_token:
         raise ValueError("HTTP API 非本机地址必须配置 ONEBOT11_ACCESS_TOKEN")
@@ -245,8 +277,14 @@ def parse_runtime_config(
             raise ValueError("home_channel_type 必须是 group 或 dm")
 
     access_policy = build_access_policy(effective, env)
+    raw_admins = effective.get("super_admins")
+    if raw_admins is None:
+        raw_admins = effective.get("admins")
+    super_admins = frozenset(parse_admin_list(raw_admins))
     role_tools = build_role_tools(effective)
     trigger_config = build_trigger_config(effective)
+    if trigger_config.llm_enabled and not trigger_config.llm_allowed_groups:
+        raise ValueError("启用 LLM trigger 时必须配置非空 llm_trigger_groups")
     reaction_enabled = parse_bool(
         effective.get("processing_reaction_enabled"),
         default=True,
@@ -296,6 +334,7 @@ def parse_runtime_config(
         ws_port=ws_port,
         access_token=access_token,
         access_policy=access_policy,
+        super_admins=super_admins,
         role_tools=role_tools,
         trigger_config=trigger_config,
         processing_reaction_enabled=reaction_enabled,

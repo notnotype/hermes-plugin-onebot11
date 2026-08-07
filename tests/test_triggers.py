@@ -357,6 +357,15 @@ def test_llm决策严格限制字段和等待秒数():
     assert parse_llm_decision({"decision": "ignore", "wait_seconds": 0, "extra": 1}) is None
 
 
+def test_llm提示词只展示合法的等待秒数合同():
+    """模型看到的 JSON 示例必须与 parser 的严格合同一致。"""
+    prompt = build_llm_trigger_input("", (), max_bytes=2048, candidate_type="question")
+    assert '{"decision":"trigger","wait_seconds":0}' in prompt
+    assert '{"decision":"wait","wait_seconds":5}' in prompt
+    assert '{"decision":"ignore","wait_seconds":0}' in prompt
+    assert '{"decision":"trigger|wait|ignore","wait_seconds":5}' not in prompt
+
+
 def test_llm输入预算严格成立且保留最新消息():
     """旁路输入即使预算很小也不超限，并优先保留最新队列项。"""
     messages = (

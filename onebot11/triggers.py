@@ -619,7 +619,10 @@ def build_llm_trigger_input(
         (
             "判断当前 OneBot11 群消息是否应该让机器人回复。",
             f"候选类型：{candidate_type}。请结合历史摘要和当前队列判断。",
-            '只输出严格 JSON：{"decision":"trigger|wait|ignore","wait_seconds":5}。',
+            "只输出严格 JSON。合法结果示例：",
+            '{"decision":"trigger","wait_seconds":0}',
+            '{"decision":"wait","wait_seconds":5}',
+            '{"decision":"ignore","wait_seconds":0}',
             "decision=wait 时 wait_seconds 只能是 5、10、30、60；trigger/ignore 使用 0。",
         )
     )

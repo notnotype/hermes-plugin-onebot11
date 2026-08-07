@@ -258,6 +258,8 @@ def parse_id_list(value: Any) -> set[str]:
 
 def parse_admin_list(admins: Any) -> set[str]:
     """解析超级管理员列表，兼容旧的 ``ONEBOT11_ADMINS``。"""
+    if isinstance(admins, Mapping):
+        raise ValueError("super_admins 必须是字符串或 YAML list，不能是 mapping")
     return parse_id_list(admins)
 
 
@@ -281,7 +283,13 @@ def build_role_tools(extra: Mapping[str, Any]) -> dict[str, frozenset[str]]:
             values = value
         else:
             raise ValueError(f"roles.{role}.tools 必须是字符串或 YAML list")
-        return frozenset(str(name).strip() for name in values if str(name).strip()) & ALL_TOOLS
+        normalized = frozenset(str(name).strip() for name in values if str(name).strip())
+        unknown = normalized - ALL_TOOLS
+        if unknown:
+            raise ValueError(
+                f"roles.{role}.tools 包含未知工具: {', '.join(sorted(unknown))}"
+            )
+        return normalized
 
     user_tools = normalize_tools(user_raw, READ_ONLY_TOOLS, "user")
     super_tools = normalize_tools(super_raw, ALL_TOOLS, "super_admin")

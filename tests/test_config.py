@@ -53,3 +53,39 @@ def test未知策略和错误YAML列表fail_closed():
         parse_runtime_config(_extra(dm_policy="unknown"))
     with pytest.raises(ValueError):
         parse_runtime_config(_extra(roles={"user": {"tools": {"bad": "shape"}}}))
+
+
+def test超级管理员返回统一解析结果并拒绝mapping():
+    """adapter 与 validate_config 必须共享同一份严格管理员配置。"""
+    runtime = parse_runtime_config(_extra(super_admins=["2056963663"]))
+    assert runtime.super_admins == frozenset({"2056963663"})
+    with pytest.raises(ValueError):
+        parse_runtime_config(_extra(super_admins={"user": "2056963663"}))
+
+
+def testws_host拒绝URL格式():
+    """监听地址只接受 hostname/IP，不能把 URL 延迟到启动阶段才失败。"""
+    with pytest.raises(ValueError):
+        parse_runtime_config(_extra(ws_host="http://127.0.0.1", access_token="token"))
+
+
+def test启用llm_trigger必须显式配置群allowlist():
+    """旁路模型不能在未限制群范围时隐式接管所有群。"""
+    with pytest.raises(ValueError):
+        parse_runtime_config(
+            _extra(
+                llm_trigger={
+                    "enabled": True,
+                    "provider": "provider",
+                    "model": "model",
+                }
+            )
+        )
+
+
+def test角色未知工具直接拒绝():
+    """角色配置不能通过静默取交集把拼写错误隐藏掉。"""
+    with pytest.raises(ValueError, match="未知工具"):
+        parse_runtime_config(
+            _extra(roles={"user": {"tools": ["qq_not_a_real_tool"]}})
+        )

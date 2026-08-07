@@ -109,6 +109,13 @@ def build_inbound_event(raw: Mapping[str, Any], self_id: str | None) -> InboundE
     """把 OneBot message 事件转换为队列可用的内部事件。"""
     if str(raw.get("post_type") or "") != "message":
         return None
+    raw_self_id = raw.get("self_id")
+    if (
+        self_id
+        and raw_self_id is not None
+        and str(raw_self_id).strip() != str(self_id).strip()
+    ):
+        return None
     message_type = raw.get("message_type")
     message_id = str(raw.get("message_id") or "")
     if not message_id:

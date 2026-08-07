@@ -782,6 +782,86 @@ class QueueStore:
         ).fetchone()
         return str(row[0]) if row else None
 
+    def _transition_trigger_rows(
+        self,
+        rows: list[sqlite3.Row],
+        status: str,
+        now: float,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        """在同一事务中结算 trigger，并合并同群重复 pending 请求。"""
+        if status not in {"pending", "uncertain", "failed"}:
+            raise ValueError(f"非法 trigger 状态: {status}")
+        for row in rows:
+            request_id = str(row["request_id"])
+            chat_id = str(row["chat_id"])
+            if status == "pending":
+                existing = self._conn.execute(
+                    """
+                    SELECT request_id FROM onebot_queue_trigger
+                    WHERE chat_id=? AND status='pending' AND request_id<>?
+                    ORDER BY created_at, rowid LIMIT 1
+                    """,
+                    (chat_id, request_id),
+                ).fetchone()
+                if existing is not None:
+                    self._conn.execute(
+                        """
+                        DELETE FROM onebot_queue_trigger
+                        WHERE request_id=? AND status IN ('claimed','uncertain','failed')
+                        """,
+                        (request_id,),
+                    )
+                    continue
+            self._conn.execute(
+                """
+                UPDATE onebot_queue_trigger
+                SET status=?, lease_id=NULL, lease_owner=NULL,
+                    uncertain_reason=?, updated_at=?
+                WHERE request_id=?
+                """,
+                (
+                    status,
+                    str(reason or "")[:512] or None
+                    if status in {"uncertain", "failed"}
+                    else None,
+                    now,
+                    request_id,
+                ),
+            )
+
+    def _ensure_retriable_trigger(self, chat_id: str, now: float) -> str | None:
+        """为曾经被认领但没有 durable trigger 的 pending 消息补触发请求。"""
+        existing = self._conn.execute(
+            """
+            SELECT request_id FROM onebot_queue_trigger
+            WHERE chat_id=? AND status='pending'
+            ORDER BY created_at, rowid LIMIT 1
+            """,
+            (str(chat_id),),
+        ).fetchone()
+        if existing is not None:
+            return str(existing[0])
+        row = self._conn.execute(
+            """
+            SELECT * FROM onebot_queue_message
+            WHERE chat_id=? AND state='pending' AND attempts>0
+            ORDER BY seq LIMIT 1
+            """,
+            (str(chat_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        trigger = TriggerRequest.create(
+            str(chat_id),
+            str(row["message_key"]),
+            "queue_recovery",
+            str(row["user_id"]),
+            str(row["user_name"]),
+        )
+        return self._ensure_trigger(trigger, str(chat_id), str(row["message_key"]), now)
+
     def _purge_dedupe(self, now: float) -> None:
         """清理过期的持久去重记录，避免 tombstone 无限增长。"""
         cutoff = now - self.dedupe_ttl_seconds
@@ -816,20 +896,31 @@ class QueueStore:
         reason: str,
         caller_user_id: str,
         caller_user_name: str,
+        message_key: str | None = None,
     ) -> str | None:
-        """为当前群最早待处理消息创建 durable trigger，不创建 lease。"""
+        """为指定或最早待处理消息创建 durable trigger，不创建 lease。"""
         with self._lock:
             try:
                 self._transaction()
                 now = self._now()
-                row = self._conn.execute(
-                    """
-                    SELECT * FROM onebot_queue_message
-                    WHERE chat_id=? AND state='pending'
-                    ORDER BY seq LIMIT 1
-                    """,
-                    (str(chat_id),),
-                ).fetchone()
+                row = None
+                if message_key:
+                    row = self._conn.execute(
+                        """
+                        SELECT * FROM onebot_queue_message
+                        WHERE chat_id=? AND message_key=? AND state='pending'
+                        """,
+                        (str(chat_id), str(message_key)),
+                    ).fetchone()
+                if row is None:
+                    row = self._conn.execute(
+                        """
+                        SELECT * FROM onebot_queue_message
+                        WHERE chat_id=? AND state='pending'
+                        ORDER BY seq LIMIT 1
+                        """,
+                        (str(chat_id),),
+                    ).fetchone()
                 if row is None:
                     self._conn.commit()
                     return None
@@ -882,6 +973,22 @@ class QueueStore:
                     self._conn.commit()
                     return None
                 uncertain_reason = "lease 过期时出站阶段未知，需管理员确认"
+                pending_expired_trigger_rows = self._conn.execute(
+                    """
+                    SELECT DISTINCT trigger.*
+                    FROM onebot_queue_trigger AS trigger
+                    JOIN onebot_queue_message AS message
+                      ON message.lease_id=trigger.lease_id
+                     AND message.chat_id=trigger.chat_id
+                    WHERE trigger.chat_id=? AND trigger.status='claimed'
+                      AND message.state='leased'
+                      AND message.lease_until IS NOT NULL
+                      AND message.lease_until<=?
+                      AND message.outbound_started=0
+                      AND message.lease_phase='agent_running'
+                    """,
+                    (chat_id, now),
+                ).fetchall()
                 self._conn.execute(
                     """
                     UPDATE onebot_queue_trigger
@@ -898,24 +1005,6 @@ class QueueStore:
                       )
                     """,
                     (uncertain_reason, now, chat_id, now),
-                )
-                self._conn.execute(
-                    """
-                    UPDATE onebot_queue_trigger
-                    SET status='pending', lease_id=NULL, lease_owner=NULL,
-                        uncertain_reason=NULL, updated_at=?
-                    WHERE chat_id=? AND status='claimed'
-                      AND EXISTS (
-                          SELECT 1 FROM onebot_queue_message AS message
-                          WHERE message.chat_id=onebot_queue_trigger.chat_id
-                            AND message.lease_id=onebot_queue_trigger.lease_id
-                            AND message.state='leased'
-                            AND message.lease_until IS NOT NULL AND message.lease_until<=?
-                            AND message.outbound_started=0
-                            AND message.lease_phase='agent_running'
-                      )
-                    """,
-                    (now, chat_id, now),
                 )
                 self._conn.execute(
                     """
@@ -936,6 +1025,11 @@ class QueueStore:
                     """,
                     (uncertain_reason, now, chat_id, now),
                 )
+                self._transition_trigger_rows(
+                    list(pending_expired_trigger_rows),
+                    "pending",
+                    now,
+                )
                 active = self._conn.execute(
                     """
                     SELECT COUNT(*) FROM onebot_queue_message
@@ -950,19 +1044,20 @@ class QueueStore:
                 if (active and int(active[0]) > 0) or (uncertain and int(uncertain[0]) > 0):
                     self._conn.commit()
                     return None
-                self._conn.execute(
+                stale_trigger_rows = self._conn.execute(
                     """
-                    UPDATE onebot_queue_trigger SET status='pending', lease_id=NULL, lease_owner=NULL,
-                        uncertain_reason=NULL, updated_at=?
-                    WHERE chat_id=? AND status='claimed' AND NOT EXISTS (
-                        SELECT 1 FROM onebot_queue_message
-                        WHERE onebot_queue_message.chat_id=onebot_queue_trigger.chat_id
-                          AND onebot_queue_message.lease_id=onebot_queue_trigger.lease_id
-                          AND onebot_queue_message.state='leased'
-                    )
+                    SELECT * FROM onebot_queue_trigger AS trigger
+                    WHERE trigger.chat_id=? AND trigger.status='claimed'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM onebot_queue_message
+                          WHERE onebot_queue_message.chat_id=trigger.chat_id
+                            AND onebot_queue_message.lease_id=trigger.lease_id
+                            AND onebot_queue_message.state='leased'
+                      )
                     """,
-                    (now, chat_id),
-                )
+                    (chat_id,),
+                ).fetchall()
+                self._transition_trigger_rows(list(stale_trigger_rows), "pending", now)
                 self._conn.execute(
                     """
                     DELETE FROM onebot_queue_trigger
@@ -1160,6 +1255,7 @@ class QueueStore:
                     "DELETE FROM onebot_queue_trigger WHERE lease_id=? AND lease_owner=?",
                     (lease_id, self._owner_id),
                 )
+                self._ensure_retriable_trigger(chat_id, now)
                 self._conn.execute(
                     "UPDATE onebot_queue_chat SET summary=?, updated_at=? WHERE chat_id=?",
                     (summary, now, chat_id),
@@ -1405,6 +1501,13 @@ class QueueStore:
                     message_state = "uncertain"
                     trigger_state = "uncertain"
                     reason = reason or "出站已开始，明确失败也需要管理员确认"
+                trigger_rows = self._conn.execute(
+                    """
+                    SELECT * FROM onebot_queue_trigger
+                    WHERE lease_id=? AND lease_owner=? AND status='claimed'
+                    """,
+                    (lease_id, self._owner_id),
+                ).fetchall()
                 final_message_state = message_state
                 final_trigger_state = trigger_state
                 next_attempt_at: float | None = None
@@ -1438,20 +1541,14 @@ class QueueStore:
                         self._owner_id,
                     ),
                 )
-                self._conn.execute(
-                    """
-                    UPDATE onebot_queue_trigger SET status=?, lease_id=NULL, lease_owner=NULL,
-                        uncertain_reason=?, updated_at=?
-                    WHERE lease_id=? AND lease_owner=? AND status='claimed'
-                    """,
-                    (
-                        final_trigger_state,
-                        failure_reason if final_trigger_state in {"uncertain", "failed"} else None,
-                        now,
-                        lease_id,
-                        self._owner_id,
-                    ),
+                self._transition_trigger_rows(
+                    list(trigger_rows),
+                    final_trigger_state,
+                    now,
+                    reason=failure_reason,
                 )
+                if final_trigger_state == "pending":
+                    self._ensure_retriable_trigger(str(rows[0]["chat_id"]), now)
                 self._conn.commit()
                 return cursor.rowcount > 0
             except Exception:
@@ -1470,6 +1567,13 @@ class QueueStore:
                     "SELECT row_id FROM onebot_queue_message WHERE chat_id=? AND state IN ('uncertain','failed')",
                     (str(chat_id),),
                 ).fetchall()
+                trigger_rows = self._conn.execute(
+                    """
+                    SELECT * FROM onebot_queue_trigger
+                    WHERE chat_id=? AND status IN ('uncertain','failed')
+                    """,
+                    (str(chat_id),),
+                ).fetchall()
                 if action == "retry":
                     self._conn.execute(
                         """
@@ -1482,15 +1586,7 @@ class QueueStore:
                         """,
                         (now, now, str(chat_id)),
                     )
-                    self._conn.execute(
-                        """
-                        UPDATE onebot_queue_trigger
-                        SET status='pending', lease_id=NULL, lease_owner=NULL,
-                            uncertain_reason=NULL, updated_at=?
-                        WHERE chat_id=? AND status IN ('uncertain','failed')
-                        """,
-                        (now, str(chat_id)),
-                    )
+                    self._transition_trigger_rows(list(trigger_rows), "pending", now)
                 else:
                     self._conn.execute(
                         """
@@ -1694,38 +1790,41 @@ class QueueStore:
             try:
                 self._transaction()
                 now = self._now()
-                self._conn.execute(
+                uncertain_reason = "lease 过期时出站阶段未知，需管理员确认"
+                uncertain_trigger_rows = self._conn.execute(
                     """
-                    UPDATE onebot_queue_trigger SET status='uncertain', lease_id=NULL,
-                        lease_owner=NULL, uncertain_reason=?, updated_at=?
-                    WHERE status='claimed' AND EXISTS (
-                        SELECT 1 FROM onebot_queue_message
-                        WHERE onebot_queue_message.lease_id=onebot_queue_trigger.lease_id
-                          AND onebot_queue_message.state='leased'
-                          AND (onebot_queue_message.lease_until IS NULL OR onebot_queue_message.lease_until<=?)
-                          AND (onebot_queue_message.outbound_started=1
-                               OR onebot_queue_message.lease_phase='outbound_started'
-                               OR onebot_queue_message.lease_until IS NULL)
-                    )
+                    SELECT DISTINCT trigger.*
+                    FROM onebot_queue_trigger AS trigger
+                    JOIN onebot_queue_message AS message
+                      ON message.lease_id=trigger.lease_id
+                     AND message.chat_id=trigger.chat_id
+                    WHERE trigger.status='claimed'
+                      AND message.state='leased'
+                      AND (message.lease_until IS NULL OR message.lease_until<=?)
+                      AND (
+                          message.outbound_started=1
+                          OR message.lease_phase='outbound_started'
+                          OR message.lease_until IS NULL
+                      )
                     """,
-                    ("lease 过期时出站阶段未知，需管理员确认", now, now),
-                )
-                self._conn.execute(
+                    (now,),
+                ).fetchall()
+                pending_trigger_rows = self._conn.execute(
                     """
-                    UPDATE onebot_queue_trigger SET status='pending', lease_id=NULL,
-                        lease_owner=NULL, uncertain_reason=NULL, updated_at=?
-                    WHERE status='claimed' AND EXISTS (
-                        SELECT 1 FROM onebot_queue_message
-                        WHERE onebot_queue_message.lease_id=onebot_queue_trigger.lease_id
-                          AND onebot_queue_message.state='leased'
-                          AND onebot_queue_message.lease_until IS NOT NULL
-                          AND onebot_queue_message.lease_until<=?
-                          AND onebot_queue_message.outbound_started=0
-                          AND onebot_queue_message.lease_phase='agent_running'
-                    )
+                    SELECT DISTINCT trigger.*
+                    FROM onebot_queue_trigger AS trigger
+                    JOIN onebot_queue_message AS message
+                      ON message.lease_id=trigger.lease_id
+                     AND message.chat_id=trigger.chat_id
+                    WHERE trigger.status='claimed'
+                      AND message.state='leased'
+                      AND message.lease_until IS NOT NULL
+                      AND message.lease_until<=?
+                      AND message.outbound_started=0
+                      AND message.lease_phase='agent_running'
                     """,
-                    (now, now),
-                )
+                    (now,),
+                ).fetchall()
                 self._conn.execute(
                     """
                     UPDATE onebot_queue_message
@@ -1744,6 +1843,29 @@ class QueueStore:
                     """,
                     (now, now),
                 )
+                self._transition_trigger_rows(
+                    list(uncertain_trigger_rows),
+                    "uncertain",
+                    now,
+                    reason=uncertain_reason,
+                )
+                self._transition_trigger_rows(
+                    list(pending_trigger_rows),
+                    "pending",
+                    now,
+                )
+                stale_trigger_rows = self._conn.execute(
+                    """
+                    SELECT * FROM onebot_queue_trigger AS trigger
+                    WHERE trigger.status='claimed' AND NOT EXISTS (
+                        SELECT 1 FROM onebot_queue_message AS message
+                        WHERE message.chat_id=trigger.chat_id
+                          AND message.lease_id=trigger.lease_id
+                          AND message.state='leased'
+                    )
+                    """
+                ).fetchall()
+                self._transition_trigger_rows(list(stale_trigger_rows), "pending", now)
                 self._conn.execute(
                     """
                     DELETE FROM onebot_queue_trigger
@@ -1909,6 +2031,13 @@ class QueueStore:
                 for row in lease_rows:
                     lease_id = str(row["lease_id"])
                     is_uncertain = bool(row["uncertain"])
+                    trigger_rows = self._conn.execute(
+                        """
+                        SELECT * FROM onebot_queue_trigger
+                        WHERE lease_id=? AND lease_owner=? AND status='claimed'
+                        """,
+                        (lease_id, self._owner_id),
+                    ).fetchall()
                     if is_uncertain:
                         self._conn.execute(
                             """
@@ -1920,14 +2049,11 @@ class QueueStore:
                             """,
                             (reason, now, lease_id, self._owner_id),
                         )
-                        self._conn.execute(
-                            """
-                            UPDATE onebot_queue_trigger
-                            SET status='uncertain', lease_id=NULL, lease_owner=NULL,
-                                uncertain_reason=?, updated_at=?
-                            WHERE lease_id=? AND lease_owner=? AND status='claimed'
-                            """,
-                            (reason, now, lease_id, self._owner_id),
+                        self._transition_trigger_rows(
+                            list(trigger_rows),
+                            "uncertain",
+                            now,
+                            reason=reason,
                         )
                         uncertain += 1
                     else:
@@ -1942,15 +2068,16 @@ class QueueStore:
                             """,
                             (now, lease_id, self._owner_id),
                         )
-                        self._conn.execute(
-                            """
-                            UPDATE onebot_queue_trigger
-                            SET status='pending', lease_id=NULL, lease_owner=NULL,
-                                uncertain_reason=NULL, updated_at=?
-                            WHERE lease_id=? AND lease_owner=? AND status='claimed'
-                            """,
-                            (now, lease_id, self._owner_id),
+                        self._transition_trigger_rows(
+                            list(trigger_rows),
+                            "pending",
+                            now,
                         )
+                        if trigger_rows:
+                            self._ensure_retriable_trigger(
+                                str(trigger_rows[0]["chat_id"]),
+                                now,
+                            )
                         pending += 1
                 self._conn.commit()
                 return {"pending": pending, "uncertain": uncertain}

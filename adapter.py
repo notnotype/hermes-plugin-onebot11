@@ -83,6 +83,7 @@ LayeredTriggerState = _proto.triggers.LayeredTriggerState
 TriggerAction = _proto.triggers.TriggerAction
 parse_llm_decision = _proto.triggers.parse_llm_decision
 build_agent_context = _proto.context.build_agent_context
+build_agent_context_parts = _proto.context.build_agent_context_parts
 should_trigger = _proto.triggers.should_trigger
 ReverseWsServer = _proto.ws_server.ReverseWsServer
 parse_runtime_config = _proto.config.parse_runtime_config
@@ -222,14 +223,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         self.allowed_users = set(self._access_policy.allowed_users)
         self.allowed_groups = set(self._access_policy.allowed_groups)
         self.require_mention = runtime.trigger_config.require_mention
-        raw_super_admins = os.getenv("ONEBOT11_SUPER_ADMINS")
-        if raw_super_admins is None:
-            raw_super_admins = os.getenv("ONEBOT11_ADMINS")
-        if raw_super_admins is None:
-            raw_super_admins = extra.get("super_admins")
-        if raw_super_admins is None:
-            raw_super_admins = extra.get("admins")
-        self.super_admins = parse_id_list(raw_super_admins)
+        self.super_admins = set(runtime.super_admins)
         self.role_tools = runtime.role_tools
         self._processing_reaction_enabled = runtime.processing_reaction_enabled
         self._processing_reaction_emoji_id = runtime.processing_reaction_emoji_id
@@ -244,6 +238,8 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._llm_trigger_semaphore: asyncio.Semaphore | None = None
         self._llm_trigger_loop: asyncio.AbstractEventLoop | None = None
         self._llm_trigger_route_logged = False
+        self._channel_prompt_supported: bool | None = None
+        self._summary_fallback_audited = False
 
         self._api = OneBotHttpApi(
             base_url=http_api,
@@ -387,6 +383,8 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._llm_trigger_semaphore = None
         self._llm_trigger_loop = None
         self._llm_trigger_route_logged = False
+        self._channel_prompt_supported = None
+        self._summary_fallback_audited = False
         self._fenced_leases.clear()
         self._unknown_leases.clear()
         self._outbound_started.clear()
@@ -422,6 +420,29 @@ class OneBot11Adapter(BasePlatformAdapter):
 
     async def _on_ws_event(self, raw: dict) -> None:
         """归一化事件、执行入队前授权并路由到 DM/群 dispatch。"""
+        raw_self_id = raw.get("self_id") if isinstance(raw, Mapping) else None
+        if (
+            raw_self_id is not None
+            and str(raw_self_id).strip() != self.self_id
+        ):
+            self._audit.record(
+                "access_denied",
+                {
+                    "reason": "OneBot raw self_id mismatch",
+                    "expected_self_id": self.self_id,
+                    "received_self_id": str(raw_self_id)[:64],
+                },
+            )
+            return
+        if (
+            raw_self_id is None
+            and isinstance(raw, Mapping)
+            and str(raw.get("post_type") or "") == "message"
+        ):
+            self._audit.record(
+                "diagnostic",
+                {"reason": "OneBot raw self_id missing; compatibility path accepted"},
+            )
         auxiliary = normalize_auxiliary_event(raw)
         if auxiliary is not None:
             self._aux_event_count += 1
@@ -585,6 +606,18 @@ class OneBot11Adapter(BasePlatformAdapter):
     def _new_media_dir(self) -> str:
         """为一个 turn 创建受控媒体目录，便于完成后精确回收。"""
         return tempfile.mkdtemp(prefix=self._media_prefix, dir=str(self._media_root))
+
+    def _supports_channel_prompt(self) -> bool:
+        """检测当前 Hermes 的 MessageEvent 是否支持临时 channel_prompt。"""
+        if self._channel_prompt_supported is not None:
+            return self._channel_prompt_supported
+        try:
+            self._channel_prompt_supported = "channel_prompt" in inspect.signature(
+                MessageEvent
+            ).parameters
+        except (TypeError, ValueError):
+            self._channel_prompt_supported = False
+        return self._channel_prompt_supported
 
     def _trigger_state_for(self, chat_id: str) -> LayeredTriggerState:
         """获取一个群的内存触发状态；重启后首次访问从 idle 开始。"""
@@ -1091,6 +1124,7 @@ class OneBot11Adapter(BasePlatformAdapter):
             "llm",
             latest.user_id,
             latest.user_name,
+            str(latest.message_key),
         )
         if request_id:
             self._last_trigger_at[normalized] = time.monotonic()
@@ -1120,12 +1154,15 @@ class OneBot11Adapter(BasePlatformAdapter):
             if int(status.get("pending_trigger_requests", 0)) > 0:
                 has_request = True
             else:
+                messages = await asyncio.to_thread(self._queue.peek, normalized)
+                latest = messages[-1] if messages else None
                 request_id = await asyncio.to_thread(
                     self._queue.create_trigger,
                     normalized,
                     "admin_flush",
                     caller_user_id,
                     caller_user_name,
+                    str(latest.message_key) if latest is not None else None,
                 )
                 has_request = request_id is not None
         if cancel_judgement:
@@ -1222,6 +1259,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                             "restore",
                             message.user_id,
                             message.user_name,
+                            str(message.message_key),
                         )
                         should_notify = bool(request_id)
                         if should_notify:
@@ -1569,12 +1607,36 @@ class OneBot11Adapter(BasePlatformAdapter):
                 raise PermissionError("OneBot11 queue lease 在媒体处理期间失效")
             if lease.messages:
                 reply_id = lease.messages[-1].message_id
-            lines_text = build_agent_context(
+            context_parts = build_agent_context_parts(
                 lease.summary,
                 lease.messages,
                 self._agent_input_bytes,
                 self._agent_recent_originals,
             )
+            lines_text = context_parts.batch_text
+            summary_prompt = context_parts.summary_prompt
+            summary_mode = "none"
+            if summary_prompt and self._supports_channel_prompt():
+                summary_mode = "channel_prompt"
+            elif summary_prompt:
+                # 老 Hermes 没有临时 prompt 字段时才退回单条 user message；
+                # 该差异必须可观察，不能静默把摘要再次写进 transcript。
+                lines_text = build_agent_context(
+                    lease.summary,
+                    lease.messages,
+                    self._agent_input_bytes,
+                    self._agent_recent_originals,
+                )
+                summary_mode = "text_fallback"
+                if not self._summary_fallback_audited:
+                    self._audit.record(
+                        "summary_prompt_degraded",
+                        {
+                            "reason": "Hermes MessageEvent 不支持 channel_prompt",
+                            "mode": "bounded_text_fallback",
+                        },
+                    )
+                    self._summary_fallback_audited = True
             source = self.build_source(
                 chat_id=lease.chat_id,
                 chat_name=lease.chat_id,
@@ -1584,15 +1646,15 @@ class OneBot11Adapter(BasePlatformAdapter):
                 message_id=reply_id,
                 role_authorized=True,
             )
-            event = MessageEvent(
-                text=lines_text,
-                message_type=MessageType.TEXT,
-                source=source,
-                message_id=reply_id,
-                media_urls=media_paths,
-                media_types=["photo"] * len(media_paths),
-                reply_to_message_id=reply_id,
-                metadata={
+            event_kwargs: dict[str, Any] = {
+                "text": lines_text,
+                "message_type": MessageType.TEXT,
+                "source": source,
+                "message_id": reply_id,
+                "media_urls": media_paths,
+                "media_types": ["photo"] * len(media_paths),
+                "reply_to_message_id": reply_id,
+                "metadata": {
                     "onebot11_queue_turn": True,
                     "onebot11_lease_id": lease.lease_id,
                     "onebot11_lease_revision": lease.revision,
@@ -1601,10 +1663,37 @@ class OneBot11Adapter(BasePlatformAdapter):
                     "onebot11_media_dir": media_dir if has_images else None,
                     "onebot11_media_paths": list(media_paths),
                     "onebot11_media_limited": media_limited,
+                    "onebot11_summary_mode": summary_mode,
                     "onebot11_defer_completion": True,
                     "onebot11_managed_context": True,
                 },
-            )
+            }
+            if summary_prompt and summary_mode == "channel_prompt":
+                event_kwargs["channel_prompt"] = summary_prompt
+            try:
+                event = MessageEvent(**event_kwargs)
+            except TypeError:
+                if "channel_prompt" not in event_kwargs:
+                    raise
+                # 兼容签名检测不完整的旧 Hermes，显式降级一次。
+                event_kwargs.pop("channel_prompt", None)
+                event_kwargs["text"] = build_agent_context(
+                    lease.summary,
+                    lease.messages,
+                    self._agent_input_bytes,
+                    self._agent_recent_originals,
+                )
+                event_kwargs["metadata"]["onebot11_summary_mode"] = "text_fallback"
+                if not self._summary_fallback_audited:
+                    self._audit.record(
+                        "summary_prompt_degraded",
+                        {
+                            "reason": "Hermes MessageEvent 构造不接受 channel_prompt",
+                            "mode": "bounded_text_fallback",
+                        },
+                    )
+                    self._summary_fallback_audited = True
+                event = MessageEvent(**event_kwargs)
             try:
                 from gateway.session import build_session_key
 
@@ -1901,7 +1990,26 @@ class OneBot11Adapter(BasePlatformAdapter):
                 lease_id,
                 exc_info=True,
             )
+            self._audit.record(
+                "completion_state_error",
+                {
+                    "lease_id": lease_id,
+                    "chat_id": chat_id,
+                    "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                },
+            )
         finally:
+            if completion_error is not None or post_completion_error is not None:
+                try:
+                    if chat_id and await self._ensure_completion_recovery_trigger(chat_id):
+                        if not self._closed:
+                            await self._dispatcher.notify(chat_id)
+                except Exception:
+                    logger.warning(
+                        "OneBot11 completion recovery trigger 创建失败: %s",
+                        chat_id,
+                        exc_info=True,
+                    )
             self._unknown_leases.discard(lease_id)
             self._outbound_started.discard(lease_id)
             self._outbound_successful.discard(lease_id)
@@ -1914,10 +2022,43 @@ class OneBot11Adapter(BasePlatformAdapter):
                 metadata.get("onebot11_media_paths"),
                 media_dir=metadata.get("onebot11_media_dir"),
             )
-            if completion_error is not None:
-                raise completion_error
-            if post_completion_error is not None:
-                raise post_completion_error
+            # queue completion 或 engaged 状态恢复失败不能在 QQ 回复之后再
+            # 冒泡成第二个 Hermes 用户错误；持久队列/恢复轮询接管后续处理。
+
+    async def _ensure_completion_recovery_trigger(self, chat_id: str) -> bool:
+        """为状态收口失败后仍应自动处理的 pending 消息补 durable trigger。"""
+        normalized = str(chat_id)
+        if not self._chat_access_allowed("group", normalized):
+            return False
+        status = await asyncio.to_thread(self._queue.status, normalized)
+        if int(status.get("pending_trigger_requests", 0)) > 0:
+            return True
+        # completion 之后新到的普通消息通常 failure_count=0；状态恢复失败
+        # 也不能让它们留下 pending=1、trigger=0 的永久静默状态。
+        if int(status.get("pending", 0)) <= 0:
+            return False
+        messages = await asyncio.to_thread(self._queue.peek, normalized)
+        if not messages:
+            return False
+        latest = messages[-1]
+        request_id = await asyncio.to_thread(
+            self._queue.create_trigger,
+            normalized,
+            "completion_recovery",
+            latest.user_id,
+            latest.user_name,
+            str(latest.message_key),
+        )
+        if request_id:
+            self._audit.record(
+                "completion_recovery_trigger",
+                {
+                    "chat_id": normalized,
+                    "pending": int(status.get("pending", 0)),
+                    "reason": "queue completion/state recovery",
+                },
+            )
+        return request_id is not None
 
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """包装 Hermes background task，确保错误通知发送后才推进下一轮。"""
@@ -2206,6 +2347,11 @@ class OneBot11Adapter(BasePlatformAdapter):
                 binding = None
             if binding is None:
                 return json.dumps({"status": "permission_error", "error": "当前 turn 身份绑定不存在"}, ensure_ascii=False)
+            if self._closed:
+                return json.dumps(
+                    {"status": "permission_error", "error": "OneBot11 adapter 已关闭"},
+                    ensure_ascii=False,
+                )
             if binding.lease_id and not self._lease_is_current(binding.lease_id):
                 self._audit.record(
                     "permission_denied",
@@ -2796,6 +2942,8 @@ def _pre_tool_call_hook(tool_name: str = "", session_id: str = "", turn_id: str 
     adapter = _get_live_adapter()
     if adapter is None:
         return {"action": "block", "message": "OneBot11 adapter unavailable"}
+    if getattr(adapter, "_closed", True):
+        return {"action": "block", "message": "OneBot11 adapter 已关闭"}
     if tool_name not in ALL_TOOLS:
         return {"action": "block", "message": "权限错误: 未知 OneBot11 工具"}
     binding = adapter._resolve_binding(session_id, turn_id)

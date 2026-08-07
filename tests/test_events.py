@@ -45,6 +45,33 @@ def test_群聊消息事件():
     assert event.user_name == "群昵称"
 
 
+def test_raw_self_id不匹配时拒绝():
+    """多 bot 共用事件通道时，不能接收其他 bot 的消息。"""
+    raw = {
+        "post_type": "message",
+        "self_id": "999",
+        "message_type": "group",
+        "message_id": 2002,
+        "group_id": 88888888,
+        "user_id": 123456789,
+        "message": [{"type": "text", "data": {"text": "不属于当前 bot"}}],
+    }
+    assert build_inbound_event(raw, self_id="3101482118") is None
+
+
+def test_raw_self_id缺失仍兼容旧事件():
+    """旧 OneBot 框架不带 self_id 时保留兼容路径。"""
+    raw = {
+        "post_type": "message",
+        "message_type": "group",
+        "message_id": 2002,
+        "group_id": 88888888,
+        "user_id": 123456789,
+        "message": [{"type": "text", "data": {"text": "兼容"}}],
+    }
+    assert build_inbound_event(raw, self_id="3101482118") is not None
+
+
 def test_群聊无card用nickname():
     raw = {
         "post_type": "message",

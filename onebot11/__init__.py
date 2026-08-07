@@ -15,7 +15,7 @@ from . import (
     triggers,
     ws_server,
 )
-from .context import build_agent_context
+from .context import AgentContextParts, build_agent_context, build_agent_context_parts
 from .dispatch import ActiveTurn, GroupDispatcher
 from .message import ParsedMessage, parse_message_segments
 from .permissions import CallerContext, ChatTarget, TurnBinding, TurnBindingStore
@@ -57,4 +57,6 @@ __all__ = [
     "ActiveTurn",
     "GroupDispatcher",
     "build_agent_context",
+    "build_agent_context_parts",
+    "AgentContextParts",
 ]
