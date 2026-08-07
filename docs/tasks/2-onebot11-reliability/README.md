@@ -1,7 +1,7 @@
 # OneBot 11 可靠性与安全完善
 
 - 关联需求：OneBot 11 插件整体完善计划
-- 状态：代码和本地验证完成；PR #8 等待 CI/审查；Arch + LLBot 已加载 0.3.1 并完成指定白名单、pending/flush、同实例 reconnect smoke 和 reaction 联调，真人并发、确认写操作和 unknown 出站仍是外部验收项
+- 状态：代码和本地验证完成；PR #8 CI 已通过、等待审查；Arch + LLBot 已加载 0.3.1 并完成指定白名单、pending/flush、同实例 reconnect smoke 和 reaction 联调，真人并发、确认写操作和 unknown 出站仍是外部验收项
 - 开始日期：2026-08-05
 
 ## 目标

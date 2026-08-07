@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- **阶段**：OneBot 11 可靠性、安全和分层触发已完成代码闭环；PR #8 已存在，插件本地门禁和 Arch 指定白名单复验通过，等待 CI 基础设施恢复并完成剩余真实 QQ 验收。
+- **阶段**：OneBot 11 可靠性、安全和分层触发已完成代码闭环；PR #8 的 CI、本地门禁和 Arch 指定白名单复验均通过，仍等待代码审查和剩余真实 QQ 验收。
 - **核心合同**：群固定一个共享 session；群消息持久入队；触发后按 lease 启动单群单 turn；非幂等出站结果未知时进入 `uncertain`，不自动重放。
 - **本地验证**：协议/状态机测试通过；使用本地 Hermes 源码与其 site-packages 运行 adapter 测试通过。最终门禁命令和环境见“验证证据”。
 
@@ -30,7 +30,7 @@
 - 使用 `scripts\\verify_hermes_integration.ps1` 和本地 Hermes 源码/site-packages：全套测试 `177 passed`；覆盖 adapter hooks、工具注册、共享队列、身份绑定、shared session key、同实例 reconnect、配置合同、operation resolve、媒体清理、出站 unknown、严格 auxiliary 参数、触发竞争和 reaction 生命周期。
 - 严格 auxiliary 回归测试：`3 passed`；确认 `fallback_policy="none"`、`max_attempts=1` 和旧 API 安全降级。
 - `.venv\\Scripts\\python.exe -m ruff check .`：通过。
-- `pip install -e ".[dev]"`：在本地干净安装路径验证通过；Linux CI 失败过一次，原因是 GitHub Actions 准备 action 时返回 `Service Unavailable`，不是安装或测试错误，已重新排队。
+- `pip install -e ".[dev]"`：在本地干净安装路径验证通过；PR #8 的 Linux CI 初次因 GitHub Actions `Service Unavailable` 失败，重新运行后已通过。
 - 真实 Hermes 临时 `HERMES_HOME` 注册 smoke：已确认平台、9 个工具、4 个安全 hooks 和 `onebot11_trigger` auxiliary 均注册，并验证 shared session 合同、严格旁路配置和同实例 reconnect。
 
 ## 外部联调状态
