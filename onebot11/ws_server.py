@@ -98,19 +98,21 @@ class ReverseWsServer:
     def _event_key(self, raw: dict) -> str:
         """构造消息事件内存去重键。"""
         message_id = raw.get("message_id")
+        self_id = raw.get("self_id") or ""
         if message_id not in (None, ""):
             chat_id = raw.get("group_id") or raw.get("user_id") or ""
-            return f"{raw.get('message_type', '')}:{chat_id}:{message_id}"
+            return f"{self_id}:{raw.get('message_type', '')}:{chat_id}:{message_id}"
         encoded = json.dumps(raw, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
         return "hash:" + hashlib.sha256(encoded).hexdigest()
 
     def _chat_key(self, raw: dict) -> str:
         """按消息目标划分顺序 lane，避免同号群和私聊互相串线。"""
+        self_id = raw.get("self_id") or ""
         if raw.get("group_id") not in (None, ""):
-            return f"group:{raw.get('group_id')}"
+            return f"{self_id}:group:{raw.get('group_id')}"
         if raw.get("user_id") not in (None, ""):
-            return f"dm:{raw.get('user_id')}"
-        return "event:global"
+            return f"{self_id}:dm:{raw.get('user_id')}"
+        return f"{self_id}:event:global"
 
     async def _admit(self, raw: dict, on_failure: OnEventFailure | None = None) -> bool:
         """在进入有界队列前完成轻量去重和背压检查。"""

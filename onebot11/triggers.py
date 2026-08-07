@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from time import monotonic
@@ -126,6 +127,8 @@ class LayeredTriggerState:
                 return self._schedule("engaged", revision, now)
 
         if self.mode == "waiting":
+            if self.arbitration_count >= self.config.engaged_max_arbitrations:
+                return TriggerAction("none", reason="arbitration_limit")
             return self._schedule("wait_followup", revision, now)
 
         if self.mode == "debounce":
@@ -467,6 +470,10 @@ QUESTION_WORDS = (
     "请问",
     "帮我",
 )
+ENGLISH_QUESTION_RE = re.compile(
+    r"\b(?:who|what|when|where|why|how|can|could|would|should|do|does|did|is|are|will)\b",
+    re.IGNORECASE,
+)
 
 
 def is_question(text: str) -> bool:
@@ -476,6 +483,7 @@ def is_question(text: str) -> bool:
         "?" in normalized
         or "？" in normalized
         or any(word in normalized for word in QUESTION_WORDS)
+        or ENGLISH_QUESTION_RE.search(normalized)
     )
 
 
@@ -510,7 +518,11 @@ def build_trigger_config(extra: dict[str, Any]) -> TriggerConfig:
         name="trigger_cooldown_seconds",
         minimum=0.0,
     )
-    raw_llm = extra.get("llm_trigger") or extra.get("trigger_llm") or {}
+    raw_llm = extra.get("llm_trigger")
+    if raw_llm is None:
+        raw_llm = extra.get("trigger_llm")
+    if raw_llm is None:
+        raw_llm = {}
     if not isinstance(raw_llm, Mapping):
         raise ValueError("llm_trigger 必须是 YAML mapping")
     llm_enabled = parse_bool(
@@ -518,8 +530,28 @@ def build_trigger_config(extra: dict[str, Any]) -> TriggerConfig:
         default=False,
         name="llm_trigger_enabled",
     )
-    provider = str(_setting(extra, raw_llm, "llm_trigger_provider", raw_llm.get("provider", "")) or "").strip()
-    model = str(_setting(extra, raw_llm, "llm_trigger_model", raw_llm.get("model", "")) or "").strip()
+    raw_provider = _setting(
+        extra,
+        raw_llm,
+        "llm_trigger_provider",
+        raw_llm.get("provider", ""),
+    )
+    raw_model = _setting(
+        extra,
+        raw_llm,
+        "llm_trigger_model",
+        raw_llm.get("model", ""),
+    )
+    if raw_provider is None:
+        raw_provider = ""
+    if raw_model is None:
+        raw_model = ""
+    if not isinstance(raw_provider, str) or not isinstance(raw_model, str):
+        raise ValueError("llm_trigger provider/model 必须是字符串")
+    provider = raw_provider.strip()
+    model = raw_model.strip()
+    if llm_enabled and (not provider or not model):
+        raise ValueError("启用 LLM trigger 时必须配置 provider 和 model")
     allowed_groups = _parse_group_ids(
         _setting(extra, raw_llm, "llm_trigger_groups", raw_llm.get("groups"))
     )
@@ -649,20 +681,16 @@ def build_llm_trigger_input(
         for message in queued[:-1]
     )
 
-    # 最新消息是触发判断的最低必要输入。预算极小时也先保住它，
-    # 不能像普通前缀一样被整体截掉。
+    # 配置下限足以容纳完整 JSON 合同时，优先保留合同，再裁剪最新消息
+    # 正文；只有调用方传入小于合同本身的测试预算时才退化为最新消息。
     latest_bytes = byte_len(latest_line)
-    if latest_bytes >= max_bytes:
-        return truncate(latest_line, max_bytes)
-    lead_budget = max_bytes - latest_bytes
-
     prefix_bytes = byte_len(queue_prefix)
-    if prefix_bytes > lead_budget:
-        # 留一个换行把受限提示词与最新消息分开；若连一个字节也
-        # 不足，则直接返回最新消息（上面的分支已保证它能放下）。
-        if lead_budget <= 1:
-            return "\n" * lead_budget + latest_line
-        return truncate(queue_prefix, lead_budget - 1) + "\n" + latest_line
+    if prefix_bytes >= max_bytes:
+        return truncate(latest_line, max_bytes)
+    latest_budget = max_bytes - prefix_bytes
+    if latest_bytes > latest_budget:
+        return queue_prefix + truncate(latest_line, latest_budget)
+    lead_budget = max_bytes - latest_bytes
 
     available = lead_budget - prefix_bytes
     selected_newest_first: list[str] = []

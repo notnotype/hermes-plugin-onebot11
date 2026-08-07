@@ -1,7 +1,7 @@
 name: onebot11-platform
 label: OneBot 11 (QQ)
 kind: platform
-version: 0.3.2
+version: 0.3.3
 description: >
   OneBot 11 (QQ) gateway adapter for Hermes Agent.
   Reverse WebSocket + HTTP API. Shared group sessions, durable queued context,
@@ -65,4 +65,8 @@ optional_env:
   - name: ONEBOT11_HOME_CHANNEL
     description: "定时任务默认投递目标（群号或 QQ 号；必须额外配置 extra.home_channel_type=group|dm）"
     prompt: "默认投递目标"
+    password: false
+  - name: ONEBOT11_HOME_CHANNEL_TYPE
+    description: "定时任务目标类型；必须是 group 或 dm，不能根据 QQ 号形状猜测"
+    prompt: "默认投递目标类型"
     password: false

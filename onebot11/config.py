@@ -73,6 +73,7 @@ class RuntimeConfig:
     media_orphan_ttl_seconds: float
     ws_max_queue: int
     ws_max_inflight: int
+    home_channel: str | None
     home_channel_type: str | None
 
 
@@ -129,6 +130,7 @@ def effective_extra(
         "MEDIA_ORPHAN_TTL_SECONDS": "media_orphan_ttl_seconds",
         "WS_MAX_QUEUE": "ws_max_queue",
         "WS_MAX_INFLIGHT": "ws_max_inflight",
+        "HOME_CHANNEL": "home_channel",
     }
     for suffix, field in fields.items():
         name = f"ONEBOT11_{suffix}"
@@ -275,6 +277,12 @@ def parse_runtime_config(
         home_channel_type = home_channel_type.casefold()
         if home_channel_type not in {"group", "dm"}:
             raise ValueError("home_channel_type 必须是 group 或 dm")
+    home_channel = _optional_string(
+        effective.get("home_channel"),
+        name="home_channel",
+    )
+    if home_channel is not None and home_channel_type is None:
+        raise ValueError("配置 home_channel 时必须同时配置 home_channel_type=group|dm")
 
     access_policy = build_access_policy(effective, env)
     raw_admins = effective.get("super_admins")
@@ -506,5 +514,6 @@ def parse_runtime_config(
             minimum=1,
             maximum=10_000,
         ),
+        home_channel=home_channel,
         home_channel_type=home_channel_type,
     )
