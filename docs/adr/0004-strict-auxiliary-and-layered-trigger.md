@@ -19,7 +19,9 @@ max_attempts=1
 旁路模型只负责输出严格三态：
 
 ```json
-{"decision":"trigger|wait|ignore","wait_seconds":5}
+{"decision":"trigger","wait_seconds":0}
+{"decision":"wait","wait_seconds":5}
+{"decision":"ignore","wait_seconds":0}
 ```
 
 `wait_seconds` 只允许 `5/10/30/60`，其他值、非法 JSON、超时和模型错误都按“不触发”处理。

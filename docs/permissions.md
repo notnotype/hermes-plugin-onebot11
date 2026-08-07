@@ -57,7 +57,7 @@ platforms:
 
 ## 队列与不确定结果
 
-群队列是持久 SQLite 状态机：
+群队列是持久 SQLite 状态机；同一群始终只保留一个 pending trigger。旧 lease 在失败、恢复或断开结算时如果遇到后来创建的 pending trigger，会合并旧请求，不因唯一索引冲突而卡住；曾经被认领但仍 pending 的消息保留恢复入口。
 
 ```text
 pending -> leased(agent_running) -> acked/deleted
@@ -88,7 +88,9 @@ failed --管理员 discard--> deleted
 - 空闲状态只把问句或带有“之前/上次/刚才/继续”等回指词、且当前群已有摘要或最近原文的消息送入候选。
 - 候选消息使用 5 秒 trailing debounce；每群最多一个判断任务，冷却期间不创建判断。
 - 旁路模型必须显式配置 provider、model 和群 allowlist，并且 Hermes auxiliary API 必须支持 `fallback_policy`、`max_attempts`。插件固定使用 `fallback_policy=none`、`max_attempts=1`；旧 API 会安全跳过，绝不调用主 Agent 作为隐式 fallback。
-- 模型只能返回 `{"decision":"trigger|wait|ignore","wait_seconds":5}`。`wait_seconds` 只能为 `5/10/30/60`；非法 JSON、超时、模型错误均按 `ignore`，消息留在 pending，不创建 lease。
+- 模型只能返回 `{"decision":"trigger|wait|ignore","wait_seconds":0}`。`wait` 的 `wait_seconds` 只能为 `5/10/30/60`，`trigger` 和 `ignore` 必须为 `0`；非法 JSON、超时、模型错误均按 `ignore`，消息留在 pending，不创建 lease。
 - 成功 turn 后进入最多 60 秒 idle 活跃窗口，最长连续活跃时间 300 秒，最多 3 次 LLM 仲裁；重启后 active/engaged 状态回到 idle，只恢复 SQLite 消息和显式 durable trigger。
+
+群历史摘要通过 Hermes 支持的 `channel_prompt` 临时注入，当前批次才写入普通 user transcript；摘要被标记为“不可信群消息数据”，其中的指令不能覆盖系统规则。旧 Hermes 没有该字段时退回有界单文本模式，并写入审计。
 
 这些规则只决定“是否启动一轮 Agent”，不改变角色权限。实际工具调用仍必须通过当前 `(session_id, turn_id)` binding、访问策略和 lease fencing。
