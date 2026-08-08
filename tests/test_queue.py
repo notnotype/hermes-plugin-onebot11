@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from onebot11.queue import QueueError, QueueMessage, QueueStore, TriggerRequest
+from onebot11.queue import QueueBusy, QueueError, QueueMessage, QueueStore, TriggerRequest
 
 
 def _message(message_id: str, *, chat_id: str = "888", text: str = "消息") -> QueueMessage:
@@ -33,21 +33,191 @@ def _trigger(message: QueueMessage, reason: str = "mention") -> TriggerRequest:
     )
 
 
-def test_一个lease覆盖并确认整批trigger(tmp_path):
-    """同一批消息的多个 trigger 必须随 lease 一起完成。"""
+def _replace_reaction_table_with_v8(
+    store: QueueStore,
+    *,
+    lease_id: str,
+    state: str,
+    created_at: float,
+    updated_at: float,
+    attempts: int,
+    next_attempt_at: float | None,
+    last_error: str | None,
+) -> None:
+    """把测试数据库中的 reaction 表精确还原为 schema v8。"""
+    store._conn.execute("DROP INDEX IF EXISTS idx_onebot_queue_reaction_cleanup")
+    store._conn.execute("DROP TABLE onebot_queue_reaction")
+    store._conn.execute(
+        """
+        CREATE TABLE onebot_queue_reaction (
+            lease_id TEXT PRIMARY KEY,
+            chat_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('pending','maybe_set')),
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at REAL,
+            last_error TEXT
+        )
+        """
+    )
+    store._conn.execute(
+        """
+        CREATE INDEX idx_onebot_queue_reaction_cleanup
+        ON onebot_queue_reaction(state, next_attempt_at, updated_at)
+        """
+    )
+    store._conn.execute(
+        """
+        INSERT INTO onebot_queue_reaction(
+            lease_id,chat_id,message_id,state,created_at,updated_at,
+            attempts,next_attempt_at,last_error
+        ) VALUES (?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            lease_id,
+            "888",
+            "reaction-message",
+            state,
+            created_at,
+            updated_at,
+            attempts,
+            next_attempt_at,
+            last_error,
+        ),
+    )
+    store._conn.commit()
+
+
+def test_每个锚点独立认领消息范围(tmp_path):
+    """两个用户的精确触发必须形成两个独立 lease 和权限边界。"""
     store = QueueStore(tmp_path / "queue.sqlite3")
     for message_id in ("1", "2", "3"):
         message = _message(message_id)
         store.enqueue(message, _trigger(message))
 
-    lease = store.claim("888")
-    assert lease is not None
-    assert [message.message_id for message in lease.messages] == ["1", "2", "3"]
-    assert store.status("888")["trigger_requests"] == 0
-    assert store.ack(lease)
-    assert store.status("888")["trigger_requests"] == 0
+    first = store.claim("888")
+    assert first is not None
+    assert [message.message_id for message in first.messages] == ["1"]
+    assert first.trigger.anchor_seq == 1
+    assert store.status("888")["pending_trigger_requests"] == 2
+    assert store.ack(first)
+
+    second = store.claim("888")
+    assert second is not None
+    assert [message.message_id for message in second.messages] == ["2"]
+    assert second.trigger.anchor_seq == 2
+    assert store.ack(second)
+
+    third = store.claim("888")
+    assert third is not None
+    assert [message.message_id for message in third.messages] == ["3"]
+    assert third.trigger.anchor_seq == 3
+    assert store.ack(third)
     assert store.peek("888") == ()
     assert store.recover_trigger_requests() == ()
+    store.close()
+
+
+def test_普通消息只归入下一个锚点且后续消息不越界(tmp_path):
+    """anchor batch 只覆盖上个完成边界到当前 anchor，不吞掉未来消息。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    ordinary = _message("1", text="普通上下文")
+    anchor_a = _message("2", text="A 的请求")
+    between = _message("3", text="后续上下文")
+    anchor_b = _message("4", text="B 的请求")
+    future = _message("5", text="未来消息")
+    store.enqueue(ordinary)
+    store.enqueue(anchor_a, _trigger(anchor_a))
+    store.enqueue(between)
+    store.enqueue(anchor_b, _trigger(anchor_b))
+    store.enqueue(future)
+
+    first = store.claim("888")
+    assert first is not None
+    assert [message.message_id for message in first.messages] == ["1", "2"]
+    assert store.ack(first)
+
+    second = store.claim("888")
+    assert second is not None
+    assert [message.message_id for message in second.messages] == ["3", "4"]
+    assert store.ack(second)
+    assert [message.message_id for message in store.peek("888")] == ["5"]
+    store.close()
+
+
+def test_blocking锚点阻止后续锚点越过(tmp_path):
+    """最早 anchor 进入 uncertain 后，后续 anchor 不能执行。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    for message_id in ("1", "2"):
+        message = _message(message_id)
+        store.enqueue(message, _trigger(message))
+    first = store.claim("888")
+    assert first is not None
+    assert store.mark_uncertain(first, "出站未知")
+    assert store.claim("888") is None
+    assert store.status("888")["blocked_trigger_requests"] == 1
+    store.close()
+
+
+def test_retry只恢复最早锚点原消息范围(tmp_path):
+    """管理员 retry 不得把后来的 pending 消息扩大进旧 anchor。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    first_message = _message("1")
+    second_message = _message("2")
+    store.enqueue(first_message, _trigger(first_message))
+    lease = store.claim("888")
+    assert lease is not None
+    assert store.mark_uncertain(lease, "未知")
+    store.enqueue(second_message, _trigger(second_message))
+
+    assert store.resolve_uncertain("888", "retry") == 1
+    retried = store.claim("888")
+    assert retried is not None
+    assert retried.trigger.request_id == lease.trigger.request_id
+    assert [message.message_id for message in retried.messages] == ["1"]
+    store.close()
+
+
+def test_自动锚点窗口不重新选择已有更晚精确锚点之前的消息(tmp_path):
+    """精确锚点已排队时，自动选择器不能再插入其前方并改写执行顺序。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    ordinary = _message("1", text="更早的群聊上下文")
+    explicit = _message("2", text="@bot 明确任务")
+    later = _message("3", text="之后的新请求？")
+    store.enqueue(ordinary)
+    explicit_result = store.enqueue(explicit, _trigger(explicit))
+    store.enqueue(later)
+
+    assert explicit_result.trigger_request_id is not None
+    assert [message.message_id for message in store.peek_unanchored("888")] == ["3"]
+    assert store.create_message_anchor("888", 3, "automatic") is not None
+    assert [anchor.anchor_seq for anchor in store.list_anchors("888")] == [2, 3]
+    store.close()
+
+
+def test_operator_anchor固定命令时边界和管理员authority(tmp_path):
+    """flush 只覆盖命令前未锚定消息，后来消息留给下一 anchor。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    store.enqueue(_message("1"))
+    anchor_id = store.create_operator_anchor(
+        "888",
+        "admin_flush",
+        "999",
+        "管理员",
+        control_message_id="9000",
+    )
+    assert anchor_id is not None
+    store.enqueue(_message("2"))
+    lease = store.claim("888")
+    assert lease is not None
+    assert [message.message_id for message in lease.messages] == ["1"]
+    assert lease.anchor.anchor_kind == "operator"
+    assert lease.anchor.caller_user_id == "999"
+    assert lease.anchor.control_message_id == "9000"
+    assert store.ack(lease)
+    assert [message.message_id for message in store.peek_unanchored("888")] == ["2"]
     store.close()
 
 
@@ -227,8 +397,8 @@ def test_旧schema活动lease迁移为uncertain(tmp_path):
     migrated.close()
 
 
-def test_v5活动lease升级到v6不被误标记为unknown(tmp_path, monkeypatch):
-    """已有 phase marker 的 v5 文件升级时应保留可恢复的活动 lease。"""
+def test_v5旧batch升级到v9进入legacy_hold(tmp_path, monkeypatch):
+    """旧 batch 无法重建单锚点权限时必须保守 hold，不能自动续跑。"""
     now = [1000.0]
     monkeypatch.setattr("onebot11.queue.time.time", lambda: now[0])
     path = tmp_path / "queue.sqlite3"
@@ -244,8 +414,216 @@ def test_v5活动lease升级到v6不被误标记为unknown(tmp_path, monkeypatch
     connection.close()
 
     migrated = QueueStore(path)
-    assert migrated.status("888")["leased"] == 1
-    assert migrated.status("888")["uncertain"] == 0
+    assert migrated.status("888")["leased"] == 0
+    assert migrated.status("888")["uncertain"] == 1
+    assert migrated.status("888")["blocked_trigger_requests"] == 1
+    migrated.close()
+
+
+def test_v8迁移只隔离阻塞消息并保留后续精确锚点(tmp_path):
+    """旧 blocked batch 不能把同群后来 pending 消息一起升级为 uncertain。"""
+    path = tmp_path / "queue.sqlite3"
+    store = QueueStore(path)
+    blocked_message = _message("blocked")
+    store.enqueue(blocked_message, _trigger(blocked_message))
+    assert store.claim("888", lease_seconds=60) is not None
+    store._conn.execute(
+        "UPDATE onebot_queue_message SET lease_until=0 WHERE message_key=?",
+        (blocked_message.message_key,),
+    )
+    store._conn.commit()
+    pending_message = _message("pending")
+    store.enqueue(pending_message, _trigger(pending_message))
+    store.close()
+
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA user_version=8")
+    connection.commit()
+    connection.close()
+
+    migrated = QueueStore(path)
+    status = migrated.status("888")
+    assert status["uncertain"] == 1
+    assert status["pending"] == 1
+    assert status["pending_trigger_requests"] == 1
+    assert any(anchor.anchor_kind == "legacy" for anchor in migrated.list_anchors("888"))
+    migrated.close()
+
+
+def test_v8有效lease拒绝迁移并保留旧reaction原状态(tmp_path):
+    """有效旧 lease 必须阻断升级，reaction 表和原状态随事务完整保留。"""
+    path = tmp_path / "queue.sqlite3"
+    store = QueueStore(path)
+    message = _message("active-v8")
+    store.enqueue(message, _trigger(message))
+    lease = store.claim("888", lease_seconds=3600)
+    assert lease is not None
+    _replace_reaction_table_with_v8(
+        store,
+        lease_id=lease.lease_id,
+        state="pending",
+        created_at=100.0,
+        updated_at=200.0,
+        attempts=1,
+        next_attempt_at=300.0,
+        last_error="旧记录仍等待清理",
+    )
+    store.close()
+
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA user_version=8")
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(QueueBusy, match="仍有效的 v8 lease"):
+        QueueStore(path)
+    connection = sqlite3.connect(path)
+    assert connection.execute("PRAGMA user_version").fetchone()[0] == 8
+    columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(onebot_queue_reaction)"
+        ).fetchall()
+    }
+    assert "reaction_kind" not in columns
+    assert connection.execute(
+        """
+        SELECT lease_id,chat_id,message_id,state,created_at,updated_at,
+               attempts,next_attempt_at,last_error
+        FROM onebot_queue_reaction
+        """
+    ).fetchone() == (
+        lease.lease_id,
+        "888",
+        "reaction-message",
+        "pending",
+        100.0,
+        200.0,
+        1,
+        300.0,
+        "旧记录仍等待清理",
+    )
+    connection.close()
+
+
+def test_v8过期lease的reaction迁移为legacy_processing且只恢复unset(
+    tmp_path,
+    monkeypatch,
+):
+    """过期旧 reaction 保留状态字段，只进入 legacy unset 恢复路径。"""
+    now = [1000.0]
+    monkeypatch.setattr("onebot11.queue.time.time", lambda: now[0])
+    path = tmp_path / "queue.sqlite3"
+    store = QueueStore(path)
+    message = _message("expired-v8")
+    store.enqueue(message, _trigger(message))
+    lease = store.claim("888", lease_seconds=5)
+    assert lease is not None
+    _replace_reaction_table_with_v8(
+        store,
+        lease_id=lease.lease_id,
+        state="maybe_set",
+        created_at=900.0,
+        updated_at=990.0,
+        attempts=2,
+        next_attempt_at=1005.0,
+        last_error="旧 unset 超时",
+    )
+    store.close()
+
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA user_version=8")
+    connection.commit()
+    connection.close()
+    now[0] = 1006.0
+
+    migrated = QueueStore(path)
+    legacy = migrated.reaction(
+        lease.lease_id,
+        reaction_kind="legacy_processing",
+    )
+    assert legacy is not None
+    assert legacy.anchor_id == f"legacy-reaction-{lease.lease_id}"
+    assert legacy.reaction_kind == "legacy_processing"
+    assert legacy.lease_id == lease.lease_id
+    assert legacy.chat_id == "888"
+    assert legacy.message_id == "reaction-message"
+    assert legacy.state == "maybe_set"
+    assert legacy.created_at == 900.0
+    assert legacy.updated_at == 990.0
+    assert legacy.attempts == 2
+    assert legacy.next_attempt_at == 1005.0
+    assert legacy.last_error == "旧 unset 超时"
+    assert legacy.emoji_id == ""
+
+    assert migrated.reaction(lease.lease_id, reaction_kind="queued") is None
+    assert migrated.reaction(lease.lease_id, reaction_kind="processing") is None
+    assert not migrated.mark_reaction_set(lease.lease_id)
+    assert migrated.pending_reaction_cleanups(now=now[0]) == (legacy,)
+    migrated.close()
+
+
+def test_v8_pending_llm锚点迁移为未锚定消息(tmp_path):
+    """旧 LLM trigger 没有可验证 authority，迁移时删除 trigger 但保留消息。"""
+    path = tmp_path / "queue.sqlite3"
+    store = QueueStore(path)
+    message = _message("old-llm")
+    store.enqueue(message, _trigger(message, reason="llm"))
+    store._conn.execute(
+        "UPDATE onebot_queue_message SET anchor_id=NULL WHERE message_key=?",
+        (message.message_key,),
+    )
+    store._conn.execute(
+        """
+        UPDATE onebot_queue_trigger
+        SET anchor_seq=NULL, anchor_kind='message'
+        WHERE message_key=?
+        """,
+        (message.message_key,),
+    )
+    store._conn.commit()
+    store.close()
+
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA user_version=8")
+    connection.commit()
+    connection.close()
+
+    migrated = QueueStore(path)
+    assert migrated.list_anchors("888") == ()
+    assert [item.message_id for item in migrated.peek_unanchored("888")] == ["old-llm"]
+    migrated.close()
+
+
+def test_v8孤儿trigger迁移为legacy_hold(tmp_path):
+    """找不到对应消息的旧 trigger 不能借用其他消息的 authority。"""
+    path = tmp_path / "queue.sqlite3"
+    store = QueueStore(path)
+    store.enqueue(_message("ordinary"))
+    now = time.time()
+    store._conn.execute(
+        """
+        INSERT INTO onebot_queue_trigger(
+            request_id,chat_id,message_key,reason,caller_user_id,caller_user_name,
+            status,anchor_seq,anchor_kind,created_at,updated_at
+        ) VALUES (?,?,?,?,?,?, 'pending', NULL, 'message', ?, ?)
+        """,
+        ("orphan", "888", "group:missing", "mention", "123", "小明", now, now),
+    )
+    store._conn.commit()
+    store.close()
+
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA user_version=8")
+    connection.commit()
+    connection.close()
+
+    migrated = QueueStore(path)
+    anchors = migrated.list_anchors("888")
+    assert len(anchors) == 1
+    assert anchors[0].anchor_kind == "legacy"
+    assert anchors[0].status == "uncertain"
+    assert migrated.status("888")["pending"] == 1
     migrated.close()
 
 
@@ -432,12 +810,12 @@ def test关闭等待已进入SQLite操作且关闭后拒绝新操作(tmp_path):
 
 
 def test_未知更高schema仍然拒绝启动(tmp_path):
-    """schema 9 及以上不能被当前插件猜测迁移。"""
+    """schema 10 及以上不能被当前插件猜测迁移。"""
     path = tmp_path / "queue.sqlite3"
     store = QueueStore(path)
     store.close()
     connection = sqlite3.connect(path)
-    connection.execute("PRAGMA user_version=9")
+    connection.execute("PRAGMA user_version=10")
     connection.commit()
     connection.close()
 
@@ -506,31 +884,6 @@ def test_队列保留调用方提供的原文(tmp_path):
     store.close()
 
 
-def test_cooldown到期只恢复标记过的触发候选(tmp_path):
-    """普通未触发消息不能被 cooldown 恢复误 dispatch。"""
-    store = QueueStore(tmp_path / "queue.sqlite3")
-    candidate = QueueMessage(
-        **{
-            **_message("candidate").__dict__,
-            "metadata": {"onebot11_cooldown_candidate": True},
-        }
-    )
-    ordinary = _message("ordinary")
-    store.enqueue(candidate)
-    store.enqueue(ordinary)
-    store._conn.execute(
-        "UPDATE onebot_queue_chat SET last_trigger_at=? WHERE chat_id=?",
-        (1000.0, "888"),
-    )
-    store._conn.commit()
-    assert store.recover_due_triggers(1004.0, cooldown_seconds=10) == ()
-    recovered = store.recover_due_triggers(1011.0, cooldown_seconds=10)
-    assert len(recovered) == 1
-    assert recovered[0].reason == "cooldown_recovery"
-    assert store.status("888")["pending_trigger_requests"] == 1
-    store.close()
-
-
 def test_reaction在活动lease期间不恢复_失效后可恢复(tmp_path, monkeypatch):
     """reaction 只保存可能已设置成功的状态，不重放 set。"""
     now = [1000.0]
@@ -549,4 +902,94 @@ def test_reaction在活动lease期间不恢复_失效后可恢复(tmp_path, monk
     assert len(pending) == 1
     assert pending[0].message_id == "123"
     assert store.delete_reaction(lease.lease_id)
+    store.close()
+
+
+def test_queued与processing_reaction按anchor独立保存(tmp_path, monkeypatch):
+    """⏳ 和 👀 共享 anchor，但清理状态互不覆盖且 set 不会被恢复重放。"""
+    now = [1000.0]
+    monkeypatch.setattr("onebot11.queue.time.time", lambda: now[0])
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    message = _message("two-reactions")
+    result = store.enqueue(message, _trigger(message))
+    assert result.trigger_request_id is not None
+    anchor_id = result.trigger_request_id
+    store.record_reaction(
+        "",
+        "888",
+        "1001",
+        anchor_id=anchor_id,
+        reaction_kind="queued",
+        emoji_id="hourglass",
+    )
+    assert store.mark_reaction_set(anchor_id, reaction_kind="queued")
+    assert store.pending_reaction_cleanups() == ()
+
+    lease = store.claim("888", lease_seconds=5)
+    assert lease is not None
+    store.record_reaction(
+        lease.lease_id,
+        "888",
+        "1001",
+        anchor_id=anchor_id,
+        reaction_kind="processing",
+        emoji_id="eyes",
+    )
+    assert store.mark_reaction_set(anchor_id, reaction_kind="processing")
+    assert store.delete_reaction(anchor_id, reaction_kind="queued")
+    assert store.reaction(anchor_id, reaction_kind="processing") is not None
+    assert store.mark_uncertain(lease, "unknown")
+    now[0] = 1006.0
+    cleanup = store.pending_reaction_cleanups()
+    assert [(item.anchor_id, item.reaction_kind) for item in cleanup] == [
+        (anchor_id, "processing")
+    ]
+    store.close()
+
+
+def test_status_for_lease聚合整个batch的出站marker(tmp_path):
+    """多消息 batch 不能只看第一条消息判断是否已开始出站。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    first = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1001",
+        user_id="123",
+        user_name="小明",
+        text="第一条",
+        message_key="group:1001",
+    )
+    second = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1002",
+        user_id="456",
+        user_name="小红",
+        text="第二条",
+        message_key="group:1002",
+    )
+    trigger = TriggerRequest.create("888", "group:1002", "mention", "456", "小红")
+    store.enqueue(first)
+    store.enqueue(second, trigger)
+    lease = store.claim("888")
+    assert lease is not None
+
+    # 模拟旧进程在多行 lease 上留下了部分阶段 marker。
+    with store._lock:
+        store._conn.execute(
+            """
+            UPDATE onebot_queue_message
+            SET lease_phase='outbound_started', outbound_started=1
+            WHERE lease_id=? AND message_key=?
+            """,
+            (lease.lease_id, "group:1002"),
+        )
+        store._conn.commit()
+
+    status = store.status_for_lease(lease.lease_id)
+    assert status["lease_phase"] == "outbound_started"
+    assert status["outbound_started"] is True
+    queue_status = store.status("888")
+    assert queue_status["lease_phase"] == "outbound_started"
+    assert queue_status["outbound_started"] is True
     store.close()

@@ -10,6 +10,7 @@
 
 - [2-onebot11-reliability](2-onebot11-reliability/README.md)：共享 session、持久队列、触发器、权限门禁和可靠出站
 - [4-onebot11-context-permissions](4-onebot11-context-permissions/README.md)：当前 batch 上下文物化、精确角色工具权限和群 slash command
+- [5-onebot11-turn-anchor](5-onebot11-turn-anchor/README.md)：每锚点独立 followup、不可变 authority、自动锚点选择和双阶段 reaction
 
 ## 历史任务
 

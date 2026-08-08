@@ -17,7 +17,7 @@
 
 本插件不增加原始 WS spool，因此持久化前的网络重连重放行为只作为实际框架的 best-effort 观察，不升级为 OneBot 11 协议保证，也不宣称输入 exactly-once。恢复调用在修改队列状态前重新套用当前 adapter 白名单，白名单收紧不会让旧群在后台继续恢复。
 
-确认写操作的令牌和 unknown 动作阻断记录属于 adapter 进程内存状态；重启会使令牌失效并清空阻断记录。持久化的是队列、lease 阶段和审计摘要，不把管理动作参数或 token 扩展成永久操作 tombstone。
+unknown 动作的同-turn 阻断记录属于 adapter 内存状态；重启后由持久 `uncertain` anchor 阻止自动执行。持久化的是队列、anchor/lease 阶段和审计摘要，不把管理动作参数扩展成永久操作 ledger。
 
 ### Reaction 清理
 

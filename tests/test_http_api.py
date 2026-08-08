@@ -265,6 +265,87 @@ async def test_get_image使用file字段查询(fake_server):
     await api.close()
 
 
+async def test_媒体host必须显式配置(fake_server):
+    """OneBot API 地址不能隐式成为媒体下载 allowlist。"""
+    base, _calls, _ = fake_server
+    api = OneBotHttpApi(base_url=base)
+    try:
+        with pytest.raises(ValueError, match="allowlist"):
+            api._validate_media_url(f"{base}/image.png")
+    finally:
+        await api.close()
+
+
+async def test_get_image返回url必须经过媒体allowlist(fake_server, monkeypatch):
+    """get_image 返回的 URL 也不能绕过显式媒体 host 规则。"""
+    base, _calls, _ = fake_server
+    api = OneBotHttpApi(base_url=base)
+
+    async def fake_call_action(action, params, *, retryable=None):
+        assert action == "get_image"
+        assert params == {"file": "abc.jpg"}
+        return {"file": "abc.jpg", "url": "https://media.example/image.png"}
+
+    monkeypatch.setattr(api, "call_action", fake_call_action)
+    try:
+        with pytest.raises(ValueError, match="allowlist"):
+            await api.get_image("abc.jpg")
+    finally:
+        await api.close()
+
+
+async def test_get_image返回url允许显式配置的host(fake_server, monkeypatch):
+    """显式配置的媒体 host 可以被 get_image 返回 URL 使用。"""
+    base, _calls, _ = fake_server
+    api = OneBotHttpApi(
+        base_url=base,
+        allowed_media_hosts={"media.example"},
+        allowed_media_ports={443},
+    )
+
+    async def fake_call_action(action, params, *, retryable=None):
+        assert action == "get_image"
+        assert params == {"file": "abc.jpg"}
+        return {"file": "abc.jpg", "url": "https://media.example/image.png"}
+
+    monkeypatch.setattr(api, "call_action", fake_call_action)
+    try:
+        result = await api.get_image("abc.jpg")
+        assert result["url"] == "https://media.example/image.png"
+    finally:
+        await api.close()
+
+
+def test_媒体空端口只允许HTTP_API端口():
+    """未配置媒体端口时，只允许显式 API host 的 API 端口。"""
+    api = OneBotHttpApi(
+        base_url="http://127.0.0.1:3000",
+        allowed_media_hosts={"127.0.0.1"},
+    )
+    api._validate_media_url("http://127.0.0.1:3000/image.png")
+    with pytest.raises(ValueError, match="port"):
+        api._validate_media_url("http://127.0.0.1:3001/image.png")
+
+
+def test_非API媒体host必须显式配置端口():
+    """额外媒体 host 不能借空端口配置放行任意服务。"""
+    api = OneBotHttpApi(
+        base_url="http://127.0.0.1:3000",
+        allowed_media_hosts={"media.example"},
+    )
+    with pytest.raises(ValueError, match="media_allowed_ports"):
+        api._validate_media_url("https://media.example/image.png")
+
+
+def test_媒体端口必须在有效范围():
+    """直接构造 HTTP 客户端时也不能接受非法端口。"""
+    with pytest.raises(ValueError, match="1-65535"):
+        OneBotHttpApi(
+            base_url="http://127.0.0.1:3000",
+            allowed_media_ports={0},
+        )
+
+
 def test_长文本分块():
     """超过限制的文本按行/字符切成多块,不截断单词。"""
     text = "一" * 30 + " " + "二" * 30

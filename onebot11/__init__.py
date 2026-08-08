@@ -2,7 +2,6 @@
 
 from . import (
     audit,
-    confirm,
     context,
     dispatch,
     events,
@@ -14,7 +13,12 @@ from . import (
     triggers,
     ws_server,
 )
-from .context import build_agent_context, build_dynamic_context, build_queue_batch_summary
+from .context import (
+    build_agent_context,
+    build_authority_reminder,
+    build_dynamic_context,
+    build_queue_batch_summary,
+)
 from .dispatch import ActiveTurn, GroupDispatcher
 from .message import ParsedMessage, parse_message_segments
 from .permissions import (
@@ -32,7 +36,14 @@ from .permissions import (
     parse_exact_tool_names,
     role_for_user,
 )
-from .queue import QueueLease, QueueMessage, QueueStore, ReactionRecord, TriggerRequest
+from .queue import (
+    QueueLease,
+    QueueMessage,
+    QueueStore,
+    ReactionRecord,
+    TriggerRequest,
+    TurnAnchor,
+)
 
 __all__ = [
     "events",
@@ -42,7 +53,6 @@ __all__ = [
     "queue",
     "dispatch",
     "triggers",
-    "confirm",
     "audit",
     "context",
     "tools",
@@ -57,11 +67,13 @@ __all__ = [
     "QueueMessage",
     "QueueStore",
     "TriggerRequest",
+    "TurnAnchor",
     "ReactionRecord",
     "ActiveTurn",
     "GroupDispatcher",
     "build_agent_context",
     "build_queue_batch_summary",
+    "build_authority_reminder",
     "build_dynamic_context",
     "ALL_TOOLS",
     "CONFIG_READ_TOOLS",

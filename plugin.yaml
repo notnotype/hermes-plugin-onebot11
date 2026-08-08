@@ -1,12 +1,12 @@
 name: onebot11-platform
 label: OneBot 11 (QQ)
 kind: platform
-version: 0.3.1
+version: 0.4.0
 description: >
   OneBot 11 (QQ) gateway adapter for Hermes Agent.
   Reverse WebSocket + HTTP API. Shared group sessions, durable queued context,
-  persistent cooldown/reaction cleanup, fail-closed scoped query tools and
-  confirmed group-management actions.
+  ordered TurnAnchor followups, immutable per-turn authority, recoverable
+  queued/processing reactions and fail-closed scoped tools.
 author: notnotype
 requires_env: []
 optional_env:
@@ -43,7 +43,7 @@ optional_env:
     prompt: "群白名单"
     password: false
   - name: ONEBOT11_REQUIRE_MENTION
-    description: "群聊是否必须 @ 机器人 才创建 trigger；未触发消息仍进入队列（默认 true）"
+    description: "群聊精确触发是否要求 @；false 只启用自动 selector 候选（默认 true）"
     prompt: "群聊 @ 触发"
     password: false
   - name: ONEBOT11_SUPER_ADMINS

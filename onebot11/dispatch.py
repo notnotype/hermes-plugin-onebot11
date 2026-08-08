@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from .queue import QueueLease, QueueStore
 
 logger = logging.getLogger(__name__)
+_COMPLETION_RETRY_DELAYS: tuple[float, ...] = (2.0, 4.0, 8.0)
 
 
 @dataclass(frozen=True)
@@ -36,7 +37,6 @@ class GroupDispatcher:
         lease_seconds: float = 120.0,
         heartbeat_seconds: float | None = None,
         recovery_poll_seconds: float = 5.0,
-        cooldown_seconds: float = 0.0,
         can_dispatch: Callable[[str], bool] | None = None,
         recovery_chat_ids: Callable[[], set[str] | frozenset[str] | tuple[str, ...] | None]
         | None = None,
@@ -49,7 +49,6 @@ class GroupDispatcher:
         self.lease_seconds = max(5.0, float(lease_seconds))
         self.heartbeat_seconds = heartbeat_seconds or max(1.0, self.lease_seconds / 3)
         self.recovery_poll_seconds = max(0.05, float(recovery_poll_seconds))
-        self.cooldown_seconds = max(0.0, float(cooldown_seconds))
         self._can_dispatch = can_dispatch or (lambda _chat_id: True)
         self._recovery_chat_ids = recovery_chat_ids
         self._on_lease_lost = on_lease_lost
@@ -91,9 +90,19 @@ class GroupDispatcher:
             self._heartbeat_tasks[chat_id] = asyncio.create_task(self._heartbeat(lease))
         try:
             await self._start_turn(lease)
+        except asyncio.CancelledError:
+            # 取消通常发生在 shutdown；立即停止本进程续租，持久 lease 交给恢复路径。
+            await self.abandon(lease.lease_id)
+            raise
         except Exception:
             logger.exception("OneBot11 turn 启动失败: chat=%s lease=%s", chat_id, lease.lease_id)
-            await self.complete(lease.lease_id, outcome="failure", unknown=False)
+            try:
+                await self.complete(lease.lease_id, outcome="failure", unknown=False)
+            except Exception:
+                # 启动失败已经需要向上层报告；收尾持久化失败不能留下本地 active/heartbeat。
+                logger.exception("OneBot11 turn 启动失败后的 lease 收尾失败: %s", lease.lease_id)
+            finally:
+                await self.abandon(lease.lease_id)
             raise
         return True
 
@@ -141,53 +150,103 @@ class GroupDispatcher:
         known_failure: bool = False,
         reason: str | None = None,
     ) -> bool:
-        """按真实处理结果确认、释放或标记 uncertain，不在此处启动下一轮。"""
+        """按真实处理结果确认、释放或标记 uncertain，不在此处启动下一轮。
+
+        持久状态转换的短暂异常按 2/4/8 秒有限重试；若仍无法完成，
+        只停止本进程的 active/heartbeat，持久 lease 等待自然过期后恢复。
+        """
         if self._closed:
             return False
         lease_id = str(lease_id)
-        active: ActiveTurn | None = None
-        chat_id: str | None = None
-        for candidate_chat, candidate in list(self._active.items()):
-            if candidate.lease.lease_id == lease_id:
-                chat_id = candidate_chat
-                active = candidate
-                break
-        if active is None or chat_id is None:
+        for attempt in range(len(_COMPLETION_RETRY_DELAYS) + 1):
+            try:
+                changed = await self._complete_once(
+                    lease_id,
+                    outcome=outcome,
+                    unknown=unknown,
+                    known_failure=known_failure,
+                    reason=reason,
+                )
+            except asyncio.CancelledError:
+                await self.abandon(lease_id)
+                raise
+            except Exception:
+                if attempt >= len(_COMPLETION_RETRY_DELAYS):
+                    logger.exception(
+                        "OneBot11 lease completion 重试耗尽，停止本进程续租: %s",
+                        lease_id,
+                    )
+                    await self.abandon(lease_id)
+                    raise
+                delay = _COMPLETION_RETRY_DELAYS[attempt]
+                logger.warning(
+                    "OneBot11 lease completion 暂时失败，将在 %.1f 秒后重试 (%d/%d): %s",
+                    delay,
+                    attempt + 1,
+                    len(_COMPLETION_RETRY_DELAYS),
+                    lease_id,
+                    exc_info=True,
+                )
+                try:
+                    await asyncio.sleep(delay)
+                except asyncio.CancelledError:
+                    await self.abandon(lease_id)
+                    raise
+                continue
+            if not changed:
+                # False 表示 lease 已失效或状态转换没有发生；绝不能让旧 active
+                # 阻塞之后对同一 chat 的恢复认领。
+                logger.warning(
+                    "OneBot11 lease completion was fenced or already transitioned: %s",
+                    lease_id,
+                )
+                await self.abandon(lease_id)
+            return changed
+        return False  # pragma: no cover - 循环总会在成功或异常路径返回
+
+    async def _complete_once(
+        self,
+        lease_id: str,
+        *,
+        outcome: str,
+        unknown: bool,
+        known_failure: bool,
+        reason: str | None,
+    ) -> bool:
+        """执行一次持久状态转换；异常留给外层有限重试。"""
+        if self._closed:
             return False
+        active = self.active_by_lease(lease_id)
+        if active is None:
+            return False
+        chat_id = str(active.lease.chat_id)
         lock = self._lock_for(chat_id)
         async with lock:
+            if self._closed:
+                return False
             current = self._active.get(chat_id)
             if current is None or current.lease.lease_id != lease_id:
                 return False
-            task = self._heartbeat_tasks.pop(chat_id, None)
-            if task is not None:
-                task.cancel()
             if current.lease_lost:
-                self._active.pop(chat_id, None)
                 return False
-            changed = False
             if unknown:
                 changed = await asyncio.to_thread(
                     self.store.mark_uncertain,
-                    active.lease,
+                    current.lease,
                     reason or "outbound result unknown",
                 )
             elif outcome == "success":
-                changed = await asyncio.to_thread(self.store.ack, active.lease)
+                changed = await asyncio.to_thread(self.store.ack, current.lease)
             else:
                 changed = await asyncio.to_thread(
                     self.store.release,
-                    active.lease,
+                    current.lease,
                     reason=reason,
                     allow_after_outbound=known_failure,
                 )
-            self._active.pop(chat_id, None)
-        if not changed:
-            logger.warning(
-                "OneBot11 lease completion was fenced or already transitioned: %s",
-                lease_id,
-            )
-        return changed
+        if changed:
+            await self._detach_active(lease_id)
+        return bool(changed)
 
     async def recover(self) -> list[str]:
         """恢复过期 lease 和持久触发请求，返回已尝试 dispatch 的群。"""
@@ -199,13 +258,6 @@ class GroupDispatcher:
             self.store.recover_trigger_requests,
             allowed_chat_ids,
         )
-        due_requests = await asyncio.to_thread(
-            self.store.recover_due_triggers,
-            None,
-            self.cooldown_seconds,
-            allowed_chat_ids,
-        )
-        requests = (*requests, *due_requests)
         if self._on_recovery_tick is not None:
             await self._on_recovery_tick()
         chats: list[str] = []
@@ -221,23 +273,19 @@ class GroupDispatcher:
 
     async def _recovery_loop(self) -> None:
         """周期恢复过期 lease，不抢占仍由其他进程持有的 lease。"""
-        try:
-            while not self._closed:
+        while not self._closed:
+            try:
                 await asyncio.sleep(self.recovery_poll_seconds)
+                if self._closed:
+                    return
                 allowed_chat_ids = self._recovery_scope()
                 requests = await asyncio.to_thread(
                     self.store.recover_trigger_requests,
                     allowed_chat_ids,
                 )
-                due_requests = await asyncio.to_thread(
-                    self.store.recover_due_triggers,
-                    None,
-                    self.cooldown_seconds,
-                    allowed_chat_ids,
-                )
                 if self._on_recovery_tick is not None:
                     await self._on_recovery_tick()
-                for request in (*requests, *due_requests):
+                for request in requests:
                     chat_id = request.chat_id
                     if (
                         not self._can_dispatch(chat_id)
@@ -252,10 +300,10 @@ class GroupDispatcher:
                             chat_id, finished
                         )
                     )
-        except asyncio.CancelledError:
-            return
-        except Exception:
-            logger.exception("OneBot11 lease 恢复轮询失败")
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("OneBot11 lease 恢复本轮失败，下轮继续")
 
     def _finish_recovery_dispatch(self, chat_id: str, task: asyncio.Task[None]) -> None:
         """清理恢复任务引用，并记录启动失败。"""
@@ -284,6 +332,30 @@ class GroupDispatcher:
             (turn for turn in self._active.values() if turn.lease.lease_id == str(lease_id)),
             None,
         )
+
+    async def abandon(self, lease_id: str) -> bool:
+        """停止指定 lease 的本进程续租，不修改其持久状态。"""
+        return await self._detach_active(lease_id)
+
+    async def _detach_active(self, lease_id: str) -> bool:
+        """移除指定 lease 的本进程状态并等待 heartbeat 停止。"""
+        lease_id = str(lease_id)
+        active = self.active_by_lease(lease_id)
+        if active is None:
+            return False
+        chat_id = str(active.lease.chat_id)
+        heartbeat: asyncio.Task[None] | None = None
+        lock = self._lock_for(chat_id)
+        async with lock:
+            current = self._active.get(chat_id)
+            if current is None or current.lease.lease_id != lease_id:
+                return False
+            self._active.pop(chat_id, None)
+            heartbeat = self._heartbeat_tasks.pop(chat_id, None)
+        if heartbeat is not None and heartbeat is not asyncio.current_task():
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+        return True
 
     def _recovery_scope(self) -> set[str] | frozenset[str] | tuple[str, ...] | None:
         """读取恢复允许目标；策略读取失败时返回空集合并 fail-closed。"""

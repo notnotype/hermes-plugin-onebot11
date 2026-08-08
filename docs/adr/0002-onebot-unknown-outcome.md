@@ -5,7 +5,7 @@
 
 ## 决策
 
-发送、撤回、禁言、踢人和全员禁言等非幂等 OneBot HTTP 请求永不自动重试。连接断开、超时、非 JSON、5xx、缺少可靠响应或分块部分成功时，把当前群 lease 标记为 `uncertain`，暂停自动重放，要求超级管理员明确 `/onebot resolve retry|discard`。群管理动作的 confirmation token 是单次消费；unknown 后允许管理员重新生成新的预览和令牌，但必须再次明确确认，并提示可能重复执行。
+发送、撤回、禁言、踢人和全员禁言等非幂等 OneBot HTTP 请求永不自动重试。连接断开、超时、非 JSON、5xx、缺少可靠响应或分块部分成功时，把当前 TurnAnchor 标记为 `uncertain`，暂停自动重放，要求超级管理员明确 `/onebot resolve retry|discard`。写工具由当前 anchor authority 直接硬校验；同一 turn 的同一 unknown 动作禁止重复调用，新的明确 anchor 才能重新决定是否执行。
 
 ## 原因
 
@@ -13,4 +13,4 @@
 
 ## 影响
 
-输入消息仍是至少一次语义；只有在非幂等出站尚未开始时，明确失败才可以按退避 release。出站 marker 一旦写入，即使随后收到明确业务错误，也不自动重放整轮。管理员选择 retry 前应先确认目标端没有执行，discard 则写入去重 tombstone，避免上游重放重新入队。插件不维护全局 fingerprint 永久阻断表，避免把一次人工重新确认错误地变成永久拒绝。
+输入消息仍是至少一次语义；只有在非幂等出站尚未开始时，明确失败才可以按退避 release。出站 marker 一旦写入，即使随后收到明确业务错误，也不自动重放整轮。管理员选择 retry 前应先确认目标端没有执行，discard 则写入去重 tombstone，避免上游重放重新入队。插件只维护当前 turn 的 unknown 指纹，不建立永久动作 ledger。

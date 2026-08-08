@@ -204,7 +204,12 @@ class OneBotHttpApi:
         """初始化 HTTP/API 与图片下载安全边界。"""
         self._base = str(base_url or "").strip().rstrip("/")
         if self._base:
-            parse_http_base_url(self._base)
+            base_scheme, base_host, base_port = parse_http_base_url(self._base)
+            self._base_host = base_host
+            self._base_port = base_port or (443 if base_scheme == "https" else 80)
+        else:
+            self._base_host = ""
+            self._base_port = None
         self._token = token or ""
         self._timeout = max(0.1, float(timeout))
         self._max_retries = max(0, int(max_retries))
@@ -215,14 +220,10 @@ class OneBotHttpApi:
             if str(host).strip()
         }
         self.allowed_media_hosts = explicit_media_hosts
-        base_parts = urlsplit(self._base) if self._base else urlsplit("")
-        base_host = base_parts.hostname
-        if base_host:
-            self.allowed_media_hosts.add(base_host.casefold().rstrip("."))
         explicit_media_ports = {int(port) for port in (allowed_media_ports or set())}
-        self.allowed_media_ports = explicit_media_ports or (
-            {base_parts.port or (443 if base_parts.scheme == "https" else 80)} if base_host else set()
-        )
+        if any(port < 1 or port > 65535 for port in explicit_media_ports):
+            raise ValueError("allowed_media_ports 必须全部在 1-65535 范围内")
+        self.allowed_media_ports = explicit_media_ports
         self.max_media_bytes = max(1024, int(max_media_bytes))
         self.max_redirects = max(0, int(max_redirects))
         self._session: aiohttp.ClientSession | None = None
@@ -453,8 +454,11 @@ class OneBotHttpApi:
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         if not self.allowed_media_hosts or host.rstrip(".") not in self.allowed_media_hosts:
             raise ValueError("图片 host 不在 allowlist")
-        if self.allowed_media_ports and port not in self.allowed_media_ports:
-            raise ValueError("图片 port 不在 allowlist")
+        if self.allowed_media_ports:
+            if port not in self.allowed_media_ports:
+                raise ValueError("图片 port 不在 allowlist")
+        elif host.rstrip(".") != self._base_host or port != self._base_port:
+            raise ValueError("非 HTTP API host/port 必须显式配置 media_allowed_ports")
         try:
             ip = ipaddress.ip_address(host)
         except ValueError:
@@ -481,7 +485,13 @@ class OneBotHttpApi:
         normalized = str(file_id or "").strip()
         if not normalized:
             raise ValueError("图片 file 不能为空")
-        return await self.call_action("get_image", {"file": normalized})
+        data = await self.call_action("get_image", {"file": normalized})
+        returned_url = data.get("url")
+        if returned_url is not None:
+            if not isinstance(returned_url, str) or not returned_url.strip():
+                raise ValueError("OneBot get_image 返回了无效 URL")
+            self._validate_media_url(returned_url)
+        return data
 
     async def get_group_msg_history(self, group_id: str, count: int = 20) -> list[dict]:
         """查询群消息历史。"""

@@ -6,6 +6,7 @@
 - **v0.2.0（2026-08-05）**：[docs/changelog/2026-08-05-v0.2.0.md](docs/changelog/2026-08-05-v0.2.0.md) — shared 群 session、持久队列、多触发器、租约和 unknown 出站合同
 - **v0.3.0（2026-08-06）**：[docs/changelog/2026-08-06-v0.3.0.md](docs/changelog/2026-08-06-v0.3.0.md) — 上下文物化、细粒度角色权限、群 slash command 和 reaction
 - **v0.3.1（2026-08-07）**：[docs/changelog/2026-08-07-v0.3.1.md](docs/changelog/2026-08-07-v0.3.1.md) — 安全可靠性收口、QueueStore v8、恢复白名单、reaction 有限恢复和 LLM trigger 去重
+- **v0.4.0（2026-08-07）**：[docs/changelog/2026-08-07-v0.4.0.md](docs/changelog/2026-08-07-v0.4.0.md) — TurnAnchor 独立 followup、不可变 authority、自动锚点选择、双阶段 reaction 和 batch/媒体边界收口
 
 ## v0.3.1 迁移指南
 
@@ -14,7 +15,15 @@
 - v7 → v8 会自动迁移，无需手工改表；高于 v8 的未知 schema 会拒绝启动。
 - 没有新增必填配置；群 session 仍固定 `shared`，不自动迁移旧 `per_user` Hermes session 历史。
 - 已存在的 `uncertain`/`failed` 消息仍需管理员明确 `/onebot resolve retry|discard`。
-- unknown 群管理动作不会自动重试；需要重新生成预览和新的 confirmation token，并确认可能重复执行。
+- unknown 群管理动作不会自动重试；v0.3.1 仍需重新生成预览和 confirmation token。升级 v0.4.0 后改为新的明确 TurnAnchor 才能再次决定执行。
 - 升级后重新核对 `allowed_groups`、私聊 `allowlist` 和机器人 token；联调白名单只允许群 `1072992996` 与用户 `2056963663`。
 
 完整步骤见：[docs/migrations/2026-08-07-v0.3.1.md](docs/migrations/2026-08-07-v0.3.1.md)。
+
+## v0.4.0 迁移指南
+
+v0.4.0 是触发与权限行为升级：QueueStore v8 → v9 自动迁移；`require_mention=false` 不再直接授予发送者 authority；自动 selector 改为返回 `anchor_seq`；确认令牌被移除；当前 turn 使用不可变权限快照。
+
+升级前停止 Hermes 并备份队列和配置。无法证明单一 authority 的旧 batch 会进入 legacy hold，不会自动执行。完整步骤见：[docs/migrations/2026-08-07-v0.4.0.md](docs/migrations/2026-08-07-v0.4.0.md)。
+
+当前 v0.4.0 已通过本地 Hermes smoke 和 `242 passed`/Ruff 门禁；真实 Arch/LLBot 联调仍待确认 SSH host key 后完成。联调白名单只允许群 `1072992996` 与私聊用户 `2056963663`。

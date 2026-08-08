@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .http_api import OneBotHttpApi
@@ -164,8 +165,15 @@ async def handle_get_group_member_info(api: OneBotHttpApi, params: dict[str, Any
     return {"status": "ok", "group_id": ctx.chat_id, "member": member}
 
 
-async def handle_write_action(api: OneBotHttpApi, tool_name: str, params: dict[str, Any], ctx: CallerContext) -> dict[str, Any]:
-    """执行已经通过确认的群管理动作；非幂等未知结果原样抛给 adapter。"""
+async def handle_write_action(
+    api: OneBotHttpApi,
+    tool_name: str,
+    params: dict[str, Any],
+    ctx: CallerContext,
+    *,
+    before_write: Callable[[], Awaitable[bool]] | None = None,
+) -> dict[str, Any]:
+    """在真实非幂等请求前执行 fencing；未知结果原样抛给 adapter。"""
     if ctx.chat_type != "group":
         return {"status": "permission_error", "error": "只能作用于当前群"}
     if tool_name == "qq_delete_message":
@@ -173,14 +181,20 @@ async def handle_write_action(api: OneBotHttpApi, tool_name: str, params: dict[s
         error = validate_message_scope(target, ctx)
         if error:
             return {"status": "permission_error", "error": error}
+        if before_write is not None and not await before_write():
+            return {"status": "permission_error", "error": "当前 turn lease 已失效"}
         data = await api.call_action("delete_msg", {"message_id": int(str(params["message_id"]))}, retryable=False)
     elif tool_name == "qq_set_group_ban":
+        if before_write is not None and not await before_write():
+            return {"status": "permission_error", "error": "当前 turn lease 已失效"}
         data = await api.call_action(
             "set_group_ban",
             {"group_id": int(ctx.chat_id), "user_id": int(str(params["user_id"])), "duration": max(0, int(params["duration"]))},
             retryable=False,
         )
     elif tool_name == "qq_set_group_kick":
+        if before_write is not None and not await before_write():
+            return {"status": "permission_error", "error": "当前 turn lease 已失效"}
         data = await api.call_action(
             "set_group_kick",
             {
@@ -193,6 +207,8 @@ async def handle_write_action(api: OneBotHttpApi, tool_name: str, params: dict[s
             retryable=False,
         )
     elif tool_name == "qq_set_group_whole_ban":
+        if before_write is not None and not await before_write():
+            return {"status": "permission_error", "error": "当前 turn lease 已失效"}
         data = await api.call_action(
             "set_group_whole_ban",
             {
