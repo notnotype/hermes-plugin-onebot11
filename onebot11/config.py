@@ -19,6 +19,7 @@ from .permissions import (
     AccessPolicy,
     build_access_policy,
     build_role_tools,
+    build_trusted_users,
     parse_admin_list,
     parse_bool,
     parse_id_list,
@@ -40,6 +41,7 @@ class RuntimeConfig:
     access_token: str
     access_policy: AccessPolicy
     super_admins: frozenset[str]
+    trusted_users: frozenset[str]
     role_tools: dict[str, frozenset[str]]
     trigger_config: TriggerConfig
     processing_reaction_enabled: bool
@@ -289,6 +291,7 @@ def parse_runtime_config(
     if raw_admins is None:
         raw_admins = effective.get("admins")
     super_admins = frozenset(parse_admin_list(raw_admins))
+    trusted_users = build_trusted_users(effective)
     role_tools = build_role_tools(effective)
     trigger_config = build_trigger_config(effective)
     if trigger_config.llm_enabled and not trigger_config.llm_allowed_groups:
@@ -343,6 +346,7 @@ def parse_runtime_config(
         access_token=access_token,
         access_policy=access_policy,
         super_admins=super_admins,
+        trusted_users=trusted_users,
         role_tools=role_tools,
         trigger_config=trigger_config,
         processing_reaction_enabled=reaction_enabled,

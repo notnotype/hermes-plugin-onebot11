@@ -62,6 +62,7 @@ AuditLog = _proto.audit.AuditLog
 ConfirmationStore = _proto.confirm.ConfirmationStore
 ToolContext = _proto.permissions.ToolContext
 build_access_policy = _proto.permissions.build_access_policy
+build_trusted_users = _proto.permissions.build_trusted_users
 parse_admin_list = _proto.permissions.parse_admin_list
 parse_bool = _proto.permissions.parse_bool
 parse_id_list = _proto.permissions.parse_id_list
@@ -184,7 +185,7 @@ def _caller_from_metadata(value: Any) -> CallerContext | None:
         return None
     if lease_id and not adapter._lease_matches_target(lease_id, chat_type, chat_id):
         return None
-    role = role_for_user(user_id, adapter.super_admins)
+    role = role_for_user(user_id, adapter.super_admins, adapter.trusted_users)
     return CallerContext(
         user_id=user_id,
         chat_type=chat_type,
@@ -226,6 +227,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         self.allowed_groups = set(self._access_policy.allowed_groups)
         self.require_mention = runtime.trigger_config.require_mention
         self.super_admins = set(runtime.super_admins)
+        self.trusted_users = set(runtime.trusted_users)
         self.role_tools = runtime.role_tools
         self._processing_reaction_enabled = runtime.processing_reaction_enabled
         self._processing_reaction_emoji_id = runtime.processing_reaction_emoji_id
@@ -769,6 +771,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                     decision.reason,
                     caller.user_id,
                     user_name or caller.user_id,
+                    anchor_kind="hard",
                 )
                 if decision.triggered
                 else None
@@ -1100,10 +1103,27 @@ class OneBot11Adapter(BasePlatformAdapter):
                     state.pause()
                 return
             if not self._llm_trigger_ready():
+                route = self._llm_trigger_route()
+                failure = "provider_missing" if not route else "hermes_api_unsupported"
                 state.on_llm_failure(
                     now=time.monotonic(),
                     current_revision=int(status.get("revision", 0)),
                     generation=action.generation,
+                )
+                self._audit.record(
+                    "llm_trigger",
+                    {
+                        "chat_id": normalized,
+                        "candidate_type": action.candidate_type or "candidate",
+                        "pending": int(status.get("pending", 0)),
+                        "input_bytes": 0,
+                        "decision": "ignore",
+                        "wait_seconds": 0,
+                        "duration_ms": 0,
+                        "failure": failure,
+                        "concurrency_waited": False,
+                        "concurrency_wait_ms": 0,
+                    },
                 )
                 if state.engaged_until is not None:
                     self._schedule_trigger_timer(normalized)
@@ -1168,6 +1188,7 @@ class OneBot11Adapter(BasePlatformAdapter):
             latest.user_id,
             latest.user_name,
             str(latest.message_key),
+            anchor_kind="selector",
         )
         if request_id:
             self._last_trigger_at[normalized] = time.monotonic()
@@ -1179,6 +1200,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         *,
         caller_user_id: str,
         caller_user_name: str,
+        control_message_id: str | None = None,
     ) -> tuple[bool, bool, bool]:
         """在群锁内准备管理员 flush，再在锁外启动 dispatcher。"""
         normalized = str(chat_id)
@@ -1207,6 +1229,8 @@ class OneBot11Adapter(BasePlatformAdapter):
                 caller_user_id,
                 caller_user_name,
                 str(latest.message_key) if latest is not None else None,
+                anchor_kind="operator",
+                control_message_id=control_message_id,
             )
             has_request = request_id is not None or int(
                 status.get("pending_trigger_requests", 0)
@@ -1311,6 +1335,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                             message.user_id,
                             message.user_name,
                             str(message.message_key),
+                            anchor_kind="recovery",
                         )
                         should_notify = bool(request_id)
                         if should_notify:
@@ -1597,7 +1622,7 @@ class OneBot11Adapter(BasePlatformAdapter):
     def _caller_for_event(self, source: Any, *, lease_id: str | None = None) -> CallerContext:
         """按当前入站消息解析角色和允许工具集合。"""
         user_id = str(source.user_id or "")
-        role = role_for_user(user_id, self.super_admins)
+        role = role_for_user(user_id, self.super_admins, self.trusted_users)
         return CallerContext(
             user_id=user_id,
             chat_type=str(source.chat_type),
@@ -1612,12 +1637,19 @@ class OneBot11Adapter(BasePlatformAdapter):
         """将 lease 批量编排为一个 synthetic user turn，保持 caller/target 绑定。"""
         if not self._chat_access_allowed("group", lease.chat_id):
             raise PermissionError("当前群已不再满足 OneBot11 allowed_groups 策略")
+        anchor_message = self._anchor_message(lease)
+        if anchor_message is None:
+            raise PermissionError("OneBot11 durable anchor 找不到对应的待处理消息")
         if not await asyncio.to_thread(self._queue.mark_agent_started, lease):
             raise PermissionError("OneBot11 queue lease 已失效")
         trigger = lease.trigger
-        role = role_for_user(trigger.caller_user_id, self.super_admins)
+        role = role_for_user(
+            anchor_message.user_id,
+            self.super_admins,
+            self.trusted_users,
+        )
         caller = CallerContext(
-            user_id=trigger.caller_user_id,
+            user_id=anchor_message.user_id,
             chat_type="group",
             chat_id=lease.chat_id,
             role=role,
@@ -1625,6 +1657,8 @@ class OneBot11Adapter(BasePlatformAdapter):
             lease_id=lease.lease_id,
             self_id=self.self_id,
         )
+        anchor_message_id = str(anchor_message.message_id or "").strip()
+        reply_id = anchor_message_id if is_numeric_message_id(anchor_message_id) else None
         media_paths: list[str] = []
         has_images = any(
             isinstance(message.metadata.get("onebot11_images"), list)
@@ -1639,7 +1673,6 @@ class OneBot11Adapter(BasePlatformAdapter):
                 self._processing_reaction_message_ids[lease.lease_id] = reaction_message_id
             media_total_bytes = 0
             media_limited = False
-            reply_id: str | None = None
             for message in lease.messages:
                 images = message.metadata.get("onebot11_images") or []
                 if isinstance(images, list):
@@ -1665,8 +1698,6 @@ class OneBot11Adapter(BasePlatformAdapter):
                         break
             if not await asyncio.to_thread(self._queue.is_lease_current, lease):
                 raise PermissionError("OneBot11 queue lease 在媒体处理期间失效")
-            if lease.messages:
-                reply_id = lease.messages[-1].message_id
             context_parts = build_agent_context_parts(
                 lease.summary,
                 lease.messages,
@@ -1702,7 +1733,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                 chat_name=lease.chat_id,
                 chat_type="group",
                 user_id=caller.user_id,
-                user_name=trigger.caller_user_name,
+                user_name=anchor_message.user_name,
                 message_id=reply_id,
                 role_authorized=True,
             )
@@ -1720,6 +1751,13 @@ class OneBot11Adapter(BasePlatformAdapter):
                     "onebot11_lease_revision": lease.revision,
                     "onebot11_caller_context": _serializable_caller(caller),
                     "onebot11_target": {"chat_type": "group", "chat_id": lease.chat_id},
+                    "onebot11_anchor_id": trigger.request_id,
+                    "onebot11_anchor_seq": trigger.anchor_seq,
+                    "onebot11_anchor_kind": trigger.anchor_kind,
+                    "onebot11_anchor_message_key": anchor_message.message_key,
+                    "onebot11_anchor_message_id": reply_id,
+                    "onebot11_anchor_user_id": anchor_message.user_id,
+                    "onebot11_anchor_user_name": anchor_message.user_name,
                     "onebot11_media_dir": media_dir if has_images else None,
                     "onebot11_media_paths": list(media_paths),
                     "onebot11_media_limited": media_limited,
@@ -1784,11 +1822,23 @@ class OneBot11Adapter(BasePlatformAdapter):
 
     def _reaction_message_id(self, lease: QueueLease) -> str | None:
         """从持久化触发请求定位真实消息 ID；内部 hash 不能用于 OneBot reaction。"""
-        trigger_key = str(lease.trigger.message_key)
+        message = self._anchor_message(lease)
+        if message is None:
+            return None
+        message_id = str(message.message_id or "").strip()
+        return message_id if is_numeric_message_id(message_id) else None
+
+    def _anchor_message(self, lease: QueueLease) -> QueueMessage | None:
+        """按 durable anchor 的序号优先定位真实 authority 消息。"""
+        anchor_seq = lease.trigger.anchor_seq
+        if anchor_seq is not None:
+            for message in lease.messages:
+                if message.seq == anchor_seq:
+                    return message
+        anchor_key = str(lease.trigger.message_key or "")
         for message in lease.messages:
-            if str(message.message_key) == trigger_key:
-                message_id = str(message.message_id or "").strip()
-                return message_id if is_numeric_message_id(message_id) else None
+            if str(message.message_key) == anchor_key:
+                return message
         return None
 
     async def _set_processing_reaction(self, lease: QueueLease, *, enabled: bool) -> str | None:
@@ -2108,6 +2158,7 @@ class OneBot11Adapter(BasePlatformAdapter):
             latest.user_id,
             latest.user_name,
             str(latest.message_key),
+            anchor_kind="recovery",
         )
         if request_id:
             self._audit.record(
@@ -2654,6 +2705,16 @@ class OneBot11Adapter(BasePlatformAdapter):
                 "unknown" if exc.unknown_outcome else "known_failed",
                 reason=str(exc),
             )
+        except (KeyError, TypeError, ValueError) as exc:
+            # 参数缺失或格式错误发生在访问 OneBot 之前，不应制造一个
+            # 需要人工 resolve 的“未知出站”假象。
+            result = {"status": "error", "error": str(exc)}
+            await asyncio.to_thread(
+                self._queue.finish_operation,
+                operation_id,
+                "known_failed",
+                reason=str(exc),
+            )
         except Exception as exc:
             result = {"status": "unknown", "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
             await asyncio.to_thread(
@@ -2771,6 +2832,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                     chat_id,
                     caller_user_id=event.user_id,
                     caller_user_name=event.user_name,
+                    control_message_id=event.message_id,
                 )
                 if not has_request:
                     await self._send_direct(event, "当前群没有可 flush 的待处理消息")
@@ -2859,6 +2921,8 @@ class OneBot11Adapter(BasePlatformAdapter):
                                 "admin_resolve_retry",
                                 event.user_id,
                                 event.user_name,
+                                None,
+                                anchor_kind="operator",
                             )
                         await self._dispatcher.notify(chat_id)
                     self._audit.record(

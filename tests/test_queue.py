@@ -2,7 +2,9 @@
 
 import sqlite3
 
-from onebot11.queue import QueueMessage, QueueStore, TriggerRequest
+import pytest
+
+from onebot11.queue import SCHEMA_VERSION, QueueError, QueueMessage, QueueStore, TriggerRequest
 
 
 def _message(message_id: str, *, chat_id: str = "888", text: str = "消息") -> QueueMessage:
@@ -30,7 +32,7 @@ def _trigger(message: QueueMessage, reason: str = "mention") -> TriggerRequest:
 
 
 def test_一个lease覆盖并确认整批trigger(tmp_path):
-    """同一批消息的多个 trigger 必须随 lease 一起完成。"""
+    """每个消息 anchor 独立消费，多个 anchor 仍按群内顺序串行。"""
     store = QueueStore(tmp_path / "queue.sqlite3")
     for message_id in ("1", "2", "3"):
         message = _message(message_id)
@@ -38,9 +40,18 @@ def test_一个lease覆盖并确认整批trigger(tmp_path):
 
     lease = store.claim("888")
     assert lease is not None
-    assert [message.message_id for message in lease.messages] == ["1", "2", "3"]
-    assert store.status("888")["trigger_requests"] == 0
+    assert [message.message_id for message in lease.messages] == ["1"]
+    assert store.status("888")["trigger_requests"] == 2
     assert store.ack(lease)
+    assert store.status("888")["pending"] == 2
+    second = store.claim("888")
+    assert second is not None
+    assert [message.message_id for message in second.messages] == ["2"]
+    assert store.ack(second)
+    third = store.claim("888")
+    assert third is not None
+    assert [message.message_id for message in third.messages] == ["3"]
+    assert store.ack(third)
     assert store.status("888")["trigger_requests"] == 0
     assert store.peek("888") == ()
     assert store.recover_trigger_requests() == ()
@@ -191,6 +202,20 @@ def test_旧schema活动lease迁移为uncertain(tmp_path):
     migrated.close()
 
 
+def test_未知更高schema版本拒绝启动(tmp_path):
+    """不能把未来 schema 当成当前 schema 静默打开。"""
+    path = tmp_path / "queue-future.sqlite3"
+    store = QueueStore(path)
+    store.close()
+    connection = sqlite3.connect(path)
+    connection.execute(f"PRAGMA user_version={SCHEMA_VERSION + 1}")
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(QueueError, match="高于支持版本"):
+        QueueStore(path)
+
+
 def test_pending_chat_ids只返回待处理群(tmp_path):
     """启动时可以发现没有 durable trigger 的遗留消息。"""
     store = QueueStore(tmp_path / "queue.sqlite3")
@@ -334,8 +359,10 @@ def test_管理动作台账崩溃恢复和人工resolve(tmp_path):
     reopened.close()
 
 
-def test_release与已有pending_trigger合并(tmp_path):
+def test_release与已有pending_trigger按anchor顺序恢复(tmp_path, monkeypatch):
     """旧 lease 释放时不能与后来的同群 trigger 冲突或丢失重试入口。"""
+    now = [1000.0]
+    monkeypatch.setattr("onebot11.queue.time.time", lambda: now[0])
     store = QueueStore(tmp_path / "queue.sqlite3")
     first = _message("merge-release")
     store.enqueue(first, _trigger(first))
@@ -345,12 +372,18 @@ def test_release与已有pending_trigger合并(tmp_path):
     store.enqueue(later, _trigger(later))
 
     assert store.release(lease, reason="agent failed")
-    assert store.status("888")["pending_trigger_requests"] == 1
+    assert store.status("888")["pending_trigger_requests"] == 2
+    assert store.claim("888") is None
+    now[0] = 1002.1
+    recovered = store.claim("888")
+    assert recovered is not None
+    assert [item.message_id for item in recovered.messages] == ["merge-release"]
+    assert store.ack(recovered)
     followup = store.claim("888")
     assert followup is not None
     assert [item.message_id for item in followup.messages] == ["merge-release-later"]
     assert store.ack(followup)
-    assert store.status("888")["pending_trigger_requests"] == 1
+    assert store.status("888")["pending_trigger_requests"] == 0
 
     store.close()
 
@@ -370,8 +403,8 @@ def test_recover与已有pending_trigger合并(tmp_path, monkeypatch):
     owner.enqueue(later, _trigger(later))
 
     now[0] = 1006.0
-    assert len(other.recover_trigger_requests()) == 1
-    assert other.status("888")["pending_trigger_requests"] == 1
+    assert other.recover_trigger_requests() == ()
+    assert other.status("888")["pending_trigger_requests"] == 2
     owner.close()
     other.close()
 
@@ -386,7 +419,7 @@ def test_abandon与已有pending_trigger合并(tmp_path):
     store.enqueue(later, _trigger(later))
 
     assert store.abandon_owner_leases() == {"pending": 1, "uncertain": 0}
-    assert store.status("888")["pending_trigger_requests"] == 1
+    assert store.status("888")["pending_trigger_requests"] == 2
     store.close()
 
 
@@ -402,7 +435,7 @@ def test_resolve_retry与已有pending_trigger合并(tmp_path):
     store.enqueue(later, _trigger(later))
 
     assert store.resolve_uncertain("888", "retry") == 1
-    assert store.status("888")["pending_trigger_requests"] == 1
+    assert store.status("888")["pending_trigger_requests"] == 2
     store.close()
 
 
@@ -426,15 +459,72 @@ def test_hard_trigger覆盖旧恢复请求并清除退避(tmp_path):
         """
         SELECT message_key, reason, caller_user_id, caller_user_name
         FROM onebot_queue_trigger
-        WHERE chat_id=? AND status='pending'
+        WHERE chat_id=? AND message_key=?
         """,
-        ("888",),
+        ("888", second.message_key),
     ).fetchone()
     assert tuple(trigger) == ("group:hard-second", "mention", "new-user", "新用户")
     assert store._conn.execute(
         "SELECT next_attempt_at FROM onebot_queue_message WHERE message_key=?",
         (second.message_key,),
     ).fetchone()[0] is None
+    store.close()
+
+
+def test_hard_trigger覆盖selector时更新anchor_kind(tmp_path):
+    """硬触发重新命中同一消息时，持久化类型不能继续伪装成 selector。"""
+    store = QueueStore(tmp_path / "queue-anchor-kind.sqlite3")
+    message = _message("anchor-kind")
+    store.enqueue(message)
+    selector_id = store.create_trigger(
+        "888",
+        "llm",
+        message.user_id,
+        message.user_name,
+        message.message_key,
+        anchor_kind="selector",
+    )
+    assert selector_id is not None
+
+    assert (
+        store.create_trigger(
+            "888",
+            "mention",
+            "new-user",
+            "新用户",
+            message.message_key,
+            anchor_kind="hard",
+        )
+        == selector_id
+    )
+    row = store._conn.execute(
+        "SELECT reason, caller_user_id, anchor_kind FROM onebot_queue_trigger WHERE request_id=?",
+        (selector_id,),
+    ).fetchone()
+    assert tuple(row) == ("mention", "new-user", "hard")
+    store.close()
+
+
+def test_turn_anchor固定当前batch边界():
+    """一个 anchor 只能消费它之前的消息，后续消息留给下一轮。"""
+    store = QueueStore(":memory:")
+    first = _message("anchor-first", text="第一条")
+    second = _message("anchor-second", text="第二条")
+    store.enqueue(first, _trigger(first))
+    store.enqueue(second, _trigger(second))
+
+    lease = store.claim("888", lease_seconds=60)
+
+    assert lease is not None
+    assert [message.message_key for message in lease.messages] == ["group:anchor-first"]
+    assert lease.trigger.anchor_seq == 1
+    assert lease.trigger.anchor_kind == "message"
+    assert store.ack(lease)
+
+    next_lease = store.claim("888", lease_seconds=60)
+    assert next_lease is not None
+    assert [message.message_key for message in next_lease.messages] == ["group:anchor-second"]
+    assert next_lease.trigger.anchor_seq == 2
     store.close()
 
 
@@ -484,4 +574,32 @@ def test_resolve_retry没有旧trigger时补建恢复入口(tmp_path):
     store._conn.commit()
     assert store.resolve_uncertain("888", "retry") == 1
     assert store.status("888")["pending_trigger_requests"] == 1
+    store.close()
+
+
+def test_显式anchor消息消失时不静默改绑到最早消息(tmp_path):
+    """selector 的旧判断失效时必须丢弃结果，不能把权限锚点换成另一条消息。"""
+    store = QueueStore(tmp_path / "queue-anchor-race.sqlite3")
+    first = _message("anchor-race-first")
+    selected = _message("anchor-race-selected")
+    store.enqueue(first)
+    store.enqueue(selected)
+    store._conn.execute(
+        "DELETE FROM onebot_queue_message WHERE message_key=?",
+        (selected.message_key,),
+    )
+    store._conn.commit()
+    assert (
+        store.create_trigger(
+            "888",
+            "llm",
+            selected.user_id,
+            selected.user_name,
+            selected.message_key,
+            anchor_kind="selector",
+        )
+        is None
+    )
+    assert store.status("888")["pending_trigger_requests"] == 0
+    assert store.peek("888")[0].message_key == first.message_key
     store.close()

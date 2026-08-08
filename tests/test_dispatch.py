@@ -20,7 +20,7 @@ def _message(message_id: str) -> QueueMessage:
 
 
 async def test_同群多个用户只有一个活动lease(tmp_path):
-    """并发 notify 只能启动一个共享群 turn，并一次认领整批消息。"""
+    """并发 notify 只能启动一个共享群 turn，多个 anchor 串行认领。"""
     store = QueueStore(tmp_path / "queue.sqlite3")
     for message_id in ("1", "2"):
         message = _message(message_id)
@@ -39,10 +39,14 @@ async def test_同群多个用户只有一个活动lease(tmp_path):
     await started.wait()
     assert await dispatcher.notify("888") is False
     assert len(leases) == 1
-    assert len(leases[0].messages) == 2
+    assert [message.message_id for message in leases[0].messages] == ["1"]
     allow_return.set()
     assert await first
     assert await dispatcher.complete(leases[0].lease_id, outcome="success", unknown=False)
+    assert store.status("888")["pending"] == 1
+    assert await dispatcher.notify("888")
+    assert [message.message_id for message in leases[1].messages] == ["2"]
+    assert await dispatcher.complete(leases[1].lease_id, outcome="success", unknown=False)
     assert store.status("888")["pending"] == 0
     await dispatcher.close()
     store.close()

@@ -63,6 +63,33 @@ def test超级管理员返回统一解析结果并拒绝mapping():
         parse_runtime_config(_extra(super_admins={"user": "2056963663"}))
 
 
+def testtrusted_user进入统一运行时配置且只能只读():
+    """adapter 与 validate_config 必须得到相同 trusted_user 身份和工具合同。"""
+    runtime = parse_runtime_config(
+        _extra(
+            roles={
+                "trusted_user": {
+                    "users": ["2056963663"],
+                    "tools": ["qq_get_message"],
+                }
+            }
+        )
+    )
+    assert runtime.trusted_users == frozenset({"2056963663"})
+    assert runtime.role_tools["trusted_user"] == frozenset({"qq_get_message"})
+    with pytest.raises(ValueError, match="只能包含只读工具"):
+        parse_runtime_config(
+            _extra(
+                roles={
+                    "trusted_user": {
+                        "users": ["2056963663"],
+                        "tools": ["qq_set_group_ban"],
+                    }
+                }
+            )
+        )
+
+
 def testws_host拒绝URL格式():
     """监听地址只接受 hostname/IP，不能把 URL 延迟到启动阶段才失败。"""
     with pytest.raises(ValueError):

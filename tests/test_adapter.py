@@ -578,7 +578,7 @@ async def test_群turn给触发消息加眼睛并在收尾移除(monkeypatch):
             ("-1001", "128064", True),
             ("-1001", "128064", False),
         ]
-        assert adapter._queue.status("888")["pending"] == 0
+        assert adapter._queue.status("888")["pending"] == 1
     finally:
         await adapter.disconnect()
 
@@ -844,6 +844,69 @@ async def test_LLM_trigger的reaction锚定候选批次最新消息(monkeypatch)
         await adapter.disconnect()
 
 
+async def test_TurnAnchor以真实锚点消息决定authority和reaction(monkeypatch):
+    """即使 trigger caller 字段错误，当前 anchor 消息仍是权限和回复锚点来源。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_SUPER_ADMINS="123",
+    )
+    adapter._processing_reaction_enabled = False
+    first = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1001",
+        user_id="456",
+        user_name="上下文用户",
+        text="前一条",
+        message_key="group:1001",
+    )
+    anchor = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1002",
+        user_id="123",
+        user_name="管理员",
+        text="@机器人执行这个",
+        message_key="group:1002",
+    )
+    adapter._queue.enqueue(first)
+    adapter._queue.enqueue(
+        anchor,
+        adapter_module.TriggerRequest.create(
+            "888",
+            "group:1002",
+            "mention",
+            "456",
+            "错误的 caller",
+            anchor_kind="hard",
+        ),
+    )
+    lease = adapter._queue.claim("888")
+    assert lease is not None
+    captured: list[object] = []
+
+    async def capture_handle(_adapter, event) -> None:
+        captured.append(event)
+
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", capture_handle)
+    try:
+        await adapter._start_queue_turn(lease)
+        assert captured
+        event = captured[0]
+        assert event.source.user_id == "123"
+        assert event.source.user_name == "管理员"
+        assert event.reply_to_message_id == "1002"
+        assert event.metadata["onebot11_anchor_seq"] == 2
+        assert event.metadata["onebot11_anchor_kind"] == "hard"
+        assert event.metadata["onebot11_anchor_message_id"] == "1002"
+        assert adapter._reaction_message_id(lease) == "1002"
+    finally:
+        adapter._queue.release(lease, reason="test cleanup")
+        await adapter.disconnect()
+
+
 async def test_shared_session摘要优先使用临时channel_prompt(monkeypatch):
     """当前 batch 进入 transcript，滚动摘要不再重复写入 user message。"""
     adapter = _make_adapter(
@@ -926,6 +989,58 @@ async def test_旧Hermes辅助API会安全禁用LLM触发(monkeypatch):
         assert adapter._llm_trigger_api_ready() is False
         assert adapter._llm_trigger_api_ready() is False
         assert adapter._llm_trigger_api_audited is True
+    finally:
+        await adapter.disconnect()
+
+
+async def test_旧Hermes旁路跳过仍留下真实失败审计(monkeypatch):
+    """严格参数不可用时不调用模型，pending 保留且审计说明安全降级原因。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "groups": ["888"],
+                },
+            },
+        )
+    )
+    message = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="old-api-question",
+        user_id="123",
+        user_name="小明",
+        text="这个问题怎么处理？",
+        message_key="group:old-api-question",
+    )
+    adapter._queue.enqueue(message)
+    state = adapter._trigger_state_for("888")
+    action = state.observe_message(
+        chat_type="group",
+        text=message.text,
+        mentioned_self=False,
+        has_context=False,
+        revision=1,
+        now=0,
+    )
+    assert action.kind == "schedule"
+    action = state.on_timer(now=6)
+    assert action.kind == "judge"
+    adapter._llm_trigger_api_supported = False
+    records: list[tuple[str, dict]] = []
+    monkeypatch.setattr(adapter._audit, "record", lambda name, fields: records.append((name, fields)))
+    try:
+        await adapter._start_llm_judgement("888", action)
+        assert adapter._queue.status("888")["pending"] == 1
+        assert adapter._queue.status("888")["pending_trigger_requests"] == 0
+        assert records[-1][0] == "llm_trigger"
+        assert records[-1][1]["failure"] == "hermes_api_unsupported"
     finally:
         await adapter.disconnect()
 
@@ -2318,6 +2433,30 @@ async def test_resolve_action只解除管理动作阻断不直接重放(monkeypa
     assert responses and "重新让 Hermes 生成预览" in responses[0]
     record = adapter._queue.operation_records("888")[0]
     assert record.status == "retry_armed"
+    assert adapter._queue.unknown_operation_count("888") == 0
+    await adapter.disconnect()
+
+
+async def test_确认后的参数错误是known_failed而不是unknown(monkeypatch):
+    """参数转换在 OneBot 请求前失败时，不应要求人工处理未知出站。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_SUPER_ADMINS="123",
+    )
+    confirmation = SimpleNamespace(
+        token="test-token",
+        tool_name="qq_set_group_ban",
+        params={"user_id": "not-a-number", "duration": 60},
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+    )
+    result = await adapter._execute_confirmed(confirmation)
+    assert result["status"] == "error"
+    record = adapter._queue.operation_records("888")[0]
+    assert record.status == "known_failed"
     assert adapter._queue.unknown_operation_count("888") == 0
     await adapter.disconnect()
 

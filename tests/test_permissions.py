@@ -9,7 +9,10 @@ from onebot11.permissions import (
     TurnBinding,
     TurnBindingStore,
     access_allowed,
+    build_role_tools,
+    build_trusted_users,
     parse_admin_list,
+    role_for_user,
     validate_message_scope,
     validate_tool_call,
 )
@@ -25,6 +28,46 @@ def test_普通工具群聊可用():
     """qq_get_group_msg_history 在群聊中允许（本群会话）。"""
     ctx = ToolContext(user_id="123", chat_type="group", chat_id="888")
     assert validate_tool_call("qq_get_group_msg_history", {}, ctx, {"999"}) is None
+
+
+def test_trusted_user优先级和只读边界():
+    """trusted_user 可以明确授予只读工具，但永远不能使用群管理写工具。"""
+    assert role_for_user("1", {"1"}, {"1"}) == "super_admin"
+    assert role_for_user("2", set(), {"2"}) == "trusted_user"
+    assert role_for_user("3", set(), {"2"}) == "user"
+    ctx = ToolContext(
+        user_id="2",
+        chat_type="group",
+        chat_id="888",
+        role="trusted_user",
+        allowed_tools=frozenset({"qq_get_message", "qq_set_group_ban"}),
+    )
+    assert validate_tool_call("qq_set_group_ban", {}, ctx, set()) is not None
+
+
+def test_trusted_user工具和用户列表只能来自明确配置():
+    """trusted_user 的 users/tools 配置必须是 mapping，且不能带写工具。"""
+    extra = {
+        "roles": {
+            "trusted_user": {
+                "users": ["2056963663"],
+                "tools": ["qq_get_message"],
+            }
+        }
+    }
+    assert build_trusted_users(extra) == frozenset({"2056963663"})
+    assert build_role_tools(extra)["trusted_user"] == frozenset({"qq_get_message"})
+    with pytest.raises(ValueError, match="只能包含只读工具"):
+        build_role_tools(
+            {
+                "roles": {
+                    "trusted_user": {
+                        "users": ["2056963663"],
+                        "tools": ["qq_set_group_ban"],
+                    }
+                }
+            }
+        )
 
 
 def test_群历史工具私聊被拒():
