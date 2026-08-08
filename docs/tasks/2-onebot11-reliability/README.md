@@ -1,7 +1,7 @@
 # OneBot 11 可靠性与安全完善
 
 - 关联需求：OneBot 11 插件整体完善计划
-- 状态：PR #8 基线上的 TurnAnchor 与出站图片收口已完成本地实现和 Hermes 组合验证；真实图片出站、真人并发、unknown 出站和 resolve 仍待外部验收
+- 状态：PR #8 基线上的 TurnAnchor 与出站图片收口已完成本地实现和 Hermes 组合验证；插件已提交为 PR #11。真实 OneBot adapter 的图片 segment/reaction smoke 已通过，但真实 Agent 图片 pipeline、真人并发、unknown 出站和 resolve 仍待外部验收；Hermes 媒体合同尚未形成远端 PR。
 - 开始日期：2026-08-05
 
 ## 目标
@@ -40,10 +40,10 @@
 - Hermes 集成：运行 `scripts\\verify_hermes_integration.ps1` 或跨平台 Python 入口；当前本地 Hermes 组合为 `229 passed`，覆盖真实 adapter import、注册、4 个 hooks、工具 handler、shared session key、TurnAnchor authority、lease fencing、同实例 reconnect、配置合同、operation resolve、触发竞争、上下文分段、媒体孤儿清理、raw self_id、home cron、reaction 生命周期和出站图片/unknown delivery 合同。
 - 严格 auxiliary 回归：`3 passed`，覆盖新 API 的 no-fallback/单次尝试合同和旧 Hermes API 缺少参数时的安全禁用。
 - 静态检查：`.venv\\Scripts\\python.exe -m ruff check .`，当前通过；临时干净环境 `pip install -e ".[dev]"` 和 `import onebot11` 也已通过。
-- Arch + LLBot 外部联调：2026-08-08 部署 `a04e9a8`，确认机器人 QQ `3101482118`、群白名单 `1072992996`、私聊白名单 `2056963663` 和 `home_channel_type=dm`；真实 WS/HTTP 连接、真实历史 message ID 的 reaction 添加/移除、TurnAnchor batch 边界、重启后 pending 保留和白名单外群拒绝通过。入站仍为受控 WS payload，不等同于真人 QQ 发言；双用户并发、unknown 出站和 resolve 仍待验收。
+- Arch + LLBot 外部联调：2026-08-08 严格使用机器人 QQ `3101482118`、群白名单 `1072992996`、私聊白名单 `2056963663` 和 `home_channel_type=dm`。旧 TurnAnchor 版本的真实 WS/HTTP 连接、真实历史 message ID 的 reaction 添加/移除、TurnAnchor batch 边界、重启后 pending 保留和白名单外群拒绝通过；随后在隔离 queue 上完成了 image-only、文字+图片、多图的真实 OneBot segment/reaction smoke。入站仍为受控 WS payload，图片 smoke 也未经过生产 Agent pipeline，不等同于真人 QQ 发言；双用户并发、部分成功/unknown 出站和 resolve 仍待验收。Arch live queue schema 10 与 PR #11 schema 9 不兼容，未切换生产 queue。
 
 ## 计划出入
 
 - 已完成原计划第一、第二阶段的本地实现，并增加了 WS 处理失败主动断开、媒体总大小限制、跨重启孤儿目录清理和非 OneBot hook 隔离。
 - 语义摘要仍保持确定性摘要为主；`onebot11_summary` auxiliary、自动语义压缩和运行时自优化不在本轮实现范围内。审计、基础运维命令和持久管理动作台账已纳入当前实现，真实 QQ 上的管理写操作仍待验收。
-- 本轮联调中的测试消息只发送到用户指定的群 `1072992996` 和用户 `2056963663`；远端保留了配置备份和移出插件扫描目录的旧 worktree 回滚 symlink。
+- 本轮联调中的测试消息只发送到用户指定的群 `1072992996` 和用户 `2056963663`；没有执行禁言、踢人、撤回或全员禁言。远端保留了配置备份，实验 queue 已移出运行配置；未把 schema 10 降级或覆盖。

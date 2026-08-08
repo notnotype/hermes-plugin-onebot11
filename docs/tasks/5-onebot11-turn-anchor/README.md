@@ -1,7 +1,7 @@
 # Task 5：OneBot 11 TurnAnchor 与 shared session 收口
 
 - 关联需求：OneBot 11 原始需求中的“群一个 shared session + 队列上下文”
-- 状态：本地实现和 Hermes 媒体/unknown 组合验证完成；等待独立 Hermes PR、真实图片出站与真人并发/unknown resolve 验收
+- 状态：本地实现和 Hermes 媒体/unknown 组合验证完成；插件已提交并推送为 PR #11。真实 OneBot adapter 图片/reaction smoke 已通过，但真实 Agent 图片 pipeline、真人并发、unknown resolve 和 Hermes 独立媒体 PR 仍未完成。
 - 分支：`fix/i9-turn-anchor-contract`
 
 ## 目标
@@ -36,7 +36,7 @@
 
 - 纯插件：`pytest -q`、`ruff check .`、editable install、`import onebot11`。
 - Hermes 组合：`scripts/verify_hermes_integration.py` 使用临时 `HERMES_HOME` 验证真实注册、9 个工具、4 个 hooks、shared session、TurnAnchor authority、reconnect、queue recovery、图片 base64 segment 和 strict auxiliary。
-- 外部：只允许群 `1072992996`、用户 `2056963663`，机器人 QQ `3101482118`；已验证真实历史 message ID 的 reaction 添加/移除、TurnAnchor batch 边界、重启 pending 保留和白名单外拒绝；真人并发和 unknown resolve 仍需联调。
+- 外部：只允许群 `1072992996`、用户 `2056963663`，机器人 QQ `3101482118`；已验证真实历史 message ID 的 reaction 添加/移除、TurnAnchor batch 边界、重启 pending 保留和白名单外拒绝，并在隔离 queue 上验证真实 OneBot image-only、文字+图片和多图 `base64://` segment。该 smoke 未经过生产 Agent pipeline；真人并发、部分成功/unknown resolve 和 schema 10 正式迁移仍需联调。
 
 ## 计划出入
 

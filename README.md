@@ -146,7 +146,8 @@ LLM trigger 默认关闭，启用时必须同时配置明确的旁路 `provider`
 出站图片只接受 Hermes 允许的媒体目录中的 PNG、JPEG、GIF、WebP，发送前
 编码为 `base64://` OneBot image segment，并可带 caption/reply。旧 Hermes
 缺少媒体结果合同或返回 unknown 时，插件不会把图片 URL/路径发成普通文本，
-也不会自动重发整轮 Agent。
+也不会自动重发整轮 Agent。当前图片/unknown 结果合同已在本地 Hermes 组合环境
+验证；部署到真实 Agent 前还需要安装对应的 Hermes 独立 PR。
 
 ## 权限说明
 
