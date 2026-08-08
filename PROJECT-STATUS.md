@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- **阶段**：v0.4.0 TurnAnchor 实现位于 Issue #9 stacked 分支；PR #10 仍为 draft，当前收口代码尚未合并 master。Arch 已有收口前 v0.4.0 smoke；本次新增修复需要重新部署验证。仍未执行破坏性群管理写操作。
+- **阶段**：v0.4.0 TurnAnchor 实现位于 Issue #9 stacked 分支；PR #10 仍为 draft，当前收口代码尚未合并 master。当前 commit `87b8dbd` 已部署到 Arch 独立 worktree 并完成白名单范围内合成 WS/LLBot smoke。仍未执行破坏性群管理写操作。
 - **核心合同**：群固定 shared session；每条锚点消息对应一个 authority 和一个串行 followup；自动 selector 只选 seq；非幂等 unknown 不自动重放。
 - **本地验证**：当前环境 `256 passed`；使用 Hermes 源码和 site-packages 完成真实 adapter 集成测试，无跳过项。Ruff、compileall、diff 检查和临时 Hermes 注册 smoke 已通过；本次 Arch 重部署仍待完成。
 
@@ -22,25 +22,26 @@
 | `onebot11/permissions.py` | 完成 | `CallerContext`、`ChatTarget`、精确 `(session_id, turn_id)` binding、角色工具并集、fail-closed |
 | `onebot11/tools.py` | 完成 | 当前范围查询；真实写请求前 fencing；写工具按 anchor authority 直接执行，unknown 不自动重放 |
 | `adapter.py` | 完成 | anchor/caller 绑定、role catalog、结构化上下文、authority reminder、⏳/👀、逐块 fencing、unknown-safe 出站 |
-| 文档/ADR | 进行中 | ADR-0002/0005、Task 5 和项目状态已同步；最终 smoke/外部证据待补 |
+| 文档/ADR | 进行中 | ADR-0002/0005、Task 5 和项目状态已同步；PR #10 仍待 CI/审查与合并 |
 
 ## 验证证据
 
 - 使用 Hermes 源码和 site-packages 加载真实 gateway，并在仓库 `.venv` 中运行：`256 passed`；覆盖 schema v9、多个独立 anchor、batch 边界、immutable authority、selector、双阶段 reaction、unknown 写操作、媒体端口边界、关闭 fencing、逐块出站和消息 key 合同。新增覆盖 selector 实际观察游标，以及失败后新消息清除 selector 退避。
-- 本轮 Arch + LLBot：服务加载 commit `f8c14ac` / v0.4.0；群 `1072992996` 和私聊 `2056963663` 是唯一允许目标。已验证 v8→v9 迁移、群 `/status`/`/onebot clear`、两个独立 @ anchor、普通用户权限拒绝、允许私聊回复、reaction recovery，以及非白名单群/私聊 fail-closed。
+- 当前 Arch + LLBot：服务加载 commit `87b8dbd` / v0.4.0；群 `1072992996` 和私聊 `2056963663` 是唯一允许目标。已验证两个独立 @ anchor、允许私聊回复、shared session 投影、队列/trigger/reaction 收尾；未执行破坏性群管理写操作。
 - `ruff check .`：通过。
 - 带 Hermes gateway 的临时 `HERMES_HOME` 真实注册 smoke 已通过：插件启用，注册 12 个工具、4 个 hooks、`onebot11_trigger` auxiliary 和 `onebot11` platform。
+- Arch 当前部署 `87b8dbd`：在群 `1072992996` 中由普通用户和超级管理员各发送一条明确 @，生成两个独立 message anchor，并分别收到 `TASK5_ANCHOR_A/B`；允许私聊用户 `2056963663` 收到 `TASK5_DM`。最终 queue、trigger、reaction 均为 0，Hermes gateway active。
 - 本轮未修改 Hermes 安装目录；OneBot `delegate_task` 明确 fail-closed，等待 Hermes 上游 per-turn 工具策略后再评估恢复。
 
 ## 外部联调状态
 
 2026-08-06 在 Arch `192.168.1.18` 使用真实 Hermes + LLBot direct compose 部署 `0.3.0` 完成 Task 4 指定白名单联调。机器人 QQ 为 `3101482118`，唯一允许群为 `1072992996`，唯一允许私聊用户为 `2056963663`；Hermes/LLBot WS 与 HTTP token 已配置一致且未记录在文档中。以下外部事件仍是通过真实反向 WS 注入的合成 OneBot payload，不等同于真人 QQ 客户端发言，也不代表 v0.4.0。
 
-2026-08-08 已通过 SSH 主机校验连接指定 Arch `192.168.1.18`。当前独立 worktree 上的 v0.4.0 部署证据对应收口前代码；LLBot compose 健康，Hermes gateway active。重新部署本次修复前不得把该证据扩展为当前 HEAD。
+2026-08-08 已通过 SSH 主机校验连接指定 Arch `192.168.1.18`。当前独立 worktree `/home/notnotype/CodeRepository/hermes-plugin-onebot11/.agent/workspace/wt/onebot11-turn-anchor-task5-live-20260808` 部署 `87b8dbd`；LLBot compose 健康，Hermes gateway active。旧部署保留在 Hermes home 外部回滚 symlink，不参与插件扫描。
 
 以下是 v0.3.0/Task 4 历史证据，不代表 v0.4.0 当前证据：
 
-- 群普通用户和超级管理员消息落在同一 session key `agent:main:onebot11:group:1072992996`；v0.4.0 已改为两个独立 anchor，尚待外部验证。
+- 群普通用户和超级管理员消息落在同一 session key `agent:main:onebot11:group:1072992996`；这是 Task 4 历史证据，当前 Task 5 的两个独立 anchor 已在后续段落重新验证。
 - `/context` 在入队前旁路返回待处理 batch；`/status` 返回 `chat_type=group`、lease/失败计数等紧凑状态，不再发送旧 summary 原文。
 - 普通用户 `/whoami` 只显示 5 个当前范围只读查询工具；请求 `terminal` 产生结构化权限错误和 `permission_denied` 审计，没有执行命令。
 - 群处理 reaction 在指定群的真实消息 ID 上按 `set=true -> 回复 -> set=false` 完成；允许私聊用户收到正常 Agent 回复。
@@ -58,7 +59,7 @@
 
 外部验收边界：
 
-- 两个 anchor 和权限测试使用真实反向 WS 连接注入的合成 OneBot payload，不等同于两名真人 QQ 客户端同时发言；真实 LLBot 消息 `1197886633` 已走过当前 v0.4.0 anchor。
+- 两个 anchor 和权限测试使用真实反向 WS 连接注入的合成 OneBot payload，不等同于两名真人 QQ 客户端同时发言；当前 `TASK5_ANCHOR_A/B` 也属于该边界。reaction set 在本次 LLBot 返回失败，插件未自动重试且没有遗留 reaction 记录；这记录为实际框架行为，不升级为 OneBot 11 协议保证。
 - v0.4.0 直接群管理写工具、非幂等出站断线后的 `uncertain` 与人工 resolve 未执行；未获额外授权时不执行禁言、踢人、撤回或全员禁言。
 - 未在本轮使用 NapCat，也未把 WS 重连重放行为提升为 OneBot 11 协议保证；LLBot 关闭时仍出现已有 Discord/Weixin 关闭异常和 OneBot disconnect timeout，但不影响本次重启后的 v0.4.0 gateway active。
 

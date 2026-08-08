@@ -26,4 +26,4 @@ v0.4.0 是触发与权限行为升级：QueueStore v8 → v9 自动迁移；`req
 
 升级前停止 Hermes 并备份队列和配置。无法证明单一 authority 的旧 batch 会进入 legacy hold，不会自动执行。完整步骤见：[docs/migrations/2026-08-07-v0.4.0.md](docs/migrations/2026-08-07-v0.4.0.md)。
 
-现有 v0.4.0 Arch 证据对应 PR #10 收口前部署；PR #10 当前分支完整 Hermes 测试为 `256 passed`，Ruff、compileall、diff 检查和真实 PluginManager 注册 smoke 已通过。Arch 重部署和真人 QQ 联调仍未完成，因此不把本次收口描述为已发布或已完成协议验收；白名单仍只允许群 `1072992996` 与私聊用户 `2056963663`。
+v0.4.0 当前仍未合并/发布；PR #10 当前分支完整 Hermes 测试为 `256 passed`，Ruff、compileall、diff 检查和真实 PluginManager 注册 smoke 已通过。Arch 已部署 `87b8dbd` 并完成白名单范围内合成 WS/LLBot 联调，但这不等同于真人 QQ 或 OneBot 11 exactly-once 保证；白名单仍只允许群 `1072992996` 与私聊用户 `2056963663`。

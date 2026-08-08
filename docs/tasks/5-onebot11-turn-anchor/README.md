@@ -35,11 +35,11 @@
 - `ruff check .`：通过；`compileall` 和 `git diff --check` 通过。
 - 真实 Hermes `PluginManager` 临时注册 smoke：通过，OneBot 平台、12 个工具、4 个 hooks 和 `onebot11_trigger` auxiliary 均注册成功。
 - 覆盖崩溃恢复退避上限、phase fencing、resolve 新 anchor、reaction 状态迁移、分块出站 fencing、binding mismatch、hash message key、HTTP redirect，以及 selector 实际观察游标和失败竞态。
-- Arch 重部署仍待完成；在部署前不把既有收口前 smoke 证据扩展为当前 HEAD。
+- Arch 当前 HEAD `87b8dbd` 已部署到独立 worktree，并完成白名单范围内合成 WS/LLBot smoke；未执行破坏性群管理写操作。
 
 ## 外部验收边界
 
-Arch 联调只允许群 `1072992996` 与私聊用户 `2056963663`。现有 Arch v0.4.0 验收证据对应收口前部署 commit `f8c14ac`；本次 lease 退避、resolve 新 anchor、逐块 fencing、hook capability gate、message key 和 selector 修复尚待重新部署。两个 anchor 使用真实反向 WS 的合成 payload；未执行禁言、踢人、撤回、全员禁言或 unknown 管理动作。
+Arch 联调只允许群 `1072992996` 与私聊用户 `2056963663`。当前 `87b8dbd` 已通过真实反向 WS 的合成 payload 验证：普通用户和超级管理员各创建一个独立 message anchor，分别得到 `TASK5_ANCHOR_A/B`；允许私聊得到 `TASK5_DM`；收尾后 queue、trigger、reaction 均为空，gateway 保持 active。未执行禁言、踢人、撤回、全员禁言、unknown 管理动作或非白名单目标事件；合成 payload 不等同于真人 QQ 客户端协议保证。
 
 ## 后续
 
