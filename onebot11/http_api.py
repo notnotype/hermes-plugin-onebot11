@@ -166,6 +166,11 @@ def _matches_image_magic(data: bytes, content_type: str, url: str) -> bool:
     return suffix in {".png", ".jpg", ".jpeg", ".gif", ".webp"} and normalized == ""
 
 
+def matches_image_magic(data: bytes, content_type: str = "", url: str = "") -> bool:
+    """公开本地图片魔数校验，供出站 base64 segment 复用。"""
+    return _matches_image_magic(data, content_type, url)
+
+
 class OneBotHttpApi:
     """OneBot HTTP 客户端，按动作类型区分重试合同。"""
 
@@ -364,9 +369,31 @@ class OneBotHttpApi:
         if is_numeric_message_id(reply_id):
             message.append({"type": "reply", "data": {"id": reply_id}})
         message.append({"type": "text", "data": {"text": text}})
+        return await self.send_message_segments(
+            chat_id,
+            message,
+            chat_type=chat_type,
+        )
+
+    async def send_message_segments(
+        self,
+        chat_id: str,
+        segments: list[dict],
+        *,
+        chat_type: str,
+    ) -> str:
+        """发送一组 OneBot 消息段；非幂等出站绝不自动重试。"""
+        if chat_type not in {"group", "dm"}:
+            raise ValueError(f"未知 OneBot chat_type: {chat_type!r}")
+        if not isinstance(segments, list) or not segments:
+            raise ValueError("OneBot 消息段不能为空")
         action = "send_group_msg" if chat_type == "group" else "send_private_msg"
         key = "group_id" if chat_type == "group" else "user_id"
-        data = await self.call_action(action, {key: int(chat_id), "message": message}, retryable=False)
+        data = await self.call_action(
+            action,
+            {key: int(chat_id), "message": segments},
+            retryable=False,
+        )
         return str(data.get("message_id", ""))
 
     async def set_message_emoji_like(

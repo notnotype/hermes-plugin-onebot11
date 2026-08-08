@@ -246,15 +246,46 @@ def parse_bool(value: Any, *, default: bool | None = None, name: str = "配置")
 
 
 def parse_id_list(value: Any) -> set[str]:
-    """解析逗号字符串或 YAML list 中的 QQ/群号。"""
+    """解析逗号字符串或 YAML list 中的纯数字 QQ/群号。"""
     if value is None:
         return set()
-    values = value.split(",") if isinstance(value, str) else value
-    if isinstance(values, (int, float)):
-        values = [values]
-    if not isinstance(values, (list, tuple, set, frozenset)):
+    if isinstance(value, str):
+        values = value.split(",")
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        values = value
+    else:
         raise ValueError(f"ID 列表格式错误: {value!r}")
-    return {str(item).strip() for item in values if str(item).strip()}
+    result: set[str] = set()
+    for item in values:
+        if isinstance(item, bool) or not isinstance(item, (str, int)):
+            raise ValueError(f"ID 列表只能包含字符串或整数: {item!r}")
+        normalized = str(item).strip()
+        if not normalized:
+            continue
+        if not normalized.isdigit():
+            raise ValueError(f"ID 必须是纯数字: {item!r}")
+        result.add(normalized)
+    return result
+
+
+def parse_string_list(value: Any, *, name: str) -> tuple[str, ...]:
+    """解析字符串或 YAML 字符串列表，拒绝 mapping、数字和任意对象。"""
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        values = value.split(",")
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        values = value
+    else:
+        raise ValueError(f"{name} 必须是字符串或 YAML list")
+    result: list[str] = []
+    for item in values:
+        if not isinstance(item, str):
+            raise ValueError(f"{name} 只能包含字符串: {item!r}")
+        normalized = item.strip()
+        if normalized:
+            result.append(normalized)
+    return tuple(dict.fromkeys(result))
 
 
 def parse_admin_list(admins: Any) -> set[str]:

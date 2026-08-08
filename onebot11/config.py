@@ -23,6 +23,7 @@ from .permissions import (
     parse_admin_list,
     parse_bool,
     parse_id_list,
+    parse_string_list,
 )
 from .triggers import TriggerConfig, build_trigger_config
 
@@ -205,6 +206,18 @@ def _optional_string(value: Any, *, name: str) -> str | None:
     return result or None
 
 
+def _numeric_id(value: Any, *, name: str, required: bool = False) -> str | None:
+    """解析单个 OneBot QQ/群号，拒绝 URL、浮点和任意对象。"""
+    if value is None or value == "":
+        if required:
+            raise ValueError(f"{name} 未配置")
+        return None
+    values = parse_id_list([value])
+    if len(values) != 1:
+        raise ValueError(f"{name} 必须是一个 QQ/群号")
+    return next(iter(values))
+
+
 def _host(value: Any, *, name: str) -> str:
     """严格解析 WS 监听地址，拒绝 URL、端口、路径和空白。"""
     if not isinstance(value, str):
@@ -250,9 +263,8 @@ def parse_runtime_config(
         parse_http_base_url(http_api)
     elif require_http_api:
         raise ValueError("ONEBOT11_HTTP_API 未配置")
-    self_id = _string(effective.get("self_id"), name="self_id")
-    if not self_id:
-        raise ValueError("ONEBOT11_SELF_ID 未配置")
+    self_id = _numeric_id(effective.get("self_id"), name="self_id", required=True)
+    assert self_id is not None
     session_mode = _string(effective.get("session_mode", "shared"), name="session_mode").casefold()
     if session_mode != "shared":
         raise ValueError("OneBot11 群 session 只允许 session_mode=shared")
@@ -279,7 +291,7 @@ def parse_runtime_config(
         home_channel_type = home_channel_type.casefold()
         if home_channel_type not in {"group", "dm"}:
             raise ValueError("home_channel_type 必须是 group 或 dm")
-    home_channel = _optional_string(
+    home_channel = _numeric_id(
         effective.get("home_channel"),
         name="home_channel",
     )
@@ -310,8 +322,11 @@ def parse_runtime_config(
         raise ValueError("processing_reaction_emoji_id 不能为空")
 
     media_hosts = frozenset(
-        str(host).casefold().rstrip(".")
-        for host in parse_id_list(effective.get("media_allowed_hosts"))
+        host.casefold().rstrip(".")
+        for host in parse_string_list(
+            effective.get("media_allowed_hosts"),
+            name="media_allowed_hosts",
+        )
     )
     media_port_values = parse_id_list(effective.get("media_allowed_ports"))
     media_ports = frozenset(

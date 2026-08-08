@@ -9,9 +9,9 @@
 - **连续对话**：成功回复后进入最多 60 秒的活跃窗口；窗口内普通消息经过 5 秒 trailing debounce，再交给低成本旁路模型判断是否回复，单窗口最多仲裁 3 次。
 - **处理指示器**：群 turn 认领后给触发消息添加 👀，Hermes turn 收尾时自动移除；没有真实消息 ID 或 QQ 框架不支持该扩展时按 best-effort 跳过，不影响回复。
 - **上下文**：队列有条数、字节数和单条消息上限，确认后形成滚动摘要，并保留最近消息原文；当前批次作为普通 user message，摘要优先通过 Hermes `channel_prompt` 临时注入，不重复写入 shared session transcript。旧 Hermes 不支持时退回有界文本模式并记录审计。
-- **图片与消息段**：兼容 array/CQ 字符串，支持图片、reply、文件、语音、视频、转发和未知段标记；图片下载有 host、端口、类型、魔数和大小限制。
+- **图片与消息段**：兼容 array/CQ 字符串，支持图片、reply、文件、语音、视频、转发和未知段标记；入站图片下载有 host、端口、类型、魔数和大小限制，出站图片使用受限 `base64://` segment，适配 Hermes 宿主机与 LLBot 容器路径隔离。
 - **工具与管理**：提供当前群/私聊范围内的查询工具，以及撤回、禁言、踢人、全员禁言工具。写操作只生成预览，必须由同一超级管理员在同一目标群发送短期确认命令。
-- **可靠性**：队列支持崩溃恢复、去重、lease heartbeat 和人工处理 `uncertain` 出站结果。OneBot 非幂等请求不自动重试，不承诺 exactly-once。
+- **可靠性**：队列支持崩溃恢复、去重、lease heartbeat 和人工处理 `uncertain` 出站结果。OneBot 非幂等请求不自动重试、unknown 不走 plain-text 或 cron standalone fallback，不承诺 exactly-once。
 
 ## 环境要求
 
@@ -105,6 +105,7 @@ platforms:
       media_orphan_ttl_seconds: 86400
       max_image_bytes: 8000000
       max_image_total_bytes: 16000000
+      max_images_per_message: 4
       media_allowed_hosts: []   # 图片 URL 必须命中此列表；默认还允许 HTTP API host
       media_allowed_ports: []   # 为空时使用 HTTP API 的端口
       llm_trigger:
@@ -141,6 +142,11 @@ LLM trigger 默认关闭，启用时必须同时配置明确的旁路 `provider`
 旁路模型只接受 `{"decision":"trigger|wait|ignore","wait_seconds":0}`；`wait` 时 `wait_seconds` 只能是 `5/10/30/60`，`trigger` 和 `ignore` 必须使用 `0`。非法结果保留队列消息，不创建 lease。
 `media_orphan_ttl_seconds` 到期后由下一次 adapter 启动或 turn 收尾清理遗留媒体目录。
 `processing_reaction_enabled` 默认开启；它使用 LLBot 的 `set_msg_emoji_like` 扩展，只作用于群聊真实消息 ID。添加或移除 reaction 的未知结果不会重放 Agent turn，也不会阻断队列 ack。
+
+出站图片只接受 Hermes 允许的媒体目录中的 PNG、JPEG、GIF、WebP，发送前
+编码为 `base64://` OneBot image segment，并可带 caption/reply。旧 Hermes
+缺少媒体结果合同或返回 unknown 时，插件不会把图片 URL/路径发成普通文本，
+也不会自动重发整轮 Agent。
 
 ## 权限说明
 

@@ -202,6 +202,136 @@ def test_旧schema活动lease迁移为uncertain(tmp_path):
     migrated.close()
 
 
+def test_真实v7表结构先补列再建索引(tmp_path):
+    """真实旧表没有 anchor_id 时，迁移不能在创建索引阶段提前失败。"""
+    path = tmp_path / "queue-v7.sqlite3"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE onebot_queue_chat (
+            chat_id TEXT PRIMARY KEY,
+            next_seq INTEGER NOT NULL DEFAULT 1,
+            summary TEXT NOT NULL DEFAULT '',
+            paused INTEGER NOT NULL DEFAULT 0,
+            updated_at REAL NOT NULL
+        );
+        CREATE TABLE onebot_queue_message (
+            row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT NOT NULL,
+            message_key TEXT NOT NULL,
+            chat_type TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            user_name TEXT NOT NULL,
+            text TEXT NOT NULL,
+            raw_text TEXT NOT NULL,
+            metadata_json TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            byte_size INTEGER NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('pending','leased','uncertain')),
+            lease_id TEXT,
+            lease_until REAL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(chat_id, message_key)
+        );
+        CREATE TABLE onebot_queue_trigger (
+            request_id TEXT PRIMARY KEY,
+            chat_id TEXT NOT NULL,
+            message_key TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            caller_user_id TEXT NOT NULL,
+            caller_user_name TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('pending','claimed','uncertain')),
+            lease_id TEXT,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(chat_id, message_key)
+        );
+        INSERT INTO onebot_queue_chat(chat_id, next_seq, updated_at)
+        VALUES ('888', 2, 1000);
+        INSERT INTO onebot_queue_message(
+            chat_id, message_key, chat_type, user_id, user_name, text, raw_text,
+            metadata_json, seq, byte_size, state, lease_id, lease_until,
+            attempts, created_at, updated_at
+        ) VALUES (
+            '888', 'group:legacy-v7', 'group', '123', '小明', '旧消息', '旧消息',
+            '{}', 1, 100, 'leased', 'legacy-lease', 990, 1, 900, 900
+        );
+        INSERT INTO onebot_queue_trigger(
+            request_id, chat_id, message_key, reason, caller_user_id,
+            caller_user_name, status, lease_id, created_at, updated_at
+        ) VALUES (
+            'legacy-trigger', '888', 'group:legacy-v7', 'mention', '123',
+            '小明', 'claimed', 'legacy-lease', 900, 900
+        );
+        PRAGMA user_version=7;
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = QueueStore(path)
+    columns = {
+        str(row[1])
+        for row in migrated._conn.execute(
+            "PRAGMA table_info(onebot_queue_message)"
+        ).fetchall()
+    }
+    assert "anchor_id" in columns
+    assert migrated.status("888")["uncertain"] == 1
+    migrated.close()
+
+
+def test_迁移失败后连接已关闭(tmp_path, monkeypatch):
+    """初始化迁移异常不能留下仍占用文件的 SQLite 连接。"""
+    opened: list[sqlite3.Connection] = []
+    original_open = QueueStore._open_connection
+
+    def tracked_open(self: QueueStore) -> sqlite3.Connection:
+        connection = original_open(self)
+        opened.append(connection)
+        return connection
+
+    def fail_migrate(self: QueueStore) -> None:
+        raise QueueError("synthetic migration failure")
+
+    monkeypatch.setattr(QueueStore, "_open_connection", tracked_open)
+    monkeypatch.setattr(QueueStore, "_migrate", fail_migrate)
+    with pytest.raises(QueueError, match="synthetic migration failure"):
+        QueueStore(tmp_path / "migration-failure.sqlite3")
+    assert opened
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].execute("SELECT 1")
+
+
+def test_reopen迁移失败后仍保持closed(tmp_path, monkeypatch):
+    """同实例 reconnect 的迁移异常也不能留下半开的连接。"""
+    path = tmp_path / "reopen-failure.sqlite3"
+    store = QueueStore(path)
+    store.close()
+    opened: list[sqlite3.Connection] = []
+    original_open = QueueStore._open_connection
+    original_migrate = QueueStore._migrate
+
+    def tracked_open(self: QueueStore) -> sqlite3.Connection:
+        connection = original_open(self)
+        opened.append(connection)
+        return connection
+
+    def fail_migrate(self: QueueStore) -> None:
+        raise QueueError("synthetic reopen failure")
+
+    monkeypatch.setattr(QueueStore, "_open_connection", tracked_open)
+    monkeypatch.setattr(QueueStore, "_migrate", fail_migrate)
+    with pytest.raises(QueueError, match="synthetic reopen failure"):
+        store.reopen()
+    assert store.closed
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].execute("SELECT 1")
+    monkeypatch.setattr(QueueStore, "_migrate", original_migrate)
+
+
 def test_未知更高schema版本拒绝启动(tmp_path):
     """不能把未来 schema 当成当前 schema 静默打开。"""
     path = tmp_path / "queue-future.sqlite3"
@@ -574,6 +704,36 @@ def test_resolve_retry没有旧trigger时补建恢复入口(tmp_path):
     store._conn.commit()
     assert store.resolve_uncertain("888", "retry") == 1
     assert store.status("888")["pending_trigger_requests"] == 1
+    store.close()
+
+
+def test_resolve_retry只清理被阻塞anchor(tmp_path):
+    """恢复一个 blocked anchor 时不能抹掉同群其他 pending anchor。"""
+    store = QueueStore(tmp_path / "queue-resolve-scope.sqlite3")
+    blocked = _message("blocked")
+    later = _message("later")
+    store.enqueue(blocked, _trigger(blocked))
+    lease = store.claim("888")
+    assert lease is not None
+    assert store.mark_uncertain(lease, "unknown")
+    store._conn.execute(
+        "DELETE FROM onebot_queue_trigger WHERE message_key=?",
+        (blocked.message_key,),
+    )
+    store._conn.commit()
+    store.enqueue(later, _trigger(later))
+
+    assert store.resolve_uncertain("888", "retry") == 1
+    blocked_anchor = store._conn.execute(
+        "SELECT anchor_id FROM onebot_queue_message WHERE message_key=?",
+        (blocked.message_key,),
+    ).fetchone()[0]
+    later_anchor = store._conn.execute(
+        "SELECT anchor_id FROM onebot_queue_message WHERE message_key=?",
+        (later.message_key,),
+    ).fetchone()[0]
+    assert blocked_anchor is None
+    assert later_anchor is not None
     store.close()
 
 

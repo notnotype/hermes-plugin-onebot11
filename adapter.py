@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextvars
 import hashlib
 import inspect
@@ -22,6 +23,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import unquote
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -54,6 +56,7 @@ build_inbound_event = _proto.events.build_inbound_event
 normalize_auxiliary_event = _proto.events.normalize_auxiliary_event
 OneBotApiError = _proto.http_api.OneBotApiError
 OneBotHttpApi = _proto.http_api.OneBotHttpApi
+matches_image_magic = _proto.http_api.matches_image_magic
 is_loopback_http_url = _proto.http_api.is_loopback_http_url
 parse_http_base_url = _proto.http_api.parse_http_base_url
 chunk_text = _proto.http_api.chunk_text
@@ -216,6 +219,8 @@ class OneBot11Adapter(BasePlatformAdapter):
 
         self.ws_port = runtime.ws_port
         self.ws_host = runtime.ws_host
+        self._ws_max_queue = runtime.ws_max_queue
+        self._ws_max_inflight = runtime.ws_max_inflight
         self.access_token = runtime.access_token
         http_api = runtime.http_api
         self._http_api = http_api
@@ -244,6 +249,10 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._llm_trigger_route_logged = False
         self._channel_prompt_supported: bool | None = None
         self._summary_fallback_audited = False
+        self._media_result_contract_supported = bool(
+            getattr(BasePlatformAdapter, "supports_media_delivery_results", False)
+        )
+        self._media_result_contract_audited = False
 
         self._api = OneBotHttpApi(
             base_url=http_api,
@@ -353,8 +362,8 @@ class OneBot11Adapter(BasePlatformAdapter):
             token=self.access_token,
             on_event=self._on_ws_event,
             host=self.ws_host,
-            max_queue=int(self.config.extra.get("ws_max_queue", 256)),
-            max_inflight=int(self.config.extra.get("ws_max_inflight", 32)),
+            max_queue=self._ws_max_queue,
+            max_inflight=self._ws_max_inflight,
         )
         await self._ws.start()
         await self._dispatcher.recover()
@@ -941,6 +950,21 @@ class OneBot11Adapter(BasePlatformAdapter):
             self._llm_trigger_loop = loop
         return self._llm_trigger_semaphore
 
+    @staticmethod
+    def _selector_block_reason(status: Mapping[str, Any]) -> str | None:
+        """返回阻止软触发消耗旁路模型的持久状态原因。"""
+        if status.get("paused"):
+            return "paused"
+        if int(status.get("leased", 0) or 0) > 0:
+            return "leased"
+        if int(status.get("uncertain", 0) or 0) > 0:
+            return "uncertain"
+        if int(status.get("failed", 0) or 0) > 0:
+            return "failed"
+        if int(status.get("pending_trigger_requests", 0) or 0) > 0:
+            return "hard_trigger_already_pending"
+        return None
+
     def _llm_trigger_api_ready(self) -> bool:
         """检查 Hermes 是否支持旁路严格参数；旧 API 直接安全降级。"""
         if self._llm_trigger_api_supported is not None:
@@ -996,12 +1020,13 @@ class OneBot11Adapter(BasePlatformAdapter):
                     if self._closed or not self._chat_access_allowed("group", chat_id):
                         return
                     status = await asyncio.to_thread(self._queue.status, chat_id)
-                    if self._dispatcher.active(chat_id) is not None:
+                    block_reason = self._selector_block_reason(status)
+                    if block_reason == "leased" or self._dispatcher.active(chat_id) is not None:
                         # Agent turn 尚未完全收口时不启动旁路仲裁；completion
                         # 会在释放活动 lease 后重新安排现有 due timer。
                         return
-                    if status.get("paused") or int(status.get("pending_trigger_requests", 0)) > 0:
-                        state.pause() if status.get("paused") else state.invalidate_judgement()
+                    if block_reason is not None:
+                        state.pause() if block_reason == "paused" else state.invalidate_judgement()
                         return
                     action = state.on_timer(now=time.monotonic())
                 if action.kind == "judge":
@@ -1037,8 +1062,9 @@ class OneBot11Adapter(BasePlatformAdapter):
         if state is None or not self._chat_access_allowed("group", normalized):
             return
         status = await asyncio.to_thread(self._queue.status, normalized)
-        if status.get("paused") or int(status.get("pending_trigger_requests", 0)) > 0:
-            if status.get("paused"):
+        block_reason = self._selector_block_reason(status)
+        if block_reason is not None:
+            if block_reason == "paused":
                 state.pause()
             else:
                 state.invalidate_judgement()
@@ -1095,12 +1121,12 @@ class OneBot11Adapter(BasePlatformAdapter):
             if (
                 state is None
                 or not state.judgement_is_current(action.generation)
-                or status.get("paused")
-                or int(status.get("pending_trigger_requests", 0)) > 0
+                or self._selector_block_reason(status) is not None
                 or not self._chat_access_allowed("group", normalized)
             ):
-                if state is not None and status.get("paused"):
-                    state.pause()
+                if state is not None:
+                    block_reason = self._selector_block_reason(status)
+                    state.pause() if block_reason == "paused" else state.invalidate_judgement()
                 return
             if not self._llm_trigger_ready():
                 route = self._llm_trigger_route()
@@ -1297,6 +1323,13 @@ class OneBot11Adapter(BasePlatformAdapter):
             status = await asyncio.to_thread(self._queue.status, normalized)
             if status.get("paused"):
                 return False
+            if self._selector_block_reason(status) == "leased":
+                return False
+            if (
+                int(status.get("uncertain", 0) or 0) > 0
+                or int(status.get("failed", 0) or 0) > 0
+            ):
+                return False
             if int(status.get("pending_trigger_requests", 0)) > 0:
                 should_notify = True
             elif (
@@ -1365,12 +1398,13 @@ class OneBot11Adapter(BasePlatformAdapter):
             state.invalidate_judgement()
             return None, False, "access_denied"
         status = await asyncio.to_thread(self._queue.status, normalized)
-        if status.get("paused"):
-            state.pause()
-            return None, False, "paused"
-        if int(status.get("pending_trigger_requests", 0)) > 0:
-            state.invalidate_judgement()
-            return None, True, "hard_trigger_already_pending"
+        block_reason = self._selector_block_reason(status)
+        if block_reason is not None:
+            if block_reason == "paused":
+                state.pause()
+            else:
+                state.invalidate_judgement()
+            return None, False, block_reason
         current_revision = int(status.get("revision", 0))
         result_action = state.on_llm_result(
             decision=decision,
@@ -1404,6 +1438,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         duration_ms: int = 0,
         concurrency_waited: bool = False,
         concurrency_wait_ms: int = 0,
+        model_call_started: bool = False,
     ) -> None:
         """在群锁内处理取消/失败结果，避免旧 task 污染新状态。"""
         normalized = str(chat_id)
@@ -1417,10 +1452,9 @@ class OneBot11Adapter(BasePlatformAdapter):
                 state.invalidate_judgement()
             else:
                 status = await asyncio.to_thread(self._queue.status, normalized)
-                if status.get("paused"):
-                    state.pause()
-                elif int(status.get("pending_trigger_requests", 0)) > 0:
-                    state.invalidate_judgement()
+                block_reason = self._selector_block_reason(status)
+                if block_reason is not None:
+                    state.pause() if block_reason == "paused" else state.invalidate_judgement()
                 else:
                     retry_action = state.on_llm_failure(
                         now=time.monotonic(),
@@ -1444,6 +1478,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                 "failure": "stale_judgement" if stale else failure,
                 "concurrency_waited": bool(concurrency_waited),
                 "concurrency_wait_ms": int(concurrency_wait_ms),
+                "model_call_started": bool(model_call_started),
             },
         )
 
@@ -1461,6 +1496,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         messages_count = 0
         input_bytes = 0
         notify = False
+        model_call_started = False
         try:
             async with self._trigger_lock_for(normalized):
                 state = self._trigger_states.get(normalized)
@@ -1470,10 +1506,9 @@ class OneBot11Adapter(BasePlatformAdapter):
                     failure = "access_denied"
                 else:
                     status = await asyncio.to_thread(self._queue.status, normalized)
-                    if status.get("paused"):
-                        failure = "paused"
-                    elif int(status.get("pending_trigger_requests", 0)) > 0:
-                        failure = "hard_trigger_already_pending"
+                    block_reason = self._selector_block_reason(status)
+                    if block_reason:
+                        failure = block_reason
                     elif self.trigger_config.cooldown_seconds > 0:
                         last_trigger = self._last_trigger_at.get(normalized)
                         if (
@@ -1522,11 +1557,23 @@ class OneBot11Adapter(BasePlatformAdapter):
                 return
             async_call_llm, provider, model, prompt, semaphore = request
             semaphore_wait_started = time.monotonic()
-            async with semaphore:
+            timeout_seconds = self.trigger_config.llm_timeout_seconds
+            remaining = timeout_seconds - (time.monotonic() - started_at)
+            if remaining <= 0:
+                raise TimeoutError("OneBot11 LLM trigger 总超时")
+            await asyncio.wait_for(semaphore.acquire(), timeout=remaining)
+            try:
                 concurrency_wait_ms = int(
                     (time.monotonic() - semaphore_wait_started) * 1000
                 )
                 concurrency_waited = concurrency_wait_ms > 0
+                remaining = timeout_seconds - (time.monotonic() - started_at)
+                if remaining <= 0:
+                    raise TimeoutError("OneBot11 LLM trigger 等待并发槽超时")
+                model_call_started = True
+                state = self._trigger_states.get(normalized)
+                if state is not None and state.generation_matches(action.generation):
+                    state.model_calls += 1
                 response = await asyncio.wait_for(
                     async_call_llm(
                         task="onebot11_trigger",
@@ -1544,12 +1591,14 @@ class OneBot11Adapter(BasePlatformAdapter):
                         ],
                         temperature=0,
                         max_tokens=32,
-                        timeout=self.trigger_config.llm_timeout_seconds,
+                        timeout=remaining,
                         fallback_policy="none",
                         max_attempts=1,
                     ),
-                    timeout=self.trigger_config.llm_timeout_seconds + 1.0,
+                    timeout=remaining,
                 )
+            finally:
+                semaphore.release()
             content = response.choices[0].message.content
             if isinstance(content, Mapping):
                 parsed_value: Any = content
@@ -1584,6 +1633,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                         "duration_ms": int((time.monotonic() - started_at) * 1000),
                         "concurrency_waited": concurrency_waited,
                         "concurrency_wait_ms": concurrency_wait_ms,
+                        "model_call_started": True,
                     },
                 )
             if notify:
@@ -1604,6 +1654,10 @@ class OneBot11Adapter(BasePlatformAdapter):
             failure = "model_error"
             logger.info("OneBot11 LLM trigger 失败，按不触发处理", exc_info=True)
         finally:
+            if failure and model_call_started:
+                state = self._trigger_states.get(normalized)
+                if state is not None:
+                    state.model_failures += 1
             if failure and not self._closed:
                 await self._apply_llm_failure(
                     normalized,
@@ -1614,6 +1668,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                     duration_ms=int((time.monotonic() - started_at) * 1000),
                     concurrency_waited=concurrency_waited,
                     concurrency_wait_ms=concurrency_wait_ms,
+                    model_call_started=model_call_started,
                 )
             current = self._llm_trigger_tasks.get(normalized)
             if current is asyncio.current_task():
@@ -2385,6 +2440,298 @@ class OneBot11Adapter(BasePlatformAdapter):
             raw_response={"sent_chunks": len(sent), "total_chunks": len(pieces)},
         )
 
+    def _media_contract_unavailable(
+        self,
+        metadata: Mapping[str, Any] | None,
+    ) -> SendResult:
+        """在旧 Hermes 上禁用图片，并让 managed turn 不能误 ack。"""
+        if not self._media_result_contract_audited:
+            self._audit.record(
+                "outbound_image_disabled",
+                {
+                    "reason": "Hermes 不支持媒体 SendResult 聚合合同",
+                    "capability": "supports_media_delivery_results",
+                },
+            )
+            self._media_result_contract_audited = True
+
+        lease_id = ""
+        sources = [metadata]
+        current_event = _CURRENT_EVENT.get()
+        sources.append(getattr(current_event, "metadata", None))
+        for source in sources:
+            if isinstance(source, Mapping):
+                lease_id = str(source.get("onebot11_lease_id") or "").strip()
+                if lease_id:
+                    break
+        if not lease_id:
+            binding = self._binding_from_context()
+            if binding is not None:
+                lease_id = str(binding.lease_id or "").strip()
+        if lease_id:
+            self._outbound_known_failure.add(lease_id)
+        return SendResult(
+            False,
+            error="当前 Hermes 不支持可靠图片出站合同",
+            error_kind="unsupported",
+        )
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """把受信任的本地图片编码为 OneBot ``base64://`` image segment。"""
+        del kwargs
+        if not self._media_result_contract_supported:
+            return self._media_contract_unavailable(metadata)
+        binding = self._binding_from_context()
+        current_event = _CURRENT_EVENT.get()
+        current_event_metadata = getattr(current_event, "metadata", None) or {}
+        managed_context = bool(
+            isinstance(metadata, Mapping)
+            and (
+                metadata.get("onebot11_managed_context")
+                or metadata.get("onebot11_lease_id")
+            )
+        ) or bool(
+            isinstance(current_event_metadata, Mapping)
+            and (
+                current_event_metadata.get("onebot11_managed_context")
+                or current_event_metadata.get("onebot11_lease_id")
+            )
+        )
+        if managed_context and binding is None:
+            stale_lease_id = str(
+                (
+                    metadata.get("onebot11_lease_id")
+                    if isinstance(metadata, Mapping)
+                    else None
+                )
+                or (
+                    current_event_metadata.get("onebot11_lease_id")
+                    if isinstance(current_event_metadata, Mapping)
+                    else None
+                )
+                or ""
+            ).strip()
+            if stale_lease_id:
+                self._fenced_leases.add(stale_lease_id)
+                self._outbound_known_failure.add(stale_lease_id)
+            return SendResult(
+                False,
+                error="OneBot11 managed turn binding unavailable，拒绝出站",
+                error_kind="fenced",
+            )
+        lease_id = binding.lease_id if binding else None
+        if self._closed:
+            if lease_id:
+                self._outbound_known_failure.add(lease_id)
+            return SendResult(False, error="OneBot11 adapter is closed", error_kind="not_found")
+        if lease_id and not self._lease_is_current(lease_id):
+            self._fenced_leases.add(lease_id)
+            self._outbound_known_failure.add(lease_id)
+            return SendResult(False, error="OneBot11 lease 已失效，拒绝出站", error_kind="fenced")
+        target = self._resolve_target(str(chat_id), metadata)
+        if target is None:
+            if lease_id:
+                self._outbound_known_failure.add(lease_id)
+            return SendResult(False, error="OneBot11 target unknown or ambiguous", error_kind="unknown")
+        caller_user_id = (
+            binding.caller.user_id
+            if binding is not None
+            else target.chat_id
+            if target.chat_type == "dm"
+            else None
+        )
+        if not self._chat_access_allowed(target.chat_type, target.chat_id, caller_user_id):
+            if lease_id:
+                self._outbound_known_failure.add(lease_id)
+            return SendResult(False, error="OneBot11 target 不再满足访问策略", error_kind="permission")
+        if self._ws is None:
+            if lease_id:
+                self._outbound_known_failure.add(lease_id)
+            return SendResult(False, error="Not connected", error_kind="not_found")
+
+        safe_path = self.validate_media_delivery_path(str(image_path))
+        if not safe_path:
+            if lease_id:
+                self._outbound_known_failure.add(lease_id)
+            return SendResult(False, error="图片路径不在 Hermes 允许的媒体目录中", error_kind="permission")
+        path = Path(safe_path)
+        resolved_path = path.resolve()
+        allowed_roots = (
+            self._media_root,
+            (self._hermes_home / "image_cache").resolve(),
+            (self._hermes_home / "cache" / "images").resolve(),
+        )
+        if not any(
+            resolved_path == root or root in resolved_path.parents
+            for root in allowed_roots
+        ):
+            if lease_id:
+                self._outbound_known_failure.add(lease_id)
+            return SendResult(False, error="图片路径不在 Hermes 媒体根目录中", error_kind="permission")
+        suffix = path.suffix.casefold()
+        if suffix not in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+            if lease_id:
+                self._outbound_known_failure.add(lease_id)
+            return SendResult(False, error="OneBot11 只允许 PNG/JPEG/GIF/WebP 图片出站", error_kind="failed")
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            if lease_id:
+                self._outbound_known_failure.add(lease_id)
+            return SendResult(False, error=f"读取图片失败: {exc}", error_kind="failed")
+        if len(data) > self._api.max_media_bytes:
+            if lease_id:
+                self._outbound_known_failure.add(lease_id)
+            return SendResult(False, error="图片超过单图大小限制", error_kind="too_large")
+        if not matches_image_magic(data, "", path.name):
+            if lease_id:
+                self._outbound_known_failure.add(lease_id)
+            return SendResult(False, error="图片魔数与文件类型不匹配", error_kind="failed")
+
+        reply_id = str(reply_to or "").strip()
+        if not reply_id and current_event is not None:
+            reply_id = str(getattr(current_event, "message_id", "") or "").strip()
+        segments: list[dict[str, Any]] = []
+        if is_numeric_message_id(reply_id):
+            segments.append({"type": "reply", "data": {"id": reply_id}})
+        segments.append(
+            {
+                "type": "image",
+                "data": {
+                    "file": "base64://" + base64.b64encode(data).decode("ascii"),
+                },
+            }
+        )
+        if caption:
+            segments.append({"type": "text", "data": {"text": str(caption)}})
+
+        if lease_id:
+            marked = await asyncio.to_thread(self._queue.mark_outbound_started, lease_id)
+            if not marked:
+                self._fenced_leases.add(lease_id)
+                self._outbound_known_failure.add(lease_id)
+                return SendResult(False, error="OneBot11 lease 已失效，拒绝出站", error_kind="fenced")
+            self._outbound_started.add(lease_id)
+        try:
+            sent_id = await self._api.send_message_segments(
+                target.chat_id,
+                segments,
+                chat_type=target.chat_type,
+            )
+            if not sent_id:
+                if lease_id:
+                    self._unknown_leases.add(lease_id)
+                return SendResult(
+                    False,
+                    error="OneBot 成功响应缺少 message_id，图片出站结果未知",
+                    error_kind="unknown",
+                )
+            if lease_id:
+                self._outbound_successful.add(lease_id)
+            return SendResult(
+                True,
+                message_id=sent_id,
+                raw_response={"segment_type": "image"},
+            )
+        except OneBotApiError as exc:
+            if lease_id:
+                if exc.unknown_outcome:
+                    self._unknown_leases.add(lease_id)
+                else:
+                    self._outbound_known_failure.add(lease_id)
+            return SendResult(
+                False,
+                error=str(exc),
+                error_kind="unknown" if exc.unknown_outcome else exc.error_kind,
+            )
+        except (OSError, ValueError) as exc:
+            if lease_id:
+                self._outbound_known_failure.add(lease_id)
+            return SendResult(False, error=str(exc), error_kind="failed")
+
+    async def send_image(
+        self,
+        chat_id: str,
+        image_url: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SendResult:
+        """安全下载远程图片后，以 base64 segment 发送，不回退为 URL 文本。"""
+        if not self._media_result_contract_supported:
+            return self._media_contract_unavailable(metadata)
+        media_dir = self._new_media_dir()
+        path = await self._api.download_to_temp(str(image_url), media_dir)
+        if not path:
+            self._cleanup_media(media_dir=media_dir)
+            return SendResult(False, error="图片下载失败或未通过安全校验", error_kind="failed")
+        try:
+            return await self.send_image_file(
+                chat_id,
+                path,
+                caption=caption,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+        finally:
+            self._cleanup_media([path], media_dir=media_dir)
+
+    async def send_multiple_images(
+        self,
+        chat_id: str,
+        images: list[tuple[str, str]],
+        metadata: dict[str, Any] | None = None,
+        human_delay: float = 0.0,
+    ) -> list[SendResult]:
+        """逐张发送图片并返回完整结果，部分成功不会被折叠成成功。"""
+        if not self._media_result_contract_supported:
+            unavailable = self._media_contract_unavailable(metadata)
+            return [
+                unavailable
+                for _image_url, _caption in images
+            ]
+        results: list[SendResult] = []
+        for index, (image_url, caption) in enumerate(images):
+            if human_delay > 0:
+                await asyncio.sleep(human_delay)
+            if str(image_url).startswith("file://"):
+                path = unquote(str(image_url)[7:])
+                result = await self.send_image_file(
+                    chat_id,
+                    path,
+                    caption=caption or None,
+                    metadata=metadata,
+                )
+            else:
+                result = await self.send_image(
+                    chat_id,
+                    str(image_url),
+                    caption=caption or None,
+                    metadata=metadata,
+                )
+            results.append(result)
+            if result.error_kind in {"unknown", "fenced"}:
+                # 结果未知或 lease 已失效时，停止后续非幂等请求；为每个
+                # 被跳过的图片保留结构化结果，避免调用方误以为缺块成功。
+                results.extend(
+                    SendResult(
+                        False,
+                        error="前一张图片出站结果未知，已跳过后续图片",
+                        error_kind="unknown",
+                    )
+                    for _ in images[index + 1 :]
+                )
+                break
+        return results
+
     async def _send_with_retry(self, chat_id: str, content: str, reply_to: str | None = None, metadata: Any = None, **kwargs: Any) -> SendResult:
         """覆盖 Hermes 默认重试/fallback，避免未知出站重复发送。"""
         del kwargs
@@ -2452,18 +2799,15 @@ class OneBot11Adapter(BasePlatformAdapter):
     def _binding_from_context(self) -> TurnBinding | None:
         """读取当前异步 turn 的精确 binding。"""
         binding = _CURRENT_BINDING.get()
-        if binding is not None:
-            caller = _CURRENT_CALLER.get()
-            if caller is None or caller == binding.caller:
-                return binding
+        if binding is None:
             return None
         caller = _CURRENT_CALLER.get()
-        if caller is None:
+        if caller is None or caller != binding.caller:
             return None
-        bindings = self._bindings.snapshot()
-        if caller.lease_id:
-            return next((binding for binding in bindings.values() if binding.lease_id == caller.lease_id), None)
-        return next((binding for binding in bindings.values() if binding.caller == caller), None)
+        # ContextVar 可能跨 reconnect/取消边界残留；只有 binding store 中
+        # 仍存在完全相同的 (session_id, turn_id) 才允许继续出站。
+        current = self._bindings.get(binding.session_id, binding.turn_id)
+        return current if current == binding else None
 
     def _resolve_binding(self, session_id: str | None, turn_id: str | None) -> TurnBinding | None:
         """按完整 Hermes 路由键读取 caller，不使用最近来源缓存。"""

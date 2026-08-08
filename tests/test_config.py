@@ -96,6 +96,18 @@ def testws_host拒绝URL格式():
         parse_runtime_config(_extra(ws_host="http://127.0.0.1", access_token="token"))
 
 
+def test媒体host使用字符串列表而ID列表保持纯数字():
+    """媒体 host 不是 QQ 号，必须走独立字符串解析器。"""
+    runtime = parse_runtime_config(
+        _extra(media_allowed_hosts=["cdn.example.com", "127.0.0.1"])
+    )
+    assert runtime.media_allowed_hosts == frozenset({"cdn.example.com", "127.0.0.1"})
+    with pytest.raises(ValueError):
+        parse_runtime_config(_extra(allowed_groups=[1.5]))
+    with pytest.raises(ValueError):
+        parse_runtime_config(_extra(media_allowed_hosts={"host": "cdn.example.com"}))
+
+
 def test启用llm_trigger必须显式配置群allowlist():
     """旁路模型不能在未限制群范围时隐式接管所有群。"""
     with pytest.raises(ValueError):

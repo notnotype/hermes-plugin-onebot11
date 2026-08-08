@@ -5,6 +5,7 @@ CI 环境没有 gateway 时自动跳过。
 """
 
 import asyncio
+import base64
 import json
 import os
 import time
@@ -1692,6 +1693,56 @@ async def test_白名单收紧后恢复不会启动旧群lease(monkeypatch):
     await adapter.disconnect()
 
 
+async def test_uncertain群不会继续消耗selector模型(monkeypatch):
+    """blocked 群必须先人工 resolve，软触发不能继续调用旁路 LLM。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    adapter.trigger_config = replace(
+        adapter.trigger_config,
+        llm_enabled=True,
+        llm_allowed_groups=frozenset({"888"}),
+    )
+    message = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="blocked-selector",
+        user_id="123",
+        user_name="小明",
+        text="问题？",
+        message_key="group:blocked-selector",
+    )
+    adapter._queue.enqueue(
+        message,
+        adapter_module.TriggerRequest.create(
+            "888",
+            "group:blocked-selector",
+            "mention",
+            "123",
+            "小明",
+        ),
+    )
+    lease = adapter._queue.claim("888")
+    assert lease is not None
+    assert adapter._queue.mark_uncertain(lease, "unknown")
+    state = adapter._trigger_state_for("888")
+    state.mode = "debounce"
+    state.debounce_due = 1.0
+
+    def fail_if_called():
+        raise AssertionError("uncertain 群不应调用 selector route")
+
+    monkeypatch.setattr(adapter, "_llm_trigger_route", fail_if_called)
+    await adapter._apply_trigger_action_locked(
+        "888",
+        adapter_module.TriggerAction("schedule", candidate_type="question"),
+    )
+    assert state.mode == "idle"
+    await adapter.disconnect()
+
+
 async def test_send走HTTP并返回SendResult(monkeypatch, fake_http_server):
     base, calls = fake_http_server
     adapter = _make_adapter(monkeypatch, ONEBOT11_HTTP_API=base, ONEBOT11_SELF_ID="1")
@@ -1705,6 +1756,129 @@ async def test_send走HTTP并返回SendResult(monkeypatch, fake_http_server):
         assert calls[0]["params"]["group_id"] == 888
     finally:
         await adapter.disconnect()
+
+
+async def test_send_image_file使用base64segment并保留reply(monkeypatch, fake_http_server):
+    """图片出站不能依赖 LLBot 容器可见的宿主机路径。"""
+    base, calls = fake_http_server
+    adapter = _make_adapter(monkeypatch, ONEBOT11_HTTP_API=base, ONEBOT11_SELF_ID="1")
+    await adapter.connect()
+    image_path = Path(adapter._media_root) / "reply.png"
+    payload = b"\x89PNG\r\n\x1a\nimage"
+    image_path.write_bytes(payload)
+    try:
+        adapter._chat_types["888"] = "group"
+        result = await adapter.send_image_file(
+            "888",
+            str(image_path),
+            caption="图片说明",
+            reply_to="1001",
+        )
+        assert result.success
+        assert calls[0]["path"] == "/send_group_msg"
+        segments = calls[0]["params"]["message"]
+        assert segments[0] == {"type": "reply", "data": {"id": "1001"}}
+        assert segments[1]["type"] == "image"
+        encoded = segments[1]["data"]["file"]
+        assert base64.b64decode(encoded.removeprefix("base64://")) == payload
+        assert segments[2] == {"type": "text", "data": {"text": "图片说明"}}
+    finally:
+        await adapter.disconnect()
+
+
+async def test_旧Hermes缺少媒体结果合同安全禁用图片(monkeypatch):
+    """旧 Hermes 不能可靠聚合媒体结果时，图片不得访问 OneBot。"""
+    monkeypatch.setattr(
+        BasePlatformAdapter,
+        "supports_media_delivery_results",
+        False,
+        raising=False,
+    )
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    called = False
+
+    async def fail_if_called(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("旧 Hermes 不应访问 OneBot 图片接口")
+
+    monkeypatch.setattr(adapter._api, "send_message_segments", fail_if_called)
+    event_token = adapter_module._CURRENT_EVENT.set(
+        SimpleNamespace(metadata={"onebot11_lease_id": "legacy-image-lease"})
+    )
+    try:
+        result = await adapter.send_multiple_images(
+            "888",
+            [("https://example.invalid/image.png", "")],
+            metadata={"onebot11_lease_id": "legacy-image-lease"},
+        )
+        assert len(result) == 1
+        assert result[0].error_kind == "unsupported"
+        assert "legacy-image-lease" in adapter._outbound_known_failure
+        assert called is False
+    finally:
+        adapter_module._CURRENT_EVENT.reset(event_token)
+
+
+async def test_send_multiple_images返回部分成功结果(monkeypatch):
+    """多图结果必须逐张保留，不能把部分成功折叠成一个成功。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    adapter._ws = object()
+    adapter._chat_types["888"] = "group"
+    first = Path(adapter._media_root) / "first.png"
+    second = Path(adapter._media_root) / "second.png"
+    first.write_bytes(b"\x89PNG\r\n\x1a\nfirst")
+    second.write_bytes(b"not-an-image")
+
+    async def fake_segments(*_args, **_kwargs):
+        return "first-message"
+
+    monkeypatch.setattr(adapter._api, "send_message_segments", fake_segments)
+    results = await adapter.send_multiple_images(
+        "888",
+        [(f"file://{first}", ""), (f"file://{second}", "")],
+    )
+    assert [result.success for result in results] == [True, False]
+
+
+async def test_send_multiple_images遇到unknown停止后续请求(monkeypatch):
+    """图片结果未知时不再发起同一 turn 的后续非幂等请求。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    adapter._ws = object()
+    adapter._chat_types["888"] = "group"
+    first = Path(adapter._media_root) / "unknown-first.png"
+    second = Path(adapter._media_root) / "unknown-second.png"
+    third = Path(adapter._media_root) / "unknown-third.png"
+    payload = b"\x89PNG\r\n\x1a\nimage"
+    for path in (first, second, third):
+        path.write_bytes(payload)
+    calls = 0
+
+    async def return_unknown(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return ""
+
+    monkeypatch.setattr(adapter._api, "send_message_segments", return_unknown)
+    results = await adapter.send_multiple_images(
+        "888",
+        [(f"file://{first}", ""), (f"file://{second}", ""), (f"file://{third}", "")],
+    )
+    assert calls == 1
+    assert len(results) == 3
+    assert all(result.error_kind == "unknown" for result in results)
 
 
 async def test_send未连接返回失败(monkeypatch):

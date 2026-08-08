@@ -204,9 +204,27 @@ class QueueStore:
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self._owner_id = uuid.uuid4().hex
-        self._closed = False
+        self._closed = True
         self._conn = self._open_connection()
-        self._migrate()
+        self._closed = False
+        try:
+            self._migrate()
+        except Exception:
+            # 迁移失败时不能留下仍被 Windows 文件锁占用的 SQLite 连接；
+            # 调用方可以看到原始错误，同时 QueueStore 保持 closed 状态。
+            self._close_after_migration_failure()
+            raise
+
+    def _close_after_migration_failure(self) -> None:
+        """在初始化或 reopen 迁移失败后关闭连接并保留 closed 状态。"""
+        try:
+            self._conn.rollback()
+        except sqlite3.Error:
+            pass
+        try:
+            self._conn.close()
+        finally:
+            self._closed = True
 
     def _open_connection(self) -> sqlite3.Connection:
         """打开一个新的 SQLite 连接并启用可靠队列所需的 pragma。"""
@@ -641,7 +659,6 @@ class QueueStore:
         )
         for statement in statements:
             self._conn.execute(statement)
-        self._create_indexes()
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_onebot_operation_fingerprint "
             "ON onebot_operation(fingerprint, updated_at)"
@@ -1935,26 +1952,27 @@ class QueueStore:
                     (str(chat_id),),
                 ).fetchall()
                 if action == "retry":
+                    blocked_row_ids = [int(row["row_id"]) for row in rows]
                     self._conn.execute(
-                        """
+                        f"""
                         UPDATE onebot_queue_message
                         SET state='pending', lease_id=NULL, lease_until=NULL, lease_owner=NULL,
                             lease_phase='pending', outbound_started=0, uncertain_reason=NULL,
                             failure_reason=NULL, failure_count=0, attempts=0,
                             next_attempt_at=?, updated_at=?
-                        WHERE chat_id=? AND state IN ('uncertain','failed')
+                        WHERE row_id IN ({",".join("?" for _ in blocked_row_ids)})
                         """,
-                        (now, now, str(chat_id)),
+                        (now, now, *blocked_row_ids),
                     )
                     self._transition_trigger_rows(list(trigger_rows), "pending", now)
                     if not trigger_rows:
                         self._conn.execute(
-                            """
+                            f"""
                             UPDATE onebot_queue_message
                             SET anchor_id=NULL
-                            WHERE chat_id=? AND state='pending'
+                            WHERE row_id IN ({",".join("?" for _ in blocked_row_ids)})
                             """,
-                            (str(chat_id),),
+                            tuple(blocked_row_ids),
                         )
                         self._ensure_retriable_trigger(
                             str(chat_id),
@@ -2360,7 +2378,11 @@ class QueueStore:
             self._conn = self._open_connection()
             self._owner_id = uuid.uuid4().hex
             self._closed = False
-            self._migrate()
+            try:
+                self._migrate()
+            except Exception:
+                self._close_after_migration_failure()
+                raise
 
     def abandon_owner_leases(self) -> dict[str, int]:
         """断开时结算当前 owner 的 lease，避免旧 turn 在重连后复活。"""

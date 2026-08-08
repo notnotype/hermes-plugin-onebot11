@@ -3,6 +3,8 @@
 用真实 aiohttp 测试服务端模拟 LLBot 的 ob11 HTTP 服务,验证组包/鉴权/重试/分块。
 """
 
+import base64
+
 import pytest
 from aiohttp import web
 
@@ -91,6 +93,33 @@ async def test_私聊发送组包(fake_server):
     assert call["params"]["message"] == [{"type": "text", "data": {"text": "你好"}}]
     assert call["auth"] == "Bearer tok"
     assert call["echo"]
+    await api.close()
+
+
+async def test_发送图片segment保留reply和base64(fake_server):
+    """OneBot 图片出站使用 base64://，不依赖宿主机路径可见性。"""
+    base, calls, _ = fake_server
+    api = OneBotHttpApi(base_url=base)
+    payload = b"\x89PNG\r\n\x1a\nimage"
+    message_id = await api.send_message_segments(
+        "88888888",
+        [
+            {"type": "reply", "data": {"id": "1001"}},
+            {
+                "type": "image",
+                "data": {"file": "base64://" + base64.b64encode(payload).decode("ascii")},
+            },
+        ],
+        chat_type="group",
+    )
+    assert message_id == "42"
+    assert calls[0]["params"]["message"][0] == {
+        "type": "reply",
+        "data": {"id": "1001"},
+    }
+    encoded = calls[0]["params"]["message"][1]["data"]["file"]
+    assert encoded.startswith("base64://")
+    assert base64.b64decode(encoded.removeprefix("base64://")) == payload
     await api.close()
 
 

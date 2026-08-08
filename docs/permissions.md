@@ -81,6 +81,12 @@ failed --管理员 discard--> deleted
 
 主动 disconnect 不增加失败次数；只有过期的明确 `agent_running` lease 才消耗有限恢复预算。lease phase 缺失或未知时统一进入 `uncertain`，不自动重放。
 
+OneBot 出站图片只能来自 Hermes 允许的媒体根目录，并在发送前校验扩展名、
+魔数和大小；插件把文件编码为受限 `base64://` image segment，不向外部
+图片 URL 携带 OneBot Bearer token，也不把失败的图片 URL/路径回退成文本。
+Hermes 会聚合每个图片块的 `SendResult`：图片-only turn 只有全部明确成功才
+允许 ack，部分成功或 unknown 进入失败/uncertain 生命周期。
+
 ## 运维命令
 
 超级管理员可在目标群发送：

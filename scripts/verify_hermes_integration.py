@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import importlib.util
 import inspect
 import os
@@ -39,13 +40,10 @@ def _environment(
     plugin_root: Path,
     hermes_source: Path,
     site_packages: Path,
-    auxiliary_source: Path | None,
     hermes_home: Path,
 ) -> dict[str, str]:
     """构造隔离的 Hermes/Python 环境，不修改调用者进程环境。"""
     sources = [str(plugin_root)]
-    if auxiliary_source is not None:
-        sources.append(str(auxiliary_source))
     sources.extend([str(hermes_source), str(site_packages)])
     env = os.environ.copy()
     env["HERMES_HOME"] = str(hermes_home)
@@ -275,6 +273,47 @@ async def _smoke(
             raise AssertionError("reconnect 后 pending message/trigger 未恢复")
         instance._queue.clear("888")
 
+        # 图片出站只做本地 segment smoke，不访问真实 OneBot；确认宿主机
+        # 路径被转换为可跨 Docker 边界传输的 base64://。
+        image_path = Path(instance._media_root) / "integration-image.png"
+        image_path.write_bytes(b"\x89PNG\r\n\x1a\nintegration")
+        instance._chat_types["888"] = "group"
+        captured_segments: list[list[dict]] = []
+
+        async def fake_send_segments(
+            target_id: str,
+            segments: list[dict],
+            *,
+            chat_type: str,
+        ) -> str:
+            if target_id != "888" or chat_type != "group":
+                raise AssertionError("图片 smoke 目标类型错误")
+            captured_segments.append(segments)
+            return "image-smoke-1"
+
+        original_send_segments = instance._api.send_message_segments
+        instance._api.send_message_segments = fake_send_segments
+        try:
+            image_result = await instance.send_image_file(
+                "888",
+                str(image_path),
+                caption="image smoke",
+            )
+        finally:
+            instance._api.send_message_segments = original_send_segments
+        if not image_result.success or not captured_segments:
+            raise AssertionError(f"图片出站 smoke 失败: {image_result!r}")
+        image_segment = next(
+            segment
+            for segment in captured_segments[0]
+            if segment.get("type") == "image"
+        )
+        encoded_image = str(image_segment["data"]["file"])
+        if not encoded_image.startswith("base64://") or base64.b64decode(
+            encoded_image.removeprefix("base64://")
+        ) != b"\x89PNG\r\n\x1a\nintegration":
+            raise AssertionError("图片 smoke 没有生成正确 base64 segment")
+
         # standalone cron 不依赖当前 session 或入站历史；用本地 monkeypatch
         # 验证目标类型和允许群合同，不访问真实 OneBot endpoint。
         captured: list[tuple[str, str, str]] = []
@@ -353,7 +392,6 @@ def main() -> int:
             plugin_root=plugin_root,
             hermes_source=hermes_source,
             site_packages=site_packages,
-            auxiliary_source=auxiliary_source,
             hermes_home=hermes_home,
         )
         if not args.skip_tests:

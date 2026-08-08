@@ -5,7 +5,7 @@
 
 ## 决策
 
-发送、撤回、禁言、踢人和全员禁言等非幂等 OneBot HTTP 请求永不自动重试。连接断开、超时、非 JSON、5xx、缺少可靠响应或分块部分成功时，把当前群 lease 标记为 `uncertain`，暂停自动重放，要求超级管理员明确 `/onebot resolve retry|discard`。
+发送、图片发送、撤回、禁言、踢人和全员禁言等非幂等 OneBot HTTP 请求永不自动重试。连接断开、超时、非 JSON、5xx、缺少可靠响应或分块部分成功时，把当前群 lease 标记为 `uncertain`，暂停自动重放，要求超级管理员明确 `/onebot resolve retry|discard`。Hermes 通用 delivery 层遇到 `error_kind="unknown"` 时也不重试、不发 plain-text fallback、不从 live cron 改走 standalone。
 
 ## 原因
 

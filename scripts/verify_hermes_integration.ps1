@@ -5,11 +5,18 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$pluginPython = Join-Path $repo ".venv\Scripts\python.exe"
 $script = Join-Path $repo "scripts\verify_hermes_integration.py"
-if (-not (Test-Path -LiteralPath $pluginPython)) {
-    throw "找不到插件虚拟环境 Python: $pluginPython"
+$pythonCandidates = @(
+    (Join-Path $repo ".venv\Scripts\python.exe"),
+    (Join-Path $repo "..\..\..\..\.venv\Scripts\python.exe")
+)
+$pluginPython = $pythonCandidates |
+    Where-Object { Test-Path -LiteralPath $_ } |
+    Select-Object -First 1
+if (-not $pluginPython) {
+    throw "找不到插件虚拟环境 Python；已检查: $($pythonCandidates -join ', ')"
 }
+$pluginPython = (Resolve-Path -LiteralPath $pluginPython).Path
 if (-not $HermesSource) {
     throw "请通过 -HermesSource 或 HERMES_ROOT 指定 Hermes 源码目录"
 }
@@ -20,6 +27,16 @@ $arguments = @(
     "--plugin-root", $repo,
     "--hermes-source", $HermesSource
 )
+$hermesSiteCandidates = @(
+    (Join-Path $HermesSource "venv\Lib\site-packages"),
+    (Join-Path $HermesSource "..\..\..\..\venv\Lib\site-packages")
+)
+$hermesSitePackages = $hermesSiteCandidates |
+    Where-Object { Test-Path -LiteralPath $_ } |
+    Select-Object -First 1
+if ($hermesSitePackages) {
+    $arguments += @("--hermes-site-packages", (Resolve-Path -LiteralPath $hermesSitePackages).Path)
+}
 if ($HermesAuxiliarySource) {
     $arguments += @("--hermes-auxiliary-source", (Resolve-Path -LiteralPath $HermesAuxiliarySource).Path)
 }

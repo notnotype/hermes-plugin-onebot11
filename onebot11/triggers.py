@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from time import monotonic
 from typing import Any
 
-from .permissions import parse_bool
+from .permissions import parse_bool, parse_id_list
 from .queue import QueueMessage
 
 
@@ -80,6 +80,8 @@ class LayeredTriggerState:
     engaged_max_until: float | None = None
     arbitration_count: int = 0
     llm_calls: int = 0
+    model_calls: int = 0
+    model_failures: int = 0
     llm_failures: int = 0
     last_candidate_type: str = ""
     dirty_revision: int | None = None
@@ -314,6 +316,9 @@ class LayeredTriggerState:
             "engaged_max_until": self.engaged_max_until,
             "arbitration_count": self.arbitration_count,
             "llm_calls": self.llm_calls,
+            "arbitrations": self.llm_calls,
+            "model_calls": self.model_calls,
+            "model_failures": self.model_failures,
             "llm_failures": self.llm_failures,
             "last_candidate_type": self.last_candidate_type,
         }
@@ -414,12 +419,7 @@ def _parse_keywords(value: Any) -> tuple[str, ...]:
 
 def _parse_group_ids(value: Any) -> frozenset[str]:
     """解析 LLM trigger 的显式群 allowlist。"""
-    if value is None:
-        return frozenset()
-    values = value.split(",") if isinstance(value, str) else value
-    if not isinstance(values, (list, tuple, set, frozenset)):
-        raise ValueError("llm_trigger_groups 必须是字符串或 YAML list")
-    return frozenset(str(item).strip() for item in values if str(item).strip())
+    return frozenset(parse_id_list(value))
 
 
 def _setting(extra: Mapping[str, Any], nested: Mapping[str, Any], name: str, default: Any = None) -> Any:

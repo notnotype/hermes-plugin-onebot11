@@ -1,7 +1,7 @@
 # OneBot 11 可靠性与安全完善
 
 - 关联需求：OneBot 11 插件整体完善计划
-- 状态：PR #8 基线上的 TurnAnchor 收口已完成本地实现、Hermes 组合验证和受限 Arch/LLBot 联调；本分支已推送，真人并发、unknown 出站和 resolve 仍待外部验收
+- 状态：PR #8 基线上的 TurnAnchor 与出站图片收口已完成本地实现和 Hermes 组合验证；真实图片出站、真人并发、unknown 出站和 resolve 仍待外部验收
 - 开始日期：2026-08-05
 
 ## 目标
@@ -21,6 +21,7 @@
 6. 生命周期：部分发送、连接中断、取消或 turn 在发送后失败均进入 `uncertain`；同一 adapter reconnect 会重新打开 SQLite/dispatcher，内存 active 状态回到 idle；群 turn 默认显示 👀，收尾时尽力清理；确认命令在 adapter 入站层处理。
 7. 管理动作台账：确认后先持久化 `started`；崩溃恢复为 `unknown`，同 fingerprint 阻断重复调用；管理员通过 operation id 明确 `retry_armed` 或 `discarded`。
 8. 收口修复：旧 lease 与后来 pending anchor 在事务中保持各自顺序；raw `self_id` 不匹配拒绝；completion 后续状态异常不再冒泡为第二个用户错误；reaction/authority 锚定真实触发消息；shared session 摘要优先临时注入。
+9. 出站媒体：图片使用受限 `base64://` segment；Hermes 聚合文本/媒体结果，unknown delivery 不自动重试、plain-text fallback 或 cron standalone fallback。
 
 ## 关键决策
 
@@ -36,7 +37,7 @@
 ## 验证
 
 - 本地插件门禁：`.venv\\Scripts\\python.exe -m pytest -q` 的纯插件结果见最终交付记录；纯插件环境只跳过需要 Hermes gateway 的 adapter 集成测试。
-- Hermes 集成：运行 `scripts\\verify_hermes_integration.ps1` 或跨平台 Python 入口；当前本地 Hermes 组合为 `218 passed`，覆盖真实 adapter import、注册、4 个 hooks、工具 handler、shared session key、TurnAnchor authority、lease fencing、同实例 reconnect、配置合同、operation resolve、触发竞争、上下文分段、媒体孤儿清理、raw self_id、home cron 和 reaction 生命周期。
+- Hermes 集成：运行 `scripts\\verify_hermes_integration.ps1` 或跨平台 Python 入口；当前本地 Hermes 组合为 `229 passed`，覆盖真实 adapter import、注册、4 个 hooks、工具 handler、shared session key、TurnAnchor authority、lease fencing、同实例 reconnect、配置合同、operation resolve、触发竞争、上下文分段、媒体孤儿清理、raw self_id、home cron、reaction 生命周期和出站图片/unknown delivery 合同。
 - 严格 auxiliary 回归：`3 passed`，覆盖新 API 的 no-fallback/单次尝试合同和旧 Hermes API 缺少参数时的安全禁用。
 - 静态检查：`.venv\\Scripts\\python.exe -m ruff check .`，当前通过；临时干净环境 `pip install -e ".[dev]"` 和 `import onebot11` 也已通过。
 - Arch + LLBot 外部联调：2026-08-08 部署 `a04e9a8`，确认机器人 QQ `3101482118`、群白名单 `1072992996`、私聊白名单 `2056963663` 和 `home_channel_type=dm`；真实 WS/HTTP 连接、真实历史 message ID 的 reaction 添加/移除、TurnAnchor batch 边界、重启后 pending 保留和白名单外群拒绝通过。入站仍为受控 WS payload，不等同于真人 QQ 发言；双用户并发、unknown 出站和 resolve 仍待验收。
