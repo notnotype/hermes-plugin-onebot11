@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- **阶段**：PR #8 基线上的 TurnAnchor 收口已完成本地实现和 Hermes 组合验证；当前分支尚未推送、创建 PR 或部署。Arch 上已有旧提交的合成 smoke 证据，但不能替代本分支的真人并发、真实 unknown 出站和真实 reaction 清理验收。
+- **阶段**：PR #8 基线上的 TurnAnchor 收口已完成本地实现、Hermes 组合验证和受限 Arch/LLBot 联调；当前分支已推送但尚未创建 PR。Arch 当前运行插件 commit `a04e9a8`，仍不能替代本分支的真人并发和真实 unknown 出站/resolve 验收。
 - **核心合同**：群固定一个共享 session；群消息持久入队；每个真实 TurnAnchor 固定 batch 和 authority，同群按序单 lease follow-up；非幂等出站结果未知时进入 `uncertain`，不自动重放。
 - **本地验证**：协议/状态机测试通过；使用本地 Hermes 源码与其 site-packages 运行 adapter 测试通过。最终门禁命令和环境见“验证证据”。
 
@@ -35,21 +35,21 @@
 
 ## 外部联调状态
 
-2026-08-07 在 Arch `192.168.1.18` 曾将旧 Hermes gateway 切换到插件 commit `af984b3`（版本 `0.3.3`），并补齐 `ONEBOT11_HOME_CHANNEL_TYPE=dm`；该记录只作为历史 smoke 证据。本分支后续联调仍固定机器人 QQ `3101482118`、唯一允许群 `1072992996` 和唯一允许私聊用户 `2056963663`，且必须先备份配置/SQLite/session。
+2026-08-08 在 Arch `ssh arch` 上将 Hermes gateway 切换到本分支 commit `a04e9a8`（版本 `0.4.0`）。联调严格固定机器人 QQ `3101482118`、唯一允许群 `1072992996` 和唯一允许私聊用户 `2056963663`；原始配置、`.env`、SQLite、session 和 LLBot 配置已备份到 `/home/notnotype/.hermes/onebot11-backup-20260808-turn-anchor-contract/`。
 
-旧部署已确认：
+当前分支已确认：
 
-- OneBot `get_login_info` 返回 `retcode=0`、机器人 QQ `3101482118`；群管理员 `/onebot status` 回执发到指定群，私聊管理员命令回执只发到 `2056963663`。
-- 通过真实反向 WS 向指定群注入三条合成事件（两条普通消息 + 一条 @），SQLite 序号从 100 到 103，最终 `pending/leased/uncertain/failed` 全为 0；确定性摘要包含三条消息，说明群队列批次收口正常。
-- 重启恢复回归：指定群注入一条不触发 Agent 的普通消息，重启前为 `pending=1、pending_trigger=0`，重启后仍为 `pending=1、pending_trigger=0`；随后直接清理该测试消息，当前队列为空。LLBot 日志确认 WS 断线后重新连接。
-- 本轮新部署使用不存在于 LLBot 消息库的合成 message ID 做 reaction，LLBot 返回 `msg not found`，因此不能把本轮合成事件记为 reaction 成功；此前旧部署的真实消息 ID reaction smoke 证据仍保留，但本轮新 commit 仍需真人消息或真实历史消息复验。
-- 白名单外群 `999999999` 的合成事件被拒绝，队列保持 `pending=0、trigger_requests=0`，没有产生出站；本次联调没有向白名单外目标发送消息。
-- 在 Arch 临时 Hermes home 中直测同一 adapter 的 `connect → disconnect → reconnect → disconnect`，四个阶段均在 3 秒超时内完成（实际约 1–20ms）；重连后 queue/dispatcher 可以继续工作。
+- OneBot `get_login_info` 返回 `retcode=0`、机器人 QQ `3101482118`；当前 WS 在 `0.0.0.0:18880` 监听。
+- 使用指定群中已存在的真实消息 ID `2076873675` 做一次受控 WS 重放：该 anchor 被 ack，后续 seq `119–127` 仍为 pending，证明 TurnAnchor batch 边界没有偷吃后续消息。
+- LLBot 日志确认对真实消息 `2076873675` 先发送 `emoji_id=128064,set=true`，Hermes 回复到指定群后再发送 `set=false`；回复消息 ID 为 `438359985`。这是真实消息 ID 的受控重放，不等同于真人刚发消息。
+- 重启 Hermes gateway 前后指定群均为 `schema=9、pending=9、无 trigger`，WS 恢复监听，pending 保留。
+- 白名单外群 `999999999` 的事件被拒绝，SQLite 中该群为 0 行，指定群队列未变化，没有产生出站。
+- Arch 配置原有 `roles.super_admin.tools: image_generate`（非 OneBot 工具），在备份后按 fail-closed 合同移除；白名单、token、机器人 QQ 和 LLBot 配置未放宽。
 
 当前 TurnAnchor 分支仍需单独完成：
 
-- 以上本轮 Agent 入站事件使用了真实反向 WS 的合成 OneBot payload，不等同于 QQ 客户端真人发言；还未完成两名真人群成员同时触发时的外部观察。
-- 指定群旧部署曾用已删除 smoke 消息验证群管理写工具预览/确认；本分支的非幂等出站 `unknown` 和 `resolve action retry|discard` 仍未在真实 QQ 上制造。
+- 以上入站仍是受控的反向 WS payload，不等同于 QQ 客户端真人发言；还未完成两名真人群成员同时 @ 时的外部观察。
+- 本分支的非幂等出站 `unknown` 和 `resolve action retry|discard` 尚未在真实 QQ 上制造；联调未执行禁言、踢人、撤回或全员禁言。
 - LLBot 当前请求日志会打印 Bearer header；插件不会把 token 发送到外部媒体地址，但部署侧应在生产前关闭该日志或轮换 token。未在本轮擅自修改 LLBot 凭据。
 - 未在本轮使用 NapCat，也未把 WS 重连重放行为提升为协议保证。
 - Hermes 全局 SIGTERM 关闭日志仍偶发出现 `onebot11 disconnect timed out after 5.0s`；空 adapter 直测没有复现，日志同时包含 Discord/Weixin 的关闭期错误，当前作为 Hermes 多平台 shutdown 观察项，不据此修改 OneBot 插件。
