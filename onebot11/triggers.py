@@ -409,9 +409,9 @@ def _parse_keywords(value: Any) -> tuple[str, ...]:
         raise ValueError("trigger_keywords 必须是字符串或 YAML list")
     normalized: list[str] = []
     for item in values:
-        if item is None:
-            continue
-        text = str(item).strip().casefold()
+        if not isinstance(item, str):
+            raise ValueError("trigger_keywords 和 memory_trigger_words 只能包含字符串")
+        text = item.strip().casefold()
         if text:
             normalized.append(text)
     return tuple(dict.fromkeys(normalized))
@@ -747,7 +747,9 @@ def should_trigger(
         reason = "keyword"
     else:
         return TriggerDecision(False, "no_trigger")
-    if config.cooldown_seconds > 0 and last_trigger_at is not None:
+    # 群的 @、关键词、always 是明确的硬触发，不能因为上一轮刚结束
+    # 就把用户明确唤醒消息吞掉。私聊沿用原有 cooldown 语义。
+    if chat_type == "dm" and config.cooldown_seconds > 0 and last_trigger_at is not None:
         current = monotonic() if now is None else now
         if current - last_trigger_at < config.cooldown_seconds:
             return TriggerDecision(False, "cooldown")

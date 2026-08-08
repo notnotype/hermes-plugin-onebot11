@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 
 from .queue import QueueLease, QueueStore
@@ -38,6 +38,7 @@ class GroupDispatcher:
         recovery_poll_seconds: float = 5.0,
         can_dispatch: Callable[[str], bool] | None = None,
         on_lease_lost: Callable[[QueueLease], Awaitable[None]] | None = None,
+        recovery_chat_ids: Callable[[], Iterable[str] | None] | None = None,
     ) -> None:
         """初始化调度器；lease 的续租由后台 heartbeat 负责。"""
         self.store = store
@@ -47,6 +48,7 @@ class GroupDispatcher:
         self.recovery_poll_seconds = max(0.05, float(recovery_poll_seconds))
         self._can_dispatch = can_dispatch or (lambda _chat_id: True)
         self._on_lease_lost = on_lease_lost
+        self._recovery_chat_ids = recovery_chat_ids
         self._locks: dict[str, asyncio.Lock] = {}
         self._active: dict[str, ActiveTurn] = {}
         self._heartbeat_tasks: dict[str, asyncio.Task[None]] = {}
@@ -192,7 +194,10 @@ class GroupDispatcher:
         if self._closed:
             return []
         self._ensure_recovery_loop()
-        requests = await asyncio.to_thread(self.store.recover_trigger_requests)
+        requests = await asyncio.to_thread(
+            self.store.recover_trigger_requests,
+            self._recovery_chat_ids() if self._recovery_chat_ids is not None else None,
+        )
         chats: list[str] = []
         for request in requests:
             if self._can_dispatch(request.chat_id) and await self.notify(request.chat_id):
@@ -209,7 +214,12 @@ class GroupDispatcher:
         try:
             while not self._closed:
                 await asyncio.sleep(self.recovery_poll_seconds)
-                requests = await asyncio.to_thread(self.store.recover_trigger_requests)
+                requests = await asyncio.to_thread(
+                    self.store.recover_trigger_requests,
+                    self._recovery_chat_ids()
+                    if self._recovery_chat_ids is not None
+                    else None,
+                )
                 for request in requests:
                     chat_id = request.chat_id
                     if (

@@ -151,6 +151,7 @@ class CallerContext:
     allowed_tools: frozenset[str] = READ_ONLY_TOOLS
     lease_id: str | None = None
     self_id: str = ""
+    adapter_epoch: int | None = None
 
     def target(self) -> ChatTarget:
         """返回当前调用者绑定的唯一出站目标。"""
@@ -328,7 +329,9 @@ def build_role_tools(extra: Mapping[str, Any]) -> dict[str, frozenset[str]]:
             values = value
         else:
             raise ValueError(f"roles.{role}.tools 必须是字符串或 YAML list")
-        normalized = frozenset(str(name).strip() for name in values if str(name).strip())
+        if any(not isinstance(name, str) for name in values):
+            raise ValueError(f"roles.{role}.tools 只能包含字符串")
+        normalized = frozenset(name.strip() for name in values if name.strip())
         unknown = normalized - ALL_TOOLS
         if unknown:
             raise ValueError(

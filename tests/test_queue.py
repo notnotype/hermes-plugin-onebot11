@@ -283,6 +283,206 @@ def test_真实v7表结构先补列再建索引(tmp_path):
     migrated.close()
 
 
+def _write_legacy_queue_schema(path, version: int) -> None:
+    """写入 v7/v8/v9/v10 的真实表形状，而不是只修改 user_version。"""
+    message_extra = ""
+    if version >= 8:
+        message_extra = """
+            message_id TEXT NOT NULL DEFAULT '',
+            lease_owner TEXT,
+            uncertain_reason TEXT,
+            lease_phase TEXT NOT NULL DEFAULT 'pending',
+            outbound_started INTEGER NOT NULL DEFAULT 0,
+            failure_count INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at REAL,
+            failure_reason TEXT,
+        """
+    message_anchor = "anchor_id TEXT," if version >= 9 else ""
+    message_state = (
+        "CHECK(state IN ('pending','leased','uncertain','failed'))"
+        if version >= 8
+        else "CHECK(state IN ('pending','leased','uncertain'))"
+    )
+    trigger_extra = ""
+    if version >= 9:
+        trigger_extra = """
+            anchor_seq INTEGER,
+            anchor_kind TEXT NOT NULL DEFAULT 'message',
+            batch_start_seq INTEGER,
+            control_message_id TEXT,
+            failure_count INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at REAL,
+            failure_reason TEXT,
+        """
+    trigger_lease_extra = ""
+    if version >= 8:
+        trigger_lease_extra = """
+            lease_owner TEXT,
+            uncertain_reason TEXT,
+        """
+    authority_extra = ""
+    authority_values = "NULL, NULL,"
+    if version >= 10:
+        authority_extra = """
+            authority_role TEXT,
+            authority_tools_json TEXT,
+        """
+        authority_values = "'user', '[\"qq_get_message\"]',"
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        f"""
+        CREATE TABLE onebot_queue_chat (
+            chat_id TEXT PRIMARY KEY,
+            next_seq INTEGER NOT NULL DEFAULT 1,
+            summary TEXT NOT NULL DEFAULT '',
+            paused INTEGER NOT NULL DEFAULT 0,
+            revision INTEGER NOT NULL DEFAULT 0,
+            updated_at REAL NOT NULL
+        );
+        CREATE TABLE onebot_queue_message (
+            row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id TEXT NOT NULL,
+            message_key TEXT NOT NULL,
+            chat_type TEXT NOT NULL,
+            user_id TEXT NOT NULL,
+            user_name TEXT NOT NULL,
+            text TEXT NOT NULL,
+            raw_text TEXT NOT NULL,
+            {message_extra}
+            metadata_json TEXT NOT NULL,
+            seq INTEGER NOT NULL,
+            byte_size INTEGER NOT NULL,
+            state TEXT NOT NULL {message_state},
+            lease_id TEXT,
+            lease_until REAL,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            {message_anchor}
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(chat_id, message_key)
+        );
+        CREATE TABLE onebot_queue_trigger (
+            request_id TEXT PRIMARY KEY,
+            chat_id TEXT NOT NULL,
+            message_key TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            caller_user_id TEXT NOT NULL,
+            caller_user_name TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('pending','claimed','uncertain','failed')),
+            lease_id TEXT,
+            {trigger_lease_extra}
+            {trigger_extra}
+            {authority_extra}
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL,
+            UNIQUE(chat_id, message_key)
+        );
+        CREATE TABLE onebot_queue_reaction (
+            lease_id TEXT PRIMARY KEY,
+            chat_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            state TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
+        INSERT INTO onebot_queue_chat(chat_id, next_seq, updated_at)
+        VALUES ('888', 2, 1000);
+        INSERT INTO onebot_queue_message(
+            chat_id,message_key,chat_type,user_id,user_name,text,raw_text,
+            metadata_json,seq,byte_size,state,lease_id,lease_until,attempts,
+            created_at,updated_at
+        ) VALUES (
+            '888','group:legacy-{version}','group','123','小明','旧消息','旧消息',
+            '{{}}',1,100,'pending',NULL,NULL,0,900,900
+        );
+        INSERT INTO onebot_queue_trigger(
+            request_id,chat_id,message_key,reason,caller_user_id,caller_user_name,
+            status,lease_id,{ "anchor_seq,anchor_kind,batch_start_seq,control_message_id," if version >= 9 else "" }
+            { "failure_count,next_attempt_at,failure_reason," if version >= 9 else "" }
+            { "authority_role,authority_tools_json," if version >= 10 else "" }
+            created_at,updated_at
+        ) VALUES (
+            'legacy-trigger-{version}','888','group:legacy-{version}','mention','123','小明',
+            'pending',NULL,{ "NULL,'message',NULL,NULL," if version >= 9 else "" }
+            { "0,NULL,NULL," if version >= 9 else "" }
+            { authority_values if version >= 10 else "" }
+            900,900
+        );
+        CREATE INDEX idx_legacy_trigger_status
+            ON onebot_queue_trigger(status{", anchor_seq" if version >= 9 else ""});
+        CREATE INDEX idx_legacy_message_state
+            ON onebot_queue_message(chat_id, state{", anchor_id" if version >= 9 else ""});
+        PRAGMA user_version={version};
+        """
+    )
+    connection.commit()
+    connection.close()
+
+
+@pytest.mark.parametrize("version", [7, 8, 9, 10])
+def test_v7到v10真实表结构迁移到schema11(tmp_path, version):
+    """四个已部署版本都必须保留核心消息并安全处理 authority/reaction。"""
+    path = tmp_path / f"queue-v{version}.sqlite3"
+    _write_legacy_queue_schema(path, version)
+
+    migrated = QueueStore(path)
+    assert migrated._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert migrated._conn.execute(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='onebot_queue_reaction'"
+    ).fetchone()[0] == 0
+    assert migrated.status("888")["pending"] == (1 if version == 10 else 0)
+    assert migrated.status("888")["uncertain"] == (0 if version == 10 else 1)
+    if version == 10:
+        assert len(migrated.recover_trigger_requests()) == 1
+    else:
+        assert migrated.recover_trigger_requests() == ()
+    migrated.close()
+
+
+def test_v10有完整authority和phase的活动lease不被误标unknown(tmp_path):
+    """补列本身不能把仍可证明的 v10 活动 lease 变成 uncertain。"""
+    path = tmp_path / "queue-v10-active.sqlite3"
+    _write_legacy_queue_schema(path, 10)
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """
+        UPDATE onebot_queue_message
+        SET state='leased', lease_id='v10-lease', lease_until=9999999999,
+            lease_owner='old-owner', lease_phase='agent_running',
+            outbound_started=0
+        WHERE chat_id='888'
+        """
+    )
+    connection.execute(
+        """
+        UPDATE onebot_queue_trigger
+        SET status='claimed', lease_id='v10-lease', lease_owner='old-owner'
+        WHERE chat_id='888'
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    migrated = QueueStore(path)
+    assert migrated.status("888")["leased"] == 1
+    assert migrated.status("888")["uncertain"] == 0
+    migrated.close()
+
+
+def test_恢复白名单只触碰允许群(tmp_path):
+    """恢复时不能因为本地旧数据存在就启动白名单外群。"""
+    store = QueueStore(tmp_path / "queue-scope.sqlite3")
+    for chat_id in ("1072992996", "9999999999"):
+        message = _message(f"scope-{chat_id}", chat_id=chat_id)
+        store.enqueue(message, _trigger(message))
+    assert [item.chat_id for item in store.recover_trigger_requests({"1072992996"})] == [
+        "1072992996"
+    ]
+    assert store.status("9999999999")["pending"] == 1
+    assert store.status("9999999999")["pending_trigger_requests"] == 1
+    store.close()
+
+
 def test_迁移失败后连接已关闭(tmp_path, monkeypatch):
     """初始化迁移异常不能留下仍占用文件的 SQLite 连接。"""
     opened: list[sqlite3.Connection] = []

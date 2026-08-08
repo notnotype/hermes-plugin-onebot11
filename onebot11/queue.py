@@ -8,20 +8,23 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 11
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_BACKOFF_SECONDS = (2.0, 4.0, 8.0)
 MAX_BACKOFF_SECONDS = 60.0
 _HARD_TRIGGER_REASONS = frozenset({"mention", "keyword", "always", "admin_flush"})
+_AUTHORITY_ROLES = frozenset({"user", "trusted_user", "super_admin"})
+logger = logging.getLogger(__name__)
 
 
 def _trigger_priority(reason: str) -> int:
@@ -85,6 +88,9 @@ class TriggerRequest:
     anchor_kind: str = "message"
     batch_start_seq: int | None = None
     control_message_id: str | None = None
+    authority_role: str | None = "user"
+    authority_tools: frozenset[str] = frozenset()
+    authority_self_id: str | None = None
 
     @classmethod
     def create(
@@ -99,8 +105,16 @@ class TriggerRequest:
         anchor_kind: str = "message",
         batch_start_seq: int | None = None,
         control_message_id: str | None = None,
+        authority_role: str | None = "user",
+        authority_tools: Iterable[str] | None = None,
+        authority_self_id: str | None = None,
     ) -> TriggerRequest:
         """创建一个新的持久触发请求。"""
+        normalized_tools = frozenset(
+            item.strip()
+            for item in (authority_tools or ())
+            if isinstance(item, str) and item.strip()
+        )
         return cls(
             request_id=uuid.uuid4().hex,
             chat_id=str(chat_id),
@@ -113,6 +127,17 @@ class TriggerRequest:
             anchor_kind=str(anchor_kind),
             batch_start_seq=batch_start_seq,
             control_message_id=control_message_id,
+            authority_role=(
+                str(authority_role).strip()
+                if authority_role is not None
+                else None
+            ),
+            authority_tools=normalized_tools,
+            authority_self_id=(
+                str(authority_self_id).strip()
+                if authority_self_id is not None
+                else None
+            ),
         )
 
 
@@ -237,16 +262,63 @@ class QueueStore:
     def _migrate(self) -> None:
         """创建当前 schema 或从已知旧版本迁移。"""
         with self._lock:
-            version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
-            if version > SCHEMA_VERSION:
-                raise QueueError(
-                    f"OneBot11 queue schema {version} 高于支持版本 {SCHEMA_VERSION}"
-                )
-            self._create_tables()
-            self._migrate_columns(version)
-            if version < SCHEMA_VERSION:
+            self._transaction()
+            try:
+                version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+                if version > SCHEMA_VERSION:
+                    raise QueueError(
+                        f"OneBot11 queue schema {version} 高于支持版本 {SCHEMA_VERSION}"
+                    )
+                # 旧索引可能在缺少 anchor_id/anchor_seq 时阻塞 ALTER TABLE；
+                # 必须在任何补列和建表动作之前删除。
+                self._drop_migration_indexes()
+                self._create_tables()
+                self._migrate_columns(version)
+                self._drop_legacy_reaction_table()
+                self._create_indexes()
+                self._recover_started_operations()
                 self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                 self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def _drop_migration_indexes(self) -> None:
+        """删除可能引用旧表缺失列的索引，迁移完成后统一重建。"""
+        rows = self._conn.execute(
+            """
+            SELECT name, sql
+            FROM sqlite_master
+            WHERE type='index'
+              AND (
+                  tbl_name IN ('onebot_queue_message', 'onebot_queue_trigger')
+                  OR name IN (
+                      'uq_onebot_queue_trigger_pending_chat',
+                      'idx_onebot_queue_trigger_anchor_seq'
+                  )
+              )
+            """
+        ).fetchall()
+        for row in rows:
+            name = str(row["name"])
+            if name.startswith("sqlite_autoindex_"):
+                continue
+            self._conn.execute(f'DROP INDEX IF EXISTS "{name.replace(chr(34), chr(34) * 2)}"')
+
+    def _drop_legacy_reaction_table(self) -> None:
+        """丢弃旧版 reaction 持久记录；远端 reaction 不承诺回收。"""
+        row = self._conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='onebot_queue_reaction'"
+        ).fetchone()
+        if row and int(row[0]) > 0:
+            count = int(
+                self._conn.execute("SELECT COUNT(*) FROM onebot_queue_reaction").fetchone()[0]
+            )
+            self._conn.execute("DROP TABLE onebot_queue_reaction")
+            logger.info(
+                "OneBot11 丢弃 %s 条旧 reaction 记录；不尝试清理远端 reaction",
+                count,
+            )
 
     def _migrate_columns(self, version: int) -> None:
         """为已存在的队列文件补充增量列；未知结构直接拒绝启动。"""
@@ -274,11 +346,9 @@ class QueueStore:
             "caller_user_name", "status", "lease_id", "created_at", "updated_at",
         }
         required_chat = {"chat_id", "next_seq", "summary", "paused", "updated_at"}
-        if (
-            not required_message.issubset(message_columns)
-            or not required_trigger.issubset(trigger_columns)
-            or not required_chat.issubset(chat_columns)
-        ):
+        if not required_message.issubset(message_columns) or not required_trigger.issubset(
+            trigger_columns
+        ) or not required_chat.issubset(chat_columns):
             raise QueueError("OneBot11 queue schema 缺少必需列，无法安全迁移")
         additions = (
             ("onebot_queue_chat", chat_columns, "revision", "INTEGER NOT NULL DEFAULT 0"),
@@ -300,12 +370,13 @@ class QueueStore:
             ("onebot_queue_trigger", trigger_columns, "failure_count", "INTEGER NOT NULL DEFAULT 0"),
             ("onebot_queue_trigger", trigger_columns, "next_attempt_at", "REAL"),
             ("onebot_queue_trigger", trigger_columns, "failure_reason", "TEXT"),
+            ("onebot_queue_trigger", trigger_columns, "authority_role", "TEXT"),
+            ("onebot_queue_trigger", trigger_columns, "authority_tools_json", "TEXT"),
+            ("onebot_queue_trigger", trigger_columns, "authority_self_id", "TEXT"),
         )
-        structure_changed = False
         for table, columns, name, definition in additions:
             if name not in columns:
                 self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
-                structure_changed = True
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS onebot_queue_dedupe (
@@ -338,7 +409,9 @@ class QueueStore:
         if "failed" not in trigger_sql:
             self._rebuild_trigger_table()
             rebuilt_legacy = True
-        if version < 6 or structure_changed or rebuilt_legacy:
+        # 仅在旧状态无法证明 phase 或必须重建表时 hold；单纯补充
+        # authority/anchor 列不应把已经可证明的 v8/v10 lease 误标 unknown。
+        if version < 6 or rebuilt_legacy:
             self._mark_legacy_leases_uncertain()
         self._conn.execute("DROP INDEX IF EXISTS uq_onebot_queue_trigger_pending_chat")
         self._conn.execute(
@@ -377,9 +450,9 @@ class QueueStore:
             WHERE state='pending' AND lease_id IS NULL AND outbound_started=0
             """
         )
-        self._create_indexes()
-        self._recover_started_operations()
-        self._conn.commit()
+        if version > 0 and version < SCHEMA_VERSION:
+            self._mark_legacy_authority_uncertain()
+        # 索引、operation recovery 和 user_version 由 _migrate 在最后统一提交。
 
     def _recover_started_operations(self) -> None:
         """进程启动后把没有结算的管理动作标记为未知。"""
@@ -505,6 +578,9 @@ class QueueStore:
                 failure_count INTEGER NOT NULL DEFAULT 0,
                 next_attempt_at REAL,
                 failure_reason TEXT,
+                authority_role TEXT,
+                authority_tools_json TEXT,
+                authority_self_id TEXT,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
                 UNIQUE(chat_id, message_key)
@@ -517,11 +593,12 @@ class QueueStore:
                 request_id,chat_id,message_key,reason,caller_user_id,caller_user_name,
                 status,lease_id,lease_owner,uncertain_reason,anchor_seq,anchor_kind,
                 batch_start_seq,control_message_id,failure_count,next_attempt_at,
-                failure_reason,created_at,updated_at
+                failure_reason,authority_role,authority_tools_json,authority_self_id,
+                created_at,updated_at
             )
             SELECT request_id,chat_id,message_key,reason,caller_user_id,caller_user_name,
                 status,lease_id,lease_owner,uncertain_reason,NULL,'message',
-                NULL,NULL,0,NULL,NULL,created_at,updated_at
+                NULL,NULL,0,NULL,NULL,NULL,NULL,NULL,created_at,updated_at
             FROM onebot_queue_trigger_legacy
             """
         )
@@ -552,6 +629,44 @@ class QueueStore:
                 WHERE lease_id=? AND state='leased'
                 """,
                 (reason, self._now(), lease_id),
+            )
+
+    def _mark_legacy_authority_uncertain(self) -> None:
+        """旧版本没有权限快照时，禁止按当前配置自动执行旧 anchor。"""
+        reason = "旧 schema 缺少 authority 快照，需管理员确认"
+        now = self._now()
+        rows = self._conn.execute(
+            """
+            SELECT * FROM onebot_queue_trigger
+            WHERE status IN ('pending','claimed')
+            """
+        ).fetchall()
+        for row in rows:
+            if self._authority_row_valid(row):
+                continue
+            request_id = str(row["request_id"])
+            chat_id = str(row["chat_id"])
+            message_key = str(row["message_key"])
+            self._conn.execute(
+                """
+                UPDATE onebot_queue_trigger
+                SET status='uncertain', lease_id=NULL, lease_owner=NULL,
+                    uncertain_reason=?, failure_reason=?, next_attempt_at=NULL,
+                    updated_at=?
+                WHERE request_id=?
+                """,
+                (reason, reason, now, request_id),
+            )
+            self._conn.execute(
+                """
+                UPDATE onebot_queue_message
+                SET state='uncertain', lease_id=NULL, lease_until=NULL, lease_owner=NULL,
+                    lease_phase='uncertain', outbound_started=1, uncertain_reason=?,
+                    failure_reason=?, next_attempt_at=NULL, updated_at=?
+                WHERE chat_id=? AND state IN ('pending','leased')
+                  AND (anchor_id=? OR message_key=?)
+                """,
+                (reason, reason, now, chat_id, request_id, message_key),
             )
 
     def _create_indexes(self) -> None:
@@ -631,6 +746,9 @@ class QueueStore:
                 failure_count INTEGER NOT NULL DEFAULT 0,
                 next_attempt_at REAL,
                 failure_reason TEXT,
+                authority_role TEXT NOT NULL DEFAULT 'user',
+                authority_tools_json TEXT NOT NULL DEFAULT '[]',
+                authority_self_id TEXT,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
                 UNIQUE(chat_id, message_key)
@@ -667,7 +785,6 @@ class QueueStore:
             "CREATE INDEX IF NOT EXISTS idx_onebot_operation_chat "
             "ON onebot_operation(chat_type, chat_id, updated_at)"
         )
-        self._conn.commit()
 
     def _now(self) -> float:
         """返回可替换的当前时间，测试可通过 monkeypatch 控制。"""
@@ -883,6 +1000,9 @@ class QueueStore:
                         anchor_seq=COALESCE(anchor_seq, ?),
                         anchor_kind=?,
                         control_message_id=COALESCE(control_message_id, ?),
+                        authority_role=COALESCE(?, authority_role),
+                        authority_tools_json=COALESCE(?, authority_tools_json),
+                        authority_self_id=COALESCE(?, authority_self_id),
                         updated_at=?, uncertain_reason=NULL,
                         failure_reason=NULL, next_attempt_at=NULL
                     WHERE request_id=? AND status='pending'
@@ -894,6 +1014,17 @@ class QueueStore:
                         anchor_seq if anchor_seq is not None else trigger.anchor_seq,
                         str(trigger.anchor_kind or "message"),
                         trigger.control_message_id,
+                        trigger.authority_role,
+                        (
+                            json.dumps(
+                                sorted(trigger.authority_tools),
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                            if trigger.authority_role is not None
+                            else None
+                        ),
+                        trigger.authority_self_id,
                         now,
                         str(existing["request_id"]),
                     ),
@@ -938,8 +1069,9 @@ class QueueStore:
             INSERT OR IGNORE INTO onebot_queue_trigger(
                 request_id,chat_id,message_key,reason,caller_user_id,caller_user_name,
                 status,anchor_seq,anchor_kind,batch_start_seq,control_message_id,
+                authority_role,authority_tools_json,authority_self_id,
                 created_at,updated_at
-            ) VALUES (?,?,?,?,?,?, 'pending',?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?, 'pending',?,?,?,?,?,?,?,?,?)
             """,
             (
                 trigger.request_id,
@@ -952,6 +1084,17 @@ class QueueStore:
                 str(trigger.anchor_kind or "message"),
                 trigger.batch_start_seq,
                 trigger.control_message_id,
+                trigger.authority_role,
+                (
+                    json.dumps(
+                        sorted(trigger.authority_tools),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                    if trigger.authority_role is not None
+                    else None
+                ),
+                trigger.authority_self_id,
                 trigger.created_at,
                 now,
             ),
@@ -1035,12 +1178,16 @@ class QueueStore:
         ).fetchone()
         if row is None:
             return None
+        authority_role, authority_tools, authority_self_id = self._authority_from_message_row(row)
         trigger = TriggerRequest.create(
             str(chat_id),
             str(row["message_key"]),
             "queue_recovery",
             str(row["user_id"]),
             str(row["user_name"]),
+            authority_role=authority_role,
+            authority_tools=authority_tools,
+            authority_self_id=authority_self_id,
         )
         return self._ensure_trigger(
             trigger,
@@ -1050,13 +1197,58 @@ class QueueStore:
             anchor_seq=int(row["seq"]),
         )
 
-    def _recover_expired_leases(self, now: float, chat_id: str | None = None) -> None:
+    def _authority_from_message_row(
+        self,
+        row: sqlite3.Row,
+    ) -> tuple[str | None, frozenset[str], str | None]:
+        """从入队时保存的受限 metadata 恢复 authority 快照。"""
+        try:
+            metadata = json.loads(str(row["metadata_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            metadata = {}
+        authority = metadata.get("onebot11_authority") if isinstance(metadata, Mapping) else None
+        if not isinstance(authority, Mapping):
+            # 通用 QueueStore 仍允许没有 adapter metadata 的调用方创建
+            # 最小权限恢复入口；真正的 OneBot adapter 会在启动 turn 时
+            # 继续要求 authority self_id 并 fail-closed。
+            return "user", frozenset(), None
+        role = authority.get("role")
+        tools = authority.get("allowed_tools")
+        self_id = authority.get("self_id")
+        if not isinstance(role, str) or not role.strip():
+            return None, frozenset(), None
+        if not isinstance(tools, (list, tuple, set, frozenset)) or any(
+            not isinstance(item, str) for item in tools
+        ):
+            return None, frozenset(), None
+        if self_id is not None and (
+            not isinstance(self_id, str) or not self_id.strip()
+        ):
+            return None, frozenset(), None
+        return (
+            role.strip(),
+            frozenset(item.strip() for item in tools if item.strip()),
+            self_id.strip() if isinstance(self_id, str) else None,
+        )
+
+    def _recover_expired_leases(
+        self,
+        now: float,
+        chat_id: str | None = None,
+        chat_ids: frozenset[str] | None = None,
+    ) -> None:
         """恢复过期 lease；只有明确 agent_running 才允许有限自动重试。"""
         chat_clause = ""
         query_params: list[Any] = [now]
         if chat_id is not None:
             chat_clause = " AND chat_id=?"
             query_params.append(str(chat_id))
+        elif chat_ids is not None:
+            if not chat_ids:
+                return
+            placeholders = ",".join("?" for _ in chat_ids)
+            chat_clause = f" AND chat_id IN ({placeholders})"
+            query_params.extend(sorted(chat_ids))
         lease_rows = self._conn.execute(
             f"""
             SELECT lease_id, chat_id, MAX(failure_count) AS failure_count
@@ -1219,6 +1411,9 @@ class QueueStore:
         *,
         anchor_kind: str = "message",
         control_message_id: str | None = None,
+        authority_role: str | None = "user",
+        authority_tools: Iterable[str] | None = None,
+        authority_self_id: str | None = None,
     ) -> str | None:
         """为指定或最早待处理消息创建 durable anchor，不创建 lease。"""
         with self._lock:
@@ -1262,6 +1457,9 @@ class QueueStore:
                     anchor_seq=int(row["seq"]),
                     anchor_kind=anchor_kind,
                     control_message_id=control_message_id,
+                    authority_role=authority_role,
+                    authority_tools=authority_tools,
+                    authority_self_id=authority_self_id,
                 )
                 request_id = self._ensure_trigger(
                     trigger,
@@ -1284,6 +1482,9 @@ class QueueStore:
         *,
         triggered_at: float | None = None,
         anchor_kind: str = "selector",
+        authority_role: str | None = "user",
+        authority_tools: Iterable[str] | None = None,
+        authority_self_id: str | None = None,
     ) -> str | None:
         """为指定的仍待处理消息创建唯一 message anchor。"""
         with self._lock:
@@ -1315,6 +1516,9 @@ class QueueStore:
                     str(row["user_name"]),
                     anchor_seq=int(anchor_seq),
                     anchor_kind=anchor_kind,
+                    authority_role=authority_role,
+                    authority_tools=authority_tools,
+                    authority_self_id=authority_self_id,
                 )
                 request_id = self._ensure_trigger(
                     trigger,
@@ -1423,6 +1627,14 @@ class QueueStore:
                     (chat_id,),
                 ).fetchone()
                 if trigger_row is None:
+                    self._conn.commit()
+                    return None
+                if not self._authority_row_valid(trigger_row):
+                    self._mark_trigger_authority_uncertain(
+                        trigger_row,
+                        "OneBot11 durable anchor 的 authority 快照损坏或缺失",
+                        now,
+                    )
                     self._conn.commit()
                     return None
                 anchor_id = str(trigger_row["request_id"])
@@ -2178,38 +2390,68 @@ class QueueStore:
             )
             self._conn.commit()
 
-    def recover_trigger_requests(self) -> tuple[TriggerRequest, ...]:
-        """启动恢复过期 lease，并返回仍需 dispatch 的持久触发请求。"""
+    def recover_trigger_requests(
+        self,
+        allowed_chat_ids: Iterable[str] | None = None,
+    ) -> tuple[TriggerRequest, ...]:
+        """按可选群白名单恢复 lease，并返回仍需 dispatch 的 durable anchor。"""
+        scope = (
+            None
+            if allowed_chat_ids is None
+            else frozenset(str(chat_id) for chat_id in allowed_chat_ids)
+        )
+        if scope is not None and not scope:
+            return ()
         with self._lock:
             try:
                 self._transaction()
                 now = self._now()
-                self._recover_expired_leases(now)
+                self._recover_expired_leases(now, chat_ids=scope)
+                scope_sql = ""
+                scope_params: tuple[Any, ...] = ()
+                if scope is not None:
+                    placeholders = ",".join("?" for _ in scope)
+                    scope_sql = f" AND trigger.chat_id IN ({placeholders})"
+                    scope_params = tuple(sorted(scope))
                 stale_trigger_rows = self._conn.execute(
-                    """
+                    f"""
                     SELECT * FROM onebot_queue_trigger AS trigger
                     WHERE trigger.status='claimed' AND NOT EXISTS (
                         SELECT 1 FROM onebot_queue_message AS message
                         WHERE message.chat_id=trigger.chat_id
                           AND message.lease_id=trigger.lease_id
                           AND message.state='leased'
-                    )
-                    """
+                    ){scope_sql}
+                    """,
+                    scope_params,
                 ).fetchall()
                 self._transition_trigger_rows(list(stale_trigger_rows), "pending", now)
+                message_scope_sql = ""
+                message_scope_params: tuple[Any, ...] = ()
+                if scope is not None:
+                    placeholders = ",".join("?" for _ in scope)
+                    message_scope_sql = f" AND chat_id IN ({placeholders})"
+                    message_scope_params = tuple(sorted(scope))
                 self._conn.execute(
-                    """
+                    f"""
                     DELETE FROM onebot_queue_trigger
-                    WHERE status='pending' AND NOT EXISTS (
+                    WHERE status='pending'{message_scope_sql} AND NOT EXISTS (
                         SELECT 1 FROM onebot_queue_message
                         WHERE onebot_queue_message.chat_id=onebot_queue_trigger.chat_id
                           AND onebot_queue_message.message_key=onebot_queue_trigger.message_key
                     )
-                    """
+                    """,
+                    message_scope_params,
                 )
                 self._conn.commit()
+                candidate_scope_sql = ""
+                candidate_scope_params: tuple[Any, ...] = ()
+                if scope is not None:
+                    placeholders = ",".join("?" for _ in scope)
+                    candidate_scope_sql = f" AND trigger.chat_id IN ({placeholders})"
+                    candidate_scope_params = tuple(sorted(scope))
                 candidate_rows = self._conn.execute(
-                    """
+                    f"""
                     SELECT trigger.* FROM onebot_queue_trigger AS trigger
                     WHERE trigger.status='pending' AND EXISTS (
                         SELECT 1 FROM onebot_queue_message AS message
@@ -2219,9 +2461,11 @@ class QueueStore:
                               OR message.message_key=trigger.message_key
                           )
                           AND message.state='pending'
-                    ) ORDER BY COALESCE(trigger.anchor_seq, 9223372036854775807),
+                    ){candidate_scope_sql}
+                    ORDER BY COALESCE(trigger.anchor_seq, 9223372036854775807),
                               trigger.created_at
                     """,
+                    candidate_scope_params,
                 ).fetchall()
                 ready_rows: list[sqlite3.Row] = []
                 for row in candidate_rows:
@@ -2305,6 +2549,15 @@ class QueueStore:
 
     def _row_to_trigger(self, row: sqlite3.Row) -> TriggerRequest:
         """把 SQLite 行转换为触发请求。"""
+        try:
+            authority_tools_value = json.loads(str(row["authority_tools_json"]))
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            authority_tools_value = None
+        authority_tools = (
+            frozenset(item for item in authority_tools_value if isinstance(item, str))
+            if isinstance(authority_tools_value, list)
+            else frozenset()
+        )
         return TriggerRequest(
             request_id=str(row["request_id"]),
             chat_id=str(row["chat_id"]),
@@ -2325,6 +2578,58 @@ class QueueStore:
                 if row["control_message_id"] is not None
                 else None
             ),
+            authority_role=(
+                str(row["authority_role"])
+                if row["authority_role"] is not None
+                else None
+            ),
+            authority_tools=authority_tools,
+            authority_self_id=(
+                str(row["authority_self_id"])
+                if row["authority_self_id"] is not None
+                else None
+            ),
+        )
+
+    def _authority_row_valid(self, row: sqlite3.Row) -> bool:
+        """校验 authority 快照结构；当前配置交集由 adapter 再做一次。"""
+        role = row["authority_role"]
+        if not isinstance(role, str) or role not in _AUTHORITY_ROLES:
+            return False
+        try:
+            tools = json.loads(str(row["authority_tools_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        return isinstance(tools, list) and all(isinstance(item, str) for item in tools)
+
+    def _mark_trigger_authority_uncertain(
+        self,
+        trigger_row: sqlite3.Row,
+        reason: str,
+        now: float,
+    ) -> None:
+        """把损坏 anchor 和其消息一起置为人工处理状态。"""
+        request_id = str(trigger_row["request_id"])
+        chat_id = str(trigger_row["chat_id"])
+        self._conn.execute(
+            """
+            UPDATE onebot_queue_trigger
+            SET status='uncertain', lease_id=NULL, lease_owner=NULL,
+                uncertain_reason=?, failure_reason=?, next_attempt_at=NULL,
+                updated_at=?
+            WHERE request_id=? AND status='pending'
+            """,
+            (str(reason)[:512], str(reason)[:512], now, request_id),
+        )
+        self._conn.execute(
+            """
+            UPDATE onebot_queue_message
+            SET state='uncertain', lease_id=NULL, lease_until=NULL, lease_owner=NULL,
+                lease_phase='uncertain', outbound_started=1, uncertain_reason=?,
+                failure_reason=?, next_attempt_at=NULL, updated_at=?
+            WHERE chat_id=? AND state='pending' AND anchor_id=?
+            """,
+            (str(reason)[:512], str(reason)[:512], now, chat_id, request_id),
         )
 
     def _row_to_operation(self, row: sqlite3.Row) -> OperationRecord:

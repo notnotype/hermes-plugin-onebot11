@@ -1,5 +1,7 @@
 """确定性触发器矩阵测试。"""
 
+from dataclasses import replace
+
 import pytest
 
 from onebot11.queue import QueueMessage
@@ -52,6 +54,43 @@ def test_私聊直接触发且冷却生效():
     assert decision.reason == "cooldown"
 
 
+def test_硬触发绕过冷却():
+    """@、关键词和 always 在 cooldown 内仍必须创建硬触发。"""
+    config = TriggerConfig(
+        require_mention=True,
+        keywords=("请回答",),
+        always=False,
+        cooldown_seconds=60,
+    )
+    mention = should_trigger(
+        chat_type="group",
+        text="在吗",
+        mentioned_self=True,
+        config=config,
+        last_trigger_at=100,
+        now=101,
+    )
+    keyword = should_trigger(
+        chat_type="group",
+        text="请回答这个",
+        mentioned_self=False,
+        config=config,
+        last_trigger_at=100,
+        now=101,
+    )
+    always = should_trigger(
+        chat_type="group",
+        text="普通消息",
+        mentioned_self=False,
+        config=replace(config, always=True),
+        last_trigger_at=100,
+        now=101,
+    )
+    assert (mention.triggered, mention.reason) == (True, "mention")
+    assert (keyword.triggered, keyword.reason) == (True, "keyword")
+    assert (always.triggered, always.reason) == (True, "always")
+
+
 def test_触发配置严格解析():
     """拒绝 bool('false') 和非 list/string 的关键词配置。"""
     config = build_trigger_config({"require_mention": "false", "trigger_keywords": ["你好"]})
@@ -61,6 +100,16 @@ def test_触发配置严格解析():
         build_trigger_config({"require_mention": "not-a-bool"})
     with pytest.raises(ValueError):
         build_trigger_config({"trigger_keywords": {"nested": "no"}})
+
+
+def test_触发词列表只接受字符串():
+    """关键词和记忆词不能把数字静默转换成可触发文本。"""
+    with pytest.raises(ValueError):
+        build_trigger_config({"trigger_keywords": [123]})
+    with pytest.raises(ValueError):
+        build_trigger_config({"memory_trigger_words": [456]})
+    with pytest.raises(ValueError):
+        build_trigger_config({"trigger_keywords": [None]})
 
 
 def test_触发数值配置越界或非有限值必须拒绝():

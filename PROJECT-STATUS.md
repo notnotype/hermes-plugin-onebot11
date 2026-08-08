@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- **阶段**：PR #8 基线上的 TurnAnchor、队列迁移和 OneBot 出站图片收口已完成本地实现；插件已提交并推送为 PR #11，Hermes 媒体合同已在独立 worktree 提交但因远端仓库权限未能推送。Arch 生产仍运行旧版本，本次图片变更尚未切换生产队列。
+- **阶段**：`fix/i9-turn-anchor-contract` 已完成 schema 11、authority 快照、图片出站和旧 Hermes 降级收口，将以独立插件 PR 交付。Hermes strict auxiliary 与媒体/unknown 合同仍分别保留在独立本地 worktree，Arch 生产仍运行旧版本，本次图片变更尚未切换生产队列。
 - **核心合同**：群固定一个共享 session；群消息持久入队；每个真实 TurnAnchor 固定 batch 和 authority，同群按序单 lease follow-up；非幂等出站结果未知时进入 `uncertain`，不自动重放。
 - **本地验证**：协议/状态机测试通过；使用本地 Hermes 源码与其 site-packages 运行 adapter 测试通过。最终门禁命令和环境见“验证证据”。
 
@@ -16,7 +16,7 @@
 | `onebot11/events.py` | 完成 | message 事件归一化；自身回传过滤；notice/request/lifecycle 只做限长统计摘要 |
 | `onebot11/ws_server.py` | 完成 | token、loopback 默认、有界接收队列、同 chat 顺序、全局 inflight、失败关闭连接促使上游重放 |
 | `onebot11/http_api.py` | 完成 | 查询有限重试；发送/管理/reaction 写永不自动重试；有符号 message_id；超时、429/5xx、非 JSON、超大响应分类；媒体 SSRF/类型/大小限制；文本/图片 segment 出站 |
-| `onebot11/queue.py` | 完成 | SQLite WAL、schema 迁移、消息/TurnAnchor 去重、固定 batch lease、heartbeat、摘要、tombstone、uncertain 人工 resolve、reopen 和管理动作 operation ledger |
+| `onebot11/queue.py` | 完成 | SQLite WAL、schema 11 迁移（真实 v7/v8/v9/v10 表结构）、消息/TurnAnchor 去重、固定 batch lease、heartbeat、摘要、tombstone、uncertain 人工 resolve、reopen 和管理动作 operation ledger |
 | `onebot11/dispatch.py` | 完成 | 每群最多一个活动 turn，恢复触发请求，暂停/恢复、失败状态转换和 reconnect reset |
 | `onebot11/triggers.py` | 完成 | @、关键词、always、问句/记忆候选、5 秒 debounce、60 秒活跃窗口和显式旁路 LLM 三态判断 |
 | `onebot11/permissions.py` | 完成 | `CallerContext`、`ChatTarget`、精确 `(session_id, turn_id)` binding、user/trusted_user/super_admin 角色、只读边界和 fail-closed |
@@ -26,10 +26,10 @@
 
 ## 验证证据
 
-- `.venv\\Scripts\\python.exe -m pytest -q`：`151 passed, 1 skipped`；纯插件环境只跳过没有 Hermes gateway 的 adapter 集成测试。
+- `.venv\\Scripts\\python.exe -m pytest -q`：`160 passed, 1 skipped`；纯插件环境只跳过没有 Hermes gateway 的 adapter 集成测试。
 - `.venv\\Scripts\\python.exe -m ruff check .`：通过。
 - `pip install -e ".[dev]"`：Windows 临时干净 venv 安装通过；`import onebot11` 通过。Linux editable install 由 PR #11 CI 通过；纯插件门禁不承诺可直接 `import adapter`，后者需要 Hermes gateway 依赖。
-- `scripts/verify_hermes_integration.py` + Hermes 媒体 worktree 和 strict auxiliary worktree：`229 passed`，strict auxiliary 回归 `3 passed`，smoke 通过，`tools=9 hooks=4 strict_auxiliary=True reconnect=True`；新增图片 base64 segment、media-only completion 和 unknown no-fallback 合同。
+- `scripts/verify_hermes_integration.py` + Hermes 媒体 worktree 和 strict auxiliary worktree：`245 passed`，strict auxiliary 回归 `3 passed`，smoke 通过，`tools=9 hooks=4 strict_auxiliary=True reconnect=True`；覆盖 schema/authority、硬触发 cooldown、图片数量和总量预检、图片 base64 segment、media-only completion 和 unknown no-fallback 合同。
 - Arch 旧 Hermes `91937a6` 的 strict auxiliary 仍不支持 `fallback_policy/max_attempts`；本分支不会在旧 API 上偷偷调用主模型，LLM trigger 会安全禁用并保留 pending。
 - 真实 Hermes 临时 `HERMES_HOME` 注册 smoke：已确认平台、9 个工具、4 个安全 hooks 和 `onebot11_trigger` auxiliary 均注册，并验证 shared session/TurnAnchor 合同、严格旁路配置、pending anchor 恢复、home cron、同实例 reconnect 和本地图片 base64 segment；旧 Hermes 组合仍安全禁用 strict LLM trigger。媒体/unknown 组合证据来自独立 Hermes worktree 的本地注入，不代表远端 Hermes PR 已合并。
 
@@ -42,13 +42,13 @@
 - OneBot `get_login_info` 返回 `retcode=0`、机器人 QQ `3101482118`；当前 WS 在 `0.0.0.0:18880` 监听。
 - 使用指定群中已存在的真实消息 ID `2076873675` 做一次受控 WS 重放：该 anchor 被 ack，后续 seq `119–127` 仍为 pending，证明 TurnAnchor batch 边界没有偷吃后续消息。
 - LLBot 日志确认对真实消息 `2076873675` 先发送 `emoji_id=128064,set=true`，Hermes 回复到指定群后再发送 `set=false`；回复消息 ID 为 `438359985`。这是真实消息 ID 的受控重放，不等同于真人刚发消息。
-- 重启 Hermes gateway 前后指定群均为 `schema=9、pending=9、无 trigger`，WS 恢复监听，pending 保留。
+- 重启 Hermes gateway 前后指定群均为 `schema=9、pending=9、无 trigger`，WS 恢复监听，pending 保留；这是旧生产版本的历史证据，不代表当前 schema 11 分支已部署。
 - 白名单外群 `999999999` 的事件被拒绝，SQLite 中该群为 0 行，指定群队列未变化，没有产生出站。
 - Arch 配置原有 `roles.super_admin.tools: image_generate`（非 OneBot 工具），在备份后按 fail-closed 合同移除；白名单、token、机器人 QQ 和 LLBot 配置未放宽。
 
 本次 `0.5.0` 图片/unknown 变更尚未在 Arch 生产部署。通过隔离 queue 和真实 OneBot HTTP/WS adapter smoke 验证了 image-only、文字+图片、多图的 `base64://` segment，以及正负 message id 的 `👀` 添加/移除；这些消息没有经过生产 Agent pipeline，因此真实 QQ Agent 的图片-only、文字+图片、多图、部分成功/unknown 和真人并发仍是待验收项。
 
-Arch 当前生产 live queue 为 schema 10，来自 detached Task 5 实现；PR #11 当前支持 schema 9。启动 PR #11 时已按 fail-closed 拒绝 schema 10，没有修改 `PRAGMA user_version`，也没有删除或覆盖生产 queue。后续必须显式实现 schema 10 合同或完成正式迁移，不能通过降低版本号兼容。
+Arch 当前生产 live queue 仍为 schema 10，来自 detached Task 5 实现；当前分支已支持真实 v7/v8/v9/v10 表结构迁移并升级到 schema 11，但尚未切换生产 queue。此前没有修改 `PRAGMA user_version`，也没有删除或覆盖生产 queue。
 
 当前 TurnAnchor 分支仍需单独完成：
 
@@ -57,7 +57,7 @@ Arch 当前生产 live queue 为 schema 10，来自 detached Task 5 实现；PR 
 - LLBot 当前请求日志会打印 Bearer header；插件不会把 token 发送到外部媒体地址，但部署侧应在生产前关闭该日志或轮换 token。未在本轮擅自修改 LLBot 凭据。
 - 未在本轮使用 NapCat，也未把 WS 重连重放行为提升为协议保证。
 - Hermes 全局 SIGTERM 关闭日志仍偶发出现 `onebot11 disconnect timed out after 5.0s`；空 adapter 直测没有复现，日志同时包含 Discord/Weixin 的关闭期错误，当前作为 Hermes 多平台 shutdown 观察项，不据此修改 OneBot 插件。
-- Hermes strict auxiliary 修改 commit `50b06cc` 已在独立干净 worktree 提交并通过 3 个测试，但当前远端 `NousResearch/hermes-agent` 对本账号无写权限，尚未能推送或创建独立 PR。Hermes 媒体/unknown 合同 commit `8707f5f` 同样只存在本地独立 worktree，未宣称为已发布能力。
+- Hermes strict auxiliary 独立 worktree 当前 commit `8e6c02b`，通过 `3 passed`；Hermes 媒体/unknown 合同独立 worktree 当前 commit `8707f5f`，均未宣称为已发布能力。插件在旧 Hermes API 上会安全禁用 LLM trigger；旧 Hermes 媒体合同不可用时会返回 `unsupported`，不访问 OneBot 图片 API。
 
 ## 约束与取舍
 

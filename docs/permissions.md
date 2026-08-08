@@ -63,7 +63,7 @@ platforms:
 
 ## 队列与不确定结果
 
-群队列是持久 SQLite 状态机；同一群可以有多个 pending TurnAnchor，但同一时间最多一个活动 lease，并按 anchor 序号串行处理。每个 anchor 绑定一个真实消息和固定 batch 边界，后续消息不会被旧 turn 偷吃。旧 lease 在失败、恢复或断开结算时保留自己的 anchor，不会通过唯一索引冲突卡住后续 anchor。
+群队列是持久 SQLite 状态机；当前 schema 为 11，启动时真实迁移支持 v7/v8/v9/v10 表结构。缺少或损坏 authority 快照的旧 anchor 会进入 `uncertain`，不自动执行；同一群可以有多个 pending TurnAnchor，但同一时间最多一个活动 lease，并按 anchor 序号串行处理。每个 anchor 绑定一个真实消息和固定 batch 边界，后续消息不会被旧 turn 偷吃。旧 lease 在失败、恢复或断开结算时保留自己的 anchor，不会通过唯一索引冲突卡住后续 anchor。
 @、关键词、always 和管理员 flush 属于硬触发，会为明确消息创建/升级 anchor，并绑定该消息的权限主体和 reaction 目标；普通恢复或 LLM trigger 只能选择仍存在的 pending 消息，不能把结果静默改绑到另一条消息。
 
 ```text

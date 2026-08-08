@@ -22,7 +22,14 @@ class AuditLog:
         self.max_bytes = max(1024, int(max_bytes))
         self._lock = threading.Lock()
         if self.path is not None:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                logger.warning(
+                    "OneBot11 audit directory is unavailable; continuing without audit file",
+                    exc_info=True,
+                )
+                self.path = None
 
     def record(self, action: str, fields: Mapping[str, Any]) -> None:
         """追加一条结构化审计事件并在超过上限时轮转。

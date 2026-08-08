@@ -196,6 +196,7 @@ async def _smoke(
     _inject_auxiliary_source(auxiliary_source)
     _register_platform_if_needed()
     from gateway.config import PlatformConfig
+    from gateway.platforms.base import BasePlatformAdapter
 
     import adapter
 
@@ -232,11 +233,14 @@ async def _smoke(
     try:
         if not await instance.connect():
             raise AssertionError("adapter connect smoke 失败")
+        instance._trigger_state_for("888").mode = "engaged"
         await instance.disconnect()
         if not await instance.connect(is_reconnect=True):
             raise AssertionError("adapter reconnect smoke 失败")
         if instance._queue.closed or instance._dispatcher._closed:
             raise AssertionError("reconnect 后 queue/dispatcher 仍是 closed")
+        if instance._trigger_states:
+            raise AssertionError("reconnect 后不应恢复内存 active/debounce/judging 状态")
 
         # 持久 trigger 不依赖入站历史；暂停群避免 smoke 启动真实 Agent，
         # 只验证断开/重连后消息和 durable request 都还在。
@@ -259,6 +263,7 @@ async def _smoke(
                 "mention",
                 "123",
                 "smoke",
+                authority_self_id="1",
             ),
         )
         instance._queue.set_paused("888", True)
@@ -301,18 +306,26 @@ async def _smoke(
             )
         finally:
             instance._api.send_message_segments = original_send_segments
-        if not image_result.success or not captured_segments:
-            raise AssertionError(f"图片出站 smoke 失败: {image_result!r}")
-        image_segment = next(
-            segment
-            for segment in captured_segments[0]
-            if segment.get("type") == "image"
+        media_contract = bool(
+            getattr(BasePlatformAdapter, "supports_media_delivery_results", False)
         )
-        encoded_image = str(image_segment["data"]["file"])
-        if not encoded_image.startswith("base64://") or base64.b64decode(
-            encoded_image.removeprefix("base64://")
-        ) != b"\x89PNG\r\n\x1a\nintegration":
-            raise AssertionError("图片 smoke 没有生成正确 base64 segment")
+        if media_contract:
+            if not image_result.success or not captured_segments:
+                raise AssertionError(f"图片出站 smoke 失败: {image_result!r}")
+            image_segment = next(
+                segment
+                for segment in captured_segments[0]
+                if segment.get("type") == "image"
+            )
+            encoded_image = str(image_segment["data"]["file"])
+            if not encoded_image.startswith("base64://") or base64.b64decode(
+                encoded_image.removeprefix("base64://")
+            ) != b"\x89PNG\r\n\x1a\nintegration":
+                raise AssertionError("图片 smoke 没有生成正确 base64 segment")
+        elif image_result.success or image_result.error_kind != "unsupported" or captured_segments:
+            raise AssertionError(
+                "旧 Hermes 图片能力降级合同失败：应返回 unsupported 且不访问 OneBot"
+            )
 
         # standalone cron 不依赖当前 session 或入站历史；用本地 monkeypatch
         # 验证目标类型和允许群合同，不访问真实 OneBot endpoint。
