@@ -5,7 +5,7 @@
 ## 它能做什么
 
 - **私聊**：和机器人一对一聊天,每条消息都会回复。
-- **群聊**：整群共享一个 Hermes session；允许的消息先进入持久 SQLite 队列，再由 @、关键词、`always` 或分层 LLM trigger 触发一轮处理。硬触发会覆盖旧的普通恢复/LLM trigger 和退避。
+- **群聊**：整群共享一个 Hermes session；允许的消息先进入持久 SQLite 队列。每个 durable TurnAnchor 只消费自己边界内的批次，同群仍保持单活动 turn 并按 anchor 顺序串行处理；@、关键词、`always` 或分层 LLM trigger 才会创建 anchor。
 - **连续对话**：成功回复后进入最多 60 秒的活跃窗口；窗口内普通消息经过 5 秒 trailing debounce，再交给低成本旁路模型判断是否回复，单窗口最多仲裁 3 次。
 - **处理指示器**：群 turn 认领后给触发消息添加 👀，Hermes turn 收尾时自动移除；没有真实消息 ID 或 QQ 框架不支持该扩展时按 best-effort 跳过，不影响回复。
 - **上下文**：队列有条数、字节数和单条消息上限，确认后形成滚动摘要，并保留最近消息原文；当前批次作为普通 user message，摘要优先通过 Hermes `channel_prompt` 临时注入，不重复写入 shared session transcript。旧 Hermes 不支持时退回有界文本模式并记录审计。
@@ -121,6 +121,17 @@ platforms:
         engaged_max_arbitrations: 3
       processing_reaction_enabled: true
       processing_reaction_emoji_id: "128064"  # LLBot 的 👀
+      roles:
+        user:
+          tools: [qq_get_message, qq_get_group_msg_history, qq_get_friend_msg_history,
+                  qq_get_group_info, qq_get_group_member_info]
+        trusted_user:
+          users: ["2056963663"]
+          tools: [qq_get_message, qq_get_group_msg_history, qq_get_group_info]
+        super_admin:
+          tools: [qq_get_message, qq_get_group_msg_history, qq_get_friend_msg_history,
+                  qq_get_group_info, qq_get_group_member_info, qq_delete_message,
+                  qq_set_group_ban, qq_set_group_kick, qq_set_group_whole_ban]
 ```
 
 `queue_recovery_poll_seconds` 只负责发现已过期 lease，不会抢占仍有效的 lease。正常主动断开时，
@@ -136,11 +147,11 @@ LLM trigger 默认关闭，启用时必须同时配置明确的旁路 `provider`
 群聊是 OneBot 11 的主要使用场景,权限分三层（详见 [docs/permissions.md](docs/permissions.md)）：
 
 1. **谁能入队**：群消息先按 `allowed_groups` 判断；私聊必须满足 `allowlist`，或在 `open` 策略下显式配置 allow-all。
-2. **谁能用工具**：`super_admins` 对应超级管理员；普通用户默认只有当前目标范围内的只读工具。
+2. **谁能用工具**：`super_admins` 对应超级管理员；`roles.trusted_user.users` 可把指定 QQ 号标记为 trusted_user，但它和普通用户一样只能使用只读工具。
 3. **会话范围**：工具和出站目标都绑定当前 `(session_id, turn_id)`，群里只能查/操作本群。
 4. **写操作**：模型第一次调用只返回 `/onebot confirm TOKEN`；确认命令在入站层执行，不进入 session 或队列。
 
-同一批群消息可能来自多个用户，但权限主体始终是创建 durable trigger 的触发用户；
+同一 anchor 批次可能来自多个用户，但权限主体始终是该 anchor 对应真实消息的触发用户；
 其他用户消息只作为不可信上下文，不会把普通用户升级为超级管理员，也不会改变当前群目标。
 
 群级运维命令由超级管理员直接发送：`/onebot status`、`queue`、`flush`、`clear`、`pause`、`resume`、`resolve retry|discard`、`resolve action retry|discard OPERATION_ID` 和 `confirm TOKEN`。`clear` 不删除 Hermes session 历史，但会同时失效当前群旧的 debounce/活跃触发状态；`uncertain` 和 `failed` 都不会自动重试，必须明确 resolve。管理动作 `unknown` 的 `retry` 只解除重复执行阻断，之后仍需重新生成预览并确认，不会直接重放。

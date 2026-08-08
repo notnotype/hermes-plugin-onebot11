@@ -10,6 +10,7 @@
 
 - [2-onebot11-reliability](2-onebot11-reliability/README.md)：共享 session、持久队列、触发器、权限门禁和可靠出站
 - [3-onebot11-trigger-spike](3-onebot11-trigger-spike/README.md)：分层触发与活跃窗口 spike
+- [5-onebot11-turn-anchor](5-onebot11-turn-anchor/README.md)：shared session 下的 TurnAnchor、authority 和 batch 边界
 
 ## 历史任务
 

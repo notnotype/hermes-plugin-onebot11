@@ -1,7 +1,7 @@
 # Task 3：OneBot 11 分层触发与活跃窗口
 
 - 关联 Issue：[Issue #5：OneBot 11 分层触发与活跃窗口](https://github.com/notnotype/hermes-plugin-onebot11/issues/5)
-- 状态：balanced 策略已落入生产代码；spike 保留为设计依据
+- 状态：balanced 策略已落入生产代码，并接入 TurnAnchor；spike 保留为设计依据
 - 类型：逻辑/状态机 + Hermes auxiliary 集成
 
 ## 背景
@@ -38,13 +38,14 @@
 ## 已落地的 balanced 合同
 
 - 硬触发：@、关键词、`always` 和管理员命令直接创建 durable trigger，不消耗旁路 LLM。
+- TurnAnchor：selector 只为仍存在且未消费的真实消息创建 anchor；同群多个 anchor 按序串行，每个 anchor 是一个独立 shared-session follow-up。
 - 候选：空闲状态只识别问句，以及带回指词且当前群有摘要/最近原文的记忆候选；候选经过 5 秒 trailing debounce。
 - 旁路结果：严格接受 `trigger|wait|ignore` 三态；`wait` 使用 `5/10/30/60` 秒，只等待真实新消息，不创建 lease 或空轮询；`trigger/ignore` 的 `wait_seconds` 必须为 `0`。
 - 活跃窗口：成功 Agent turn 后 idle 60 秒，最长连续 300 秒，最多 3 次 LLM 仲裁；失败、取消和 uncertain 不进入 engaged。
 - 竞争处理：每群最多一个判断任务；判断期间的队列 revision 变化会重新安排一次，硬触发会使旧结果失效。
 - waiting 状态也受当前活跃窗口的仲裁上限约束；达到上限后只等待硬触发或管理员 flush，不再消耗旁路模型调用。
 - 兼容性：旁路调用只接受显式 provider/model 和群 allowlist，并固定 `fallback_policy=none`、`max_attempts=1`。Hermes strict auxiliary 改动单独交付；旧 Hermes auxiliary API 缺少参数时安全跳过。
-- 上下文：群当前批次作为普通 user message，滚动摘要优先通过 `channel_prompt` 临时注入；旧 Hermes 明确退回有界文本模式。摘要不会作为每轮普通 user transcript 重复累积。
+- 上下文：群当前 anchor batch 作为普通 user message，滚动摘要优先通过 `channel_prompt` 临时注入；旧 Hermes 明确退回有界文本模式。摘要不会作为每轮普通 user transcript 重复累积。
 
 Hermes 自优化只适合生成配置 diff/建议并由管理员审核，不允许运行时修改 Python、权限、白名单或自动启用关键词。本任务不实现自优化执行链路、RAG 或向量库。
 

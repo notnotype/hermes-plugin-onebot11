@@ -1,12 +1,12 @@
 name: onebot11-platform
 label: OneBot 11 (QQ)
 kind: platform
-version: 0.3.3
+version: 0.4.0
 description: >
   OneBot 11 (QQ) gateway adapter for Hermes Agent.
-  Reverse WebSocket + HTTP API. Shared group sessions, durable queued context,
-  layered triggers, active conversation windows, scoped query tools and
-  confirmed group-management actions.
+  Reverse WebSocket + HTTP API. Shared group sessions, durable TurnAnchor
+  context, layered triggers, active conversation windows, scoped query tools
+  and confirmed group-management actions.
 author: notnotype
 requires_env: []
 optional_env:

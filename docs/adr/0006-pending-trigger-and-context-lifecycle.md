@@ -1,20 +1,20 @@
-# ADR-0006：pending trigger 合并与群上下文生命周期
+# ADR-0006：TurnAnchor、摘要临时注入与延期边界
 
 - 状态：已接受
 - 日期：2026-08-07
 
 ## 决策
 
-### 同群 pending trigger 合并
+### TurnAnchor 生命周期
 
-一个群的 SQLite 队列最多保留一个 `pending` trigger。旧 lease 在明确失败、过期恢复、adapter 断开结算或管理员 retry 时，如果同群已经有后来创建的 `pending` trigger：
+一个群可以有多个 `pending` TurnAnchor，但同一时间只有一个活动 lease，并按 `anchor_seq` 串行处理。每个 anchor：
 
-- 保留后来请求作为唯一 pending trigger；
-- 在同一 SQLite 事务中删除或合并旧的 claimed/uncertain/failed trigger；
-- 不因 partial unique index 冲突回滚整个 lease 状态转换；
-- 曾经被认领但重新回到 pending 的消息保留 `attempts`，必要时由 queue recovery 补回 durable trigger。
+- 绑定一条真实的 pending 消息和一个 `anchor_kind`；
+- 固定“上一个 anchor 之后到当前 anchor”为本轮 batch；
+- authority、角色、reaction 和 reply 都从这条真实消息推导；
+- 后续消息不会被旧 turn 通过动态 `peek` 偷吃。
 
-硬触发和 LLM trigger 仍显式记录实际触发消息的 `message_key`，用于 reaction 锚点；队列恢复时只在必要时生成内部 `queue_recovery` trigger。
+硬触发、selector、管理员 flush 和 recovery 都必须携带明确的 message key。selector 指向的消息消失时，旧判断直接失效，不能回退到队列最早消息。失败恢复保留自己的 anchor；单群单活动 lease和最早 anchor backoff 保证顺序。
 
 ### 摘要临时注入
 
@@ -33,7 +33,7 @@
 
 ## 原因
 
-pending trigger 的唯一索引是为了防止同群并发 dispatch，不应反过来成为失败恢复的永久阻塞点。合并请求能保持单群单 turn，同时避免把旧失败路径改成无界多 trigger。
+TurnAnchor 的唯一职责是保存真实触发消息和 batch 边界；并发限制由 dispatcher 的单群活动 lease 负责，而不是靠“每群一个 pending trigger”的唯一索引。这样既保留多用户/多次硬触发的 authority，又避免旧失败恢复把群卡死。
 
 摘要重复进入 shared session 会让每轮输入持续增长，并把历史群文本伪装成普通用户消息。临时注入能保留理解上下文，又不把同一摘要复制到每个历史 turn。
 
@@ -41,6 +41,7 @@ RAG 和自动自优化都需要额外的索引、评估、权限和审核闭环�
 
 ## 影响
 
-- 某次恢复合并后，reaction 仍锚定实际触发消息；内部恢复 trigger 可能锚定最早待重试消息。
+- 多个 pending anchor 会增加少量 SQLite 行数，但不会增加同群并发 Agent turn；最早 anchor 失败或退避时，后续 anchor 按序等待。
+- 内部 recovery anchor 可能锚定最早待重试消息，但仍使用真实消息的 authority 和 reaction 规则。
 - 旧 Hermes 能继续运行，但摘要可能以有界普通文本进入 transcript，输入成本高于支持 `channel_prompt` 的版本。
 - 想加入 RAG 或自动优化时，必须另建任务和验收合同，不能把当前 SQLite 摘要候选悄悄升级成语义检索。

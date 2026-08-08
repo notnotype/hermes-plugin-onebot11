@@ -5,11 +5,14 @@
 
 ## 决策
 
-### 混合批次的权限主体
+### TurnAnchor 的权限主体
 
-一个群的 durable trigger 只有一个权限主体：创建或被硬触发覆盖时记录的用户。
-同一批里其他用户的消息只是非可信上下文，不会改变角色、允许工具或出站目标。
+一个群的每个 durable TurnAnchor 只有一个权限主体：anchor 对应真实 OneBot 消息的发送者。
+同一 batch 里其他用户的消息只是非可信上下文，不会改变角色、允许工具或出站目标。
 这样保持“群一个 shared session”不变，同时避免把普通用户消息混入后意外升级管理权限。
+
+`trusted_user` 只允许配置的只读工具，不能修改权限、白名单或角色；super_admin 仍由
+`super_admins`/兼容旧名 `ONEBOT11_ADMINS` 明确定义。
 
 ### Home Channel cron
 
@@ -31,6 +34,6 @@ WS 结构内实现，不需要第二套身份数据库、delivery metadata 或�
 
 ## 影响
 
-- 混合消息批次不会按用户拆分，因此后续普通消息不能获得更高权限；
+- 混合消息 batch 不会按用户拆分，因此后续普通消息不能获得更高权限；
 - cron 配置更严格，但避免把群号当 QQ 号或反之；
 - malformed payload 的丢弃不提供可靠恢复承诺，真实框架重连行为仍按 OneBot 11 实际观察记录。

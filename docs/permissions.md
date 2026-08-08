@@ -33,13 +33,16 @@ platforms:
         user:
           tools: [qq_get_message, qq_get_group_msg_history, qq_get_friend_msg_history,
                   qq_get_group_info, qq_get_group_member_info]
+        trusted_user:
+          users: ["2056963663"]
+          tools: [qq_get_message, qq_get_group_msg_history, qq_get_group_info]
         super_admin:
           tools: [qq_get_message, qq_get_group_msg_history, qq_get_friend_msg_history,
                   qq_get_group_info, qq_get_group_member_info, qq_delete_message,
                   qq_set_group_ban, qq_set_group_kick, qq_set_group_whole_ban]
 ```
 
-`ONEBOT11_SUPER_ADMINS` 优先，`ONEBOT11_ADMINS` 仅作为兼容旧名。超级管理员为空时没有任何写权限；普通用户默认只有只读工具。可配置的角色工具集合会取所有角色许可工具的并集注册到 Hermes，再由当前 turn 的角色门禁限制实际执行。
+`ONEBOT11_SUPER_ADMINS` 优先，`ONEBOT11_ADMINS` 仅作为兼容旧名。超级管理员为空时没有任何写权限；普通用户默认只有只读工具。`roles.trusted_user.users` 只定义 trusted_user 身份，`roles.trusted_user.tools` 只能是只读工具；它不能修改权限、白名单或角色配置。可配置的角色工具集合会取所有角色许可工具的并集注册到 Hermes，再由当前 turn 的角色门禁限制实际执行。
 
 默认只读工具：
 
@@ -60,9 +63,8 @@ platforms:
 
 ## 队列与不确定结果
 
-群队列是持久 SQLite 状态机；同一群始终只保留一个 pending trigger。旧 lease 在失败、恢复或断开结算时如果遇到后来创建的 pending trigger，会合并旧请求，不因唯一索引冲突而卡住；曾经被认领但仍 pending 的消息保留恢复入口。
-@、关键词、always 和管理员 flush 属于硬触发，会更新 trigger anchor、触发者和权限主体，并清除当前 anchor 的退避；
-普通恢复或 LLM trigger 不能覆盖更高优先级的硬触发。
+群队列是持久 SQLite 状态机；同一群可以有多个 pending TurnAnchor，但同一时间最多一个活动 lease，并按 anchor 序号串行处理。每个 anchor 绑定一个真实消息和固定 batch 边界，后续消息不会被旧 turn 偷吃。旧 lease 在失败、恢复或断开结算时保留自己的 anchor，不会通过唯一索引冲突卡住后续 anchor。
+@、关键词、always 和管理员 flush 属于硬触发，会为明确消息创建/升级 anchor，并绑定该消息的权限主体和 reaction 目标；普通恢复或 LLM trigger 只能选择仍存在的 pending 消息，不能把结果静默改绑到另一条消息。
 
 ```text
 pending -> leased(agent_running) -> acked/deleted
