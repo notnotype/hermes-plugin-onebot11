@@ -56,6 +56,7 @@ class GroupDispatcher:
         self._locks: dict[str, asyncio.Lock] = {}
         self._active: dict[str, ActiveTurn] = {}
         self._heartbeat_tasks: dict[str, asyncio.Task[None]] = {}
+        self._notify_tasks: set[asyncio.Task[bool]] = set()
         self._recovery_task: asyncio.Task[None] | None = None
         self._recovery_dispatch_tasks: dict[str, asyncio.Task[None]] = {}
         self._closed = False
@@ -70,41 +71,50 @@ class GroupDispatcher:
 
     async def notify(self, chat_id: str) -> bool:
         """在有持久触发请求时尝试启动该群唯一 turn。"""
-        if self._closed:
-            return False
-        chat_id = str(chat_id)
-        if not self._can_dispatch(chat_id):
-            return False
-        lock = self._lock_for(chat_id)
-        async with lock:
-            if (
-                chat_id in self._active
-                or self.store.status(chat_id).get("paused")
-                or not self._can_dispatch(chat_id)
-            ):
-                return False
-            lease = await asyncio.to_thread(self.store.claim, chat_id, self.lease_seconds)
-            if lease is None:
-                return False
-            self._active[chat_id] = ActiveTurn(lease=lease, started_at=lease.claimed_at)
-            self._heartbeat_tasks[chat_id] = asyncio.create_task(self._heartbeat(lease))
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            self._notify_tasks.add(current_task)
         try:
-            await self._start_turn(lease)
-        except asyncio.CancelledError:
-            # 取消通常发生在 shutdown；立即停止本进程续租，持久 lease 交给恢复路径。
-            await self.abandon(lease.lease_id)
-            raise
-        except Exception:
-            logger.exception("OneBot11 turn 启动失败: chat=%s lease=%s", chat_id, lease.lease_id)
+            if self._closed:
+                return False
+            chat_id = str(chat_id)
+            if not self._can_dispatch(chat_id):
+                return False
+            lock = self._lock_for(chat_id)
+            async with lock:
+                if self._closed or (
+                    chat_id in self._active
+                    or self.store.status(chat_id).get("paused")
+                    or not self._can_dispatch(chat_id)
+                ):
+                    return False
+                lease = await asyncio.to_thread(self.store.claim, chat_id, self.lease_seconds)
+                if lease is None or self._closed:
+                    if lease is not None:
+                        await self.abandon(lease.lease_id)
+                    return False
+                self._active[chat_id] = ActiveTurn(lease=lease, started_at=lease.claimed_at)
+                self._heartbeat_tasks[chat_id] = asyncio.create_task(self._heartbeat(lease))
             try:
-                await self.complete(lease.lease_id, outcome="failure", unknown=False)
-            except Exception:
-                # 启动失败已经需要向上层报告；收尾持久化失败不能留下本地 active/heartbeat。
-                logger.exception("OneBot11 turn 启动失败后的 lease 收尾失败: %s", lease.lease_id)
-            finally:
+                await self._start_turn(lease)
+            except asyncio.CancelledError:
+                # 取消通常发生在 shutdown；立即停止本进程续租，持久 lease 交给恢复路径。
                 await self.abandon(lease.lease_id)
-            raise
-        return True
+                raise
+            except Exception:
+                logger.exception("OneBot11 turn 启动失败: chat=%s lease=%s", chat_id, lease.lease_id)
+                try:
+                    await self.complete(lease.lease_id, outcome="failure", unknown=False)
+                except Exception:
+                    # 启动失败已经需要向上层报告；收尾持久化失败不能留下本地 active/heartbeat。
+                    logger.exception("OneBot11 turn 启动失败后的 lease 收尾失败: %s", lease.lease_id)
+                finally:
+                    await self.abandon(lease.lease_id)
+                raise
+            return True
+        finally:
+            if current_task is not None:
+                self._notify_tasks.discard(current_task)
 
     async def _heartbeat(self, lease: QueueLease) -> None:
         """长 Hermes turn 期间续租，避免被另一个进程/恢复路径重复认领。"""
@@ -384,6 +394,15 @@ class GroupDispatcher:
         """立即 fencing 内存活动 lease，再停止 heartbeat 和恢复任务。"""
         self._closed = True
         self.fence_active()
+        notify_tasks = [
+            task
+            for task in self._notify_tasks
+            if task is not asyncio.current_task() and not task.done()
+        ]
+        for task in notify_tasks:
+            task.cancel()
+        if notify_tasks:
+            await asyncio.gather(*notify_tasks, return_exceptions=True)
         recovery = self._recovery_task
         self._recovery_task = None
         if recovery is not None:

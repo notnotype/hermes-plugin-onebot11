@@ -15,15 +15,15 @@
 - v7 → v8 会自动迁移，无需手工改表；高于 v8 的未知 schema 会拒绝启动。
 - 没有新增必填配置；群 session 仍固定 `shared`，不自动迁移旧 `per_user` Hermes session 历史。
 - 已存在的 `uncertain`/`failed` 消息仍需管理员明确 `/onebot resolve retry|discard`。
-- unknown 群管理动作不会自动重试；v0.3.1 仍需重新生成预览和 confirmation token。升级 v0.4.0 后改为新的明确 TurnAnchor 才能再次决定执行。
+- unknown 群管理动作不会自动重试；v0.3.1 仍需重新生成预览和 confirmation token。升级 v0.4.0 后，只有管理员明确执行 `/onebot resolve retry` 才会创建新的 retry anchor；不会复用旧 request id，也不会猜测 legacy authority。
 - 升级后重新核对 `allowed_groups`、私聊 `allowlist` 和机器人 token；联调白名单只允许群 `1072992996` 与用户 `2056963663`。
 
 完整步骤见：[docs/migrations/2026-08-07-v0.3.1.md](docs/migrations/2026-08-07-v0.3.1.md)。
 
 ## v0.4.0 迁移指南
 
-v0.4.0 是触发与权限行为升级：QueueStore v8 → v9 自动迁移；`require_mention=false` 不再直接授予发送者 authority；自动 selector 改为返回 `anchor_seq`；确认令牌被移除；当前 turn 使用不可变权限快照。
+v0.4.0 是触发与权限行为升级：QueueStore v8 → v9 自动迁移；`require_mention=false` 不再直接授予发送者 authority；自动 selector 改为返回 `anchor_seq`；确认令牌被移除；当前 turn 使用不可变权限快照。PR #10 继续收口 lease fencing、崩溃退避、retry 新 anchor、reaction 迁移、真实/内部 message ID 分离和 HTTP redirect 边界。
 
 升级前停止 Hermes 并备份队列和配置。无法证明单一 authority 的旧 batch 会进入 legacy hold，不会自动执行。完整步骤见：[docs/migrations/2026-08-07-v0.4.0.md](docs/migrations/2026-08-07-v0.4.0.md)。
 
-当前 v0.4.0 已通过本地 Hermes smoke、`242 passed`/Ruff 门禁，并在 Arch `192.168.1.18` 完成指定白名单 smoke。真人双用户同时发言、群管理写工具和 unknown resolve 仍未执行；联调白名单只允许群 `1072992996` 与私聊用户 `2056963663`。
+现有 v0.4.0 Arch 证据对应 PR #10 收口前部署；PR #10 当前分支完整 Hermes 测试为 `256 passed`，Ruff、compileall、diff 检查和真实 PluginManager 注册 smoke 已通过。Arch 重部署和真人 QQ 联调仍未完成，因此不把本次收口描述为已发布或已完成协议验收；白名单仍只允许群 `1072992996` 与私聊用户 `2056963663`。

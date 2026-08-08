@@ -112,6 +112,7 @@ def _message_record(
     record: dict[str, object] = {
         "seq": message.seq,
         "message_id": _bounded_field(message.message_id),
+        "message_key": _bounded_field(message.message_key),
         "user_id": _bounded_field(message.user_id),
         "user_name": _bounded_field(message.user_name),
         "role": _bounded_field(role, 128) or "unknown",
@@ -164,7 +165,7 @@ def _fit_record_json(record: Mapping[str, object], limit: int) -> str | None:
 
     for field in ("segment_markers", "media_markers"):
         candidate[field] = []
-    for field in ("message_id", "user_id", "user_name", "role", "reply_to"):
+    for field in ("message_id", "message_key", "user_id", "user_name", "role", "reply_to"):
         if candidate.get(field) is not None:
             candidate[field] = _bounded_field(candidate[field], 64)
     encoded = _record_json(candidate)
@@ -322,6 +323,7 @@ def build_authority_reminder(
     payload = {
         "anchor_seq": anchor.seq,
         "anchor_message_id": _bounded_field(anchor.message_id),
+        "anchor_message_key": _bounded_field(anchor.message_key),
         "caller_user_id": _bounded_field(anchor.user_id),
         "caller_user_name": _bounded_field(anchor.user_name),
         "caller_role": _bounded_field(caller_role, 128) or "unknown",

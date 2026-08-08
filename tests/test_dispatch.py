@@ -1,6 +1,7 @@
 """群级 dispatcher 的共享 lease 测试。"""
 
 import asyncio
+import threading
 
 import pytest
 
@@ -85,6 +86,8 @@ async def test_其他进程退出后lease到期自动恢复(tmp_path, monkeypatc
     dispatcher = GroupDispatcher(store, start_turn, recovery_poll_seconds=0.05)
     assert await dispatcher.recover() == []
     now[0] = 1006.0
+    assert await dispatcher.recover() == []
+    now[0] = 1008.0
     await asyncio.wait_for(started.wait(), timeout=1)
     assert len(recovered) == 1
     assert recovered[0].lease_id != lease.lease_id
@@ -250,6 +253,8 @@ async def test_complete_false后heartbeat停止且lease可被恢复接管(tmp_pa
 
     now[0] = 1006.0
     owner = QueueStore(path)
+    assert owner.claim("888", lease_seconds=5) is None
+    now[0] = 1008.0
     recovered = owner.claim("888", lease_seconds=5)
     assert recovered is not None
     assert recovered.lease_id != captured[0].lease_id
@@ -323,3 +328,32 @@ async def test_shutdown后straggler完成不会访问已关闭SQLite(tmp_path):
     await dispatcher.close()
     store.close()
     assert not await dispatcher.complete(lease.lease_id, outcome="success", unknown=False)
+
+
+async def test_shutdown会取消正在claim的notify(tmp_path, monkeypatch):
+    """dispatcher close 不应让尚未完成的 notify 在 QueueStore 关闭后继续运行。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    message = _message("notify-shutdown")
+    store.enqueue(
+        message,
+        TriggerRequest.create("888", "group:notify-shutdown", "mention", "1", "用户1"),
+    )
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_claim(*_args, **_kwargs):
+        entered.set()
+        release.wait(timeout=2)
+        return None
+
+    monkeypatch.setattr(store, "claim", slow_claim)
+    dispatcher = GroupDispatcher(store, lambda _lease: asyncio.sleep(0))
+    notifying = asyncio.create_task(dispatcher.notify("888"))
+    assert await asyncio.to_thread(entered.wait, 1)
+    closing = asyncio.create_task(dispatcher.close())
+    await asyncio.sleep(0.05)
+    release.set()
+    await closing
+    with pytest.raises(asyncio.CancelledError):
+        await notifying
+    store.close()

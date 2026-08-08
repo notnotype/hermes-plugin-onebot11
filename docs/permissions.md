@@ -36,7 +36,7 @@
 3. authority reminder：由 `pre_llm_call` 动态生成，追加到当前 user request，不修改 system prompt。
 4. 其他动态信息：时间等易变字段只适合 request-only 注入，不应写入稳定 system prompt。
 
-当前 batch 用有界 JSONL 表示，每条包含 `seq`、`message_id`、`user_id`、`user_name`、turn-start `role`、`reply_to`、segment/media markers、正文和 anchor 标记。这样群管理工具能拿到真实消息 ID，同时 Agent 能区分上下文发送者与本轮 authority。
+当前 batch 用有界 JSONL 表示，每条包含 `seq`、真实 `message_id`、稳定 `message_key`、`user_id`、`user_name`、turn-start `role`、`reply_to`、segment/media markers、正文和 anchor 标记。没有真实 OneBot message ID 时 `message_id` 保持为空；`message_key` 只用于去重/上下文定位，不能传给 `get_msg`。这样群管理工具能拿到可用的真实消息 ID，同时 Agent 能区分上下文发送者与本轮 authority。
 
 Hermes 将当前 user turn 和 wire sidecar 保存到 session；SQLite ack 后删除已消费消息，不重复维护跨轮摘要。极端崩溃窗口仍是至少一次语义，不承诺跨 SQLite/Hermes exactly-once。
 
@@ -69,6 +69,8 @@ platforms:
 
 共享 session 的 schema 是所有角色工具并集，`pre_tool_call` 与 handler 按当前 authority 硬拦截。`delegate_task` 在 Hermes 提供传递性 per-turn policy 前禁止配置和调用；Docker 子代理另行设计。
 
+模型会看到一个有界 role catalog，列出三个角色当前配置的工具集合。catalog 只是解释性提示；当前 turn authority 只来自锚点，其他消息的 role 不能授予权限。`tool_search` 不是权限绕过入口，但在 Hermes 上游完整传递 `turn_id` 前，缺少精确 turn 身份的工具搜索请求必须拒绝。
+
 ## 权限配置工具
 
 - `onebot_get_permissions`：读取角色配置。
@@ -81,7 +83,7 @@ platforms:
 
 撤回、禁言、踢人、全员禁言在角色、目标和 lease 校验通过后直接执行，不再生成 confirmation token。真实 HTTP 写请求前原子写入 outbound marker。
 
-OneBot 11 非幂等请求无法保证 exactly-once。超时、断线、非 JSON、5xx 或部分成功会使 anchor 进入 `uncertain`，阻塞后续 anchor；同一 turn 的相同 unknown 动作禁止重复调用。管理员核对 QQ 端状态后使用 `/onebot resolve retry|discard`。缺少可验证旧 authority 的 legacy 数据 retry 后只回到未锚定 pending，必须重新明确触发。
+OneBot 11 非幂等请求无法保证 exactly-once。超时、断线、非 JSON、5xx 或部分成功会使 anchor 进入 `uncertain`，阻塞后续 anchor；同一 turn 的相同 unknown 动作禁止重复调用。管理员核对 QQ 端状态后使用 `/onebot resolve retry|discard`。`resolve retry` 为可验证的 `message`/`operator` anchor 创建新的 request id，保留原 authority、消息范围和 reaction 状态；legacy hold 不能 retry，只能 discard 或等待新的明确触发。
 
 ## 目标与命令
 

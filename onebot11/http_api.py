@@ -274,7 +274,20 @@ class OneBotHttpApi:
         url = f"{self._base}/{action}?echo={uuid.uuid4().hex}"
         for attempt in range(attempts + 1):
             try:
-                async with session.post(url, json=params, headers=self._headers()) as resp:
+                async with session.post(
+                    url,
+                    json=params,
+                    headers=self._headers(),
+                    allow_redirects=False,
+                ) as resp:
+                    if 300 <= resp.status < 400:
+                        raise OneBotApiError(
+                            action,
+                            f"http_{resp.status}_redirect",
+                            -1,
+                            unknown_outcome=action in WRITE_ACTIONS,
+                            error_kind="unknown" if action in WRITE_ACTIONS else "protocol",
+                        )
                     try:
                         body = await self._read_response_bytes(resp, limit=self.max_response_bytes)
                     except OneBotApiError as exc:
@@ -478,7 +491,10 @@ class OneBotHttpApi:
 
     async def get_message(self, message_id: str) -> dict:
         """查询单条消息。"""
-        return await self.call_action("get_msg", {"message_id": int(message_id)})
+        normalized = str(message_id or "").strip()
+        if not is_numeric_message_id(normalized):
+            raise ValueError("该消息没有可查询的真实 OneBot message_id")
+        return await self.call_action("get_msg", {"message_id": int(normalized)})
 
     async def get_image(self, file_id: str) -> dict:
         """把 OneBot image file 标识解析为受控的本地路径或 URL。"""

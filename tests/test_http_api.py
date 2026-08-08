@@ -102,6 +102,43 @@ async def test_发送拒绝未知目标类型(fake_server):
         await api.send_message("1", "x", chat_type="unknown")
 
 
+async def test_action重定向不转发请求体和Bearer_token():
+    """非幂等 action 遇到 3xx 必须停在原地址，不能跟随重定向。"""
+    calls: list[str] = []
+
+    async def redirect_handler(_request: web.Request) -> web.Response:
+        calls.append("redirect")
+        return web.Response(status=307, headers={"Location": "/target"})
+
+    async def target_handler(request: web.Request) -> web.Response:
+        del request
+        calls.append("target")
+        return web.json_response({"status": "ok", "retcode": 0, "data": {}})
+
+    app = web.Application()
+    app.router.add_post("/send_group_msg", redirect_handler)
+    app.router.add_post("/target", target_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    base = f"http://127.0.0.1:{runner.addresses[0][1]}"
+    api = OneBotHttpApi(base_url=base, token="secret", max_retries=3)
+    try:
+        with pytest.raises(OneBotApiError) as error:
+            await api.call_action(
+                "send_group_msg",
+                {"group_id": 888, "message": "不应转发"},
+                retryable=False,
+            )
+        assert error.value.status == "http_307_redirect"
+        assert error.value.unknown_outcome is True
+        assert calls == ["redirect"]
+    finally:
+        await api.close()
+        await runner.cleanup()
+
+
 async def test_群聊发送带reply段(fake_server):
     base, calls, _ = fake_server
     api = OneBotHttpApi(base_url=base)

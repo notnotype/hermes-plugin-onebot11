@@ -175,8 +175,94 @@ def test_retry只恢复最早锚点原消息范围(tmp_path):
     assert store.resolve_uncertain("888", "retry") == 1
     retried = store.claim("888")
     assert retried is not None
-    assert retried.trigger.request_id == lease.trigger.request_id
+    assert retried.trigger.request_id != lease.trigger.request_id
+    assert retried.trigger.caller_user_id == lease.trigger.caller_user_id
     assert [message.message_id for message in retried.messages] == ["1"]
+    store.close()
+
+
+def test_过期agent_lease恢复使用退避并在第三次进入failed(tmp_path):
+    """崩溃恢复不能绕过自动失败上限，避免恢复风暴。"""
+    path = tmp_path / "queue.sqlite3"
+    store = QueueStore(path)
+    message = _message("crash")
+    store.enqueue(message, _trigger(message))
+    for expected_failure_count in (1, 2, 3):
+        lease = store.claim("888")
+        if lease is None:
+            store._conn.execute(
+                "UPDATE onebot_queue_trigger SET next_attempt_at=0 WHERE chat_id=?",
+                ("888",),
+            )
+            store._conn.execute(
+                "UPDATE onebot_queue_message SET next_attempt_at=0 WHERE chat_id=?",
+                ("888",),
+            )
+            store._conn.commit()
+            lease = store.claim("888")
+        assert lease is not None
+        store._conn.execute(
+            "UPDATE onebot_queue_message SET lease_until=0 WHERE lease_id=?",
+            (lease.lease_id,),
+        )
+        store._conn.commit()
+        store.close()
+        store = QueueStore(path)
+        store.recover_trigger_requests({"888"})
+        assert store.claim("888") is None
+        status = store.status("888")
+        assert status["failure_count"] == expected_failure_count
+        if expected_failure_count < 3:
+            assert status["pending"] == 1
+            assert status["next_retry_at"] is not None
+        else:
+            assert status["failed"] == 1
+            assert status["pending_trigger_requests"] == 0
+    store.close()
+
+
+def test_lease_phase未知即使marker为零也进入uncertain(tmp_path):
+    """state/phase 不一致时按更保守的出站未知处理。"""
+    path = tmp_path / "queue.sqlite3"
+    store = QueueStore(path)
+    message = _message("phase-unknown")
+    store.enqueue(message, _trigger(message))
+    lease = store.claim("888")
+    assert lease is not None
+    store._conn.execute(
+        """
+        UPDATE onebot_queue_message
+        SET lease_until=0,lease_phase='unexpected',outbound_started=0
+        WHERE lease_id=?
+        """,
+        (lease.lease_id,),
+    )
+    store._conn.commit()
+    store.close()
+    recovered = QueueStore(path)
+    recovered.recover_trigger_requests({"888"})
+    status = recovered.status("888")
+    assert status["uncertain"] == 1
+    assert status["pending"] == 0
+    recovered.close()
+
+
+def test_当前lease_phase未知时成功结果也不能ack(tmp_path):
+    """活动 lease 的阶段字段损坏时，ack 必须先转 uncertain。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    message = _message("phase-active")
+    store.enqueue(message, _trigger(message))
+    lease = store.claim("888")
+    assert lease is not None
+    store._conn.execute(
+        "UPDATE onebot_queue_message SET lease_phase='unexpected' WHERE lease_id=?",
+        (lease.lease_id,),
+    )
+    store._conn.commit()
+    assert not store.ack(lease)
+    status = store.status("888")
+    assert status["uncertain"] == 1
+    assert status["pending"] == 0
     store.close()
 
 
@@ -258,6 +344,7 @@ def test_恢复不抢占仍有效的其他进程租约(tmp_path, monkeypatch):
     recovered = other.recover_trigger_requests()
     assert len(recovered) == 1
     assert recovered[0].request_id == lease.trigger.request_id
+    now[0] = 1033.0
     assert other.claim("888") is not None
     owner.close()
     other.close()
@@ -944,6 +1031,44 @@ def test_queued与processing_reaction按anchor独立保存(tmp_path, monkeypatch
     assert [(item.anchor_id, item.reaction_kind) for item in cleanup] == [
         (anchor_id, "processing")
     ]
+    store.close()
+
+
+def test_reaction同目标只保留一条且maybe_set退避不被重置(tmp_path, monkeypatch):
+    """retry/重复事件不能制造重复 UI，也不能让 unset 失败重新立即执行。"""
+    now = [1000.0]
+    monkeypatch.setattr("onebot11.queue.time.time", lambda: now[0])
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    store.record_reaction(
+        "lease-1",
+        "888",
+        "1001",
+        anchor_id="anchor-1",
+        reaction_kind="processing",
+        emoji_id="eyes",
+    )
+    assert store.mark_reaction_set("anchor-1", reaction_kind="processing")
+    assert store.mark_reaction_cleanup_failed(
+        "anchor-1",
+        "first unset failed",
+        reaction_kind="processing",
+    )
+    before = store.reaction("anchor-1", reaction_kind="processing")
+    assert before is not None
+    store.record_reaction(
+        "lease-2",
+        "888",
+        "1001",
+        anchor_id="anchor-2",
+        reaction_kind="processing",
+        emoji_id="eyes",
+    )
+    after = store.reaction("anchor-2", reaction_kind="processing")
+    assert after is not None
+    assert store.reaction("anchor-1", reaction_kind="processing") is None
+    assert after.state == "maybe_set"
+    assert after.attempts == before.attempts
+    assert after.next_attempt_at == before.next_attempt_at
     store.close()
 
 

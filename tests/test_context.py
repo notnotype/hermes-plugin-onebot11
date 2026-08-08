@@ -98,6 +98,7 @@ def test_TurnAnchor输出结构化消息元数据和角色快照():
         {
             "seq": 1,
             "message_id": "1",
+            "message_key": "group:1",
             "user_id": "100",
             "user_name": "用户1",
             "role": "user",
@@ -110,6 +111,7 @@ def test_TurnAnchor输出结构化消息元数据和角色快照():
         {
             "seq": 2,
             "message_id": "2",
+            "message_key": "group:2",
             "user_id": "200",
             "user_name": "用户2",
             "role": "trusted_user",

@@ -105,6 +105,25 @@ READ_TOOL_NAMES = frozenset(
 WRITE_TOOL_NAMES = frozenset(set(TOOL_SCHEMAS) - set(READ_TOOL_NAMES))
 
 
+def _unqueryable_message_id(message_id: Any) -> dict[str, Any] | None:
+    """识别内部 hash key，避免把它误传给 OneBot 的整数 message_id API。"""
+    normalized = str(message_id or "").strip()
+    if normalized.startswith("hash:"):
+        return {
+            "status": "error",
+            "error_code": "message_id_unavailable",
+            "error": "该消息没有可查询的真实 OneBot message_id",
+            "message_key": normalized,
+        }
+    if not normalized:
+        return {
+            "status": "error",
+            "error_code": "message_id_required",
+            "error": "message_id 不能为空",
+        }
+    return None
+
+
 def _count(params: dict[str, Any]) -> int:
     """规范化查询条数。"""
     try:
@@ -116,6 +135,9 @@ def _count(params: dict[str, Any]) -> int:
 
 async def handle_get_message(api: OneBotHttpApi, params: dict[str, Any], ctx: CallerContext) -> dict[str, Any]:
     """查询当前群或当前私聊中的单条消息。"""
+    unavailable = _unqueryable_message_id(params.get("message_id"))
+    if unavailable is not None:
+        return unavailable
     message = await api.get_message(str(params["message_id"]))
     error = validate_message_scope(message, ctx)
     if error:
@@ -177,6 +199,9 @@ async def handle_write_action(
     if ctx.chat_type != "group":
         return {"status": "permission_error", "error": "只能作用于当前群"}
     if tool_name == "qq_delete_message":
+        unavailable = _unqueryable_message_id(params.get("message_id"))
+        if unavailable is not None:
+            return unavailable
         target = await api.get_message(str(params["message_id"]))
         error = validate_message_scope(target, ctx)
         if error:

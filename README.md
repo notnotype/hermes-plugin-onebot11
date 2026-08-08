@@ -7,10 +7,10 @@
 - **私聊**：和机器人一对一聊天,每条消息都会回复。
 - **群聊**：整群共享一个 Hermes session；每条明确触发消息形成独立 TurnAnchor，并按序启动独立 followup。
 - **处理指示器**：锚点持久排队后显示 ⏳，认领后切换为 👀，turn 收尾自动移除；框架不支持时按 best-effort 跳过。
-- **上下文**：每个 batch 截止到自己的 `anchor_seq`，以结构化 JSONL 物化消息 ID、发送者、role、reply 和媒体标记；锚点之后的消息不会越界进入当前 turn。
+- **上下文**：每个 batch 截止到自己的 `anchor_seq`，以结构化 JSONL 物化真实 `message_id`、稳定 `message_key`、发送者、role、reply 和媒体标记；没有真实 OneBot ID 时不伪造 ID，锚点之后的消息不会越界进入当前 turn。
 - **图片与消息段**：兼容 array/CQ 字符串，支持图片、reply、文件、语音、视频、转发和未知段标记；图片下载有 host、端口、类型、魔数和大小限制。
 - **工具与管理**：authority 完全继承锚点消息发送者的 turn-start 角色快照。角色允许、目标和 lease 有效时写工具直接执行；unknown 不自动重试。
-- **可靠性**：队列支持崩溃恢复、去重、lease heartbeat 和人工处理 `uncertain` 出站结果。OneBot 非幂等请求不自动重试，不承诺 exactly-once。
+- **可靠性**：队列支持崩溃恢复、去重、lease heartbeat、过期 lease 退避和人工处理 `uncertain`/`failed` 出站结果。OneBot 非幂等请求不自动重试，不承诺 exactly-once；`resolve retry` 会创建新的 retry anchor。
 - **安全边界**：白名单同时约束实时入站、cron 和恢复；普通 OneBot caller 不能跨到 subagent。`delegate_task` 在 Hermes 支持 per-turn 工具权限前禁止配置和调用。
 
 ## 环境要求
@@ -138,6 +138,8 @@ reaction 的清理状态持久化在队列数据库中；重启或恢复只会�
 
 authority reminder 由 `pre_llm_call` 追加到当前 user request，不修改稳定 system prompt；Hermes 保存该 turn 的 wire sidecar，后续历史可按相同字节重放。它只是模型提醒，真实权限由 binding、lease 和不可变工具快照校验。时间等易变信息仍只适合 request-only 动态上下文。
 
+插件会同时注入有界 role catalog，帮助模型理解 `user`、`trusted_user`、`super_admin` 的工具集合；catalog 不是授权来源。未来 Hermes 若为系统错误通知提供 `hermes_system_error_notice=true`，插件会避免把该通知计入业务 outbound marker；在此之前保持保守的 `uncertain` 行为。
+
 ## 权限说明
 
 群聊是 OneBot 11 的主要使用场景,权限分三层（详见 [docs/permissions.md](docs/permissions.md)）：
@@ -145,7 +147,7 @@ authority reminder 由 `pre_llm_call` 追加到当前 user request，不修改�
 1. **谁能入队**：群消息先按 `allowed_groups` 判断；私聊必须满足 `allowlist`，或在 `open` 策略下显式配置 allow-all。
 2. **谁能用工具**：`super_admins` 对应超级管理员；`roles.trusted_user.users` 指定受信用户；工具集合按精确工具名匹配，普通用户默认只有当前目标范围内的只读工具。
 3. **会话范围**：工具和出站目标都绑定当前 `(session_id, turn_id)`，群里只能查/操作本群。
-4. **写操作**：按锚点 authority 直接硬校验并执行；同一 turn 的同一 unknown 动作禁止自动重复调用。
+4. **写操作**：按锚点 authority 直接硬校验并执行；同一 turn 的同一 unknown 动作禁止自动重复调用，管理员 retry 需先核对目标端且会生成新的 anchor。
 
 群内任何已授权用户都可以旁路发送 `/context`、`/status`、`/whoami`、`/help`、`/commands`；这些命令不进入队列或 Agent session。`/new`、`/reset`、`/restart`、`/model`、`/compress` 会被明确拒绝。群级运维命令由超级管理员直接发送：`/onebot status`、`queue`、`flush`、`clear`、`pause`、`resume`、`resolve retry|discard`。`flush` 创建继承命令管理员权限的 operator anchor；`clear` 不删除 Hermes session 历史。
 

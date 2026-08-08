@@ -21,6 +21,7 @@ class InboundEvent:
     user_id: str
     user_name: str
     message_id: str
+    message_key: str = ""
     images: list[str] = field(default_factory=list)
     image_urls: list[str] = field(default_factory=list)
     image_files: list[str] = field(default_factory=list)
@@ -113,7 +114,8 @@ def build_inbound_event(raw: Mapping[str, Any], self_id: str | None) -> InboundE
         return None
     message_type = raw.get("message_type")
     message_id = str(raw.get("message_id") or "")
-    if not message_id:
+    message_key = message_id
+    if not message_key:
         canonical = _normalized_event_for_hash(raw)
         encoded = json.dumps(
             canonical,
@@ -122,7 +124,7 @@ def build_inbound_event(raw: Mapping[str, Any], self_id: str | None) -> InboundE
             default=str,
             separators=(",", ":"),
         ).encode("utf-8")
-        message_id = "hash:" + hashlib.sha256(encoded).hexdigest()
+        message_key = "hash:" + hashlib.sha256(encoded).hexdigest()
     user_id = str(raw.get("user_id") or "")
     if self_id and user_id == str(self_id):
         return None
@@ -152,6 +154,7 @@ def build_inbound_event(raw: Mapping[str, Any], self_id: str | None) -> InboundE
         user_id=user_id,
         user_name=user_name,
         message_id=message_id,
+        message_key=message_key,
         images=parsed.images,
         image_urls=parsed.image_urls,
         image_files=parsed.image_files,

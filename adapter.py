@@ -45,6 +45,7 @@ CallerContext = _proto.CallerContext
 ChatTarget = _proto.ChatTarget
 GroupDispatcher = _proto.GroupDispatcher
 QueueFull = _proto.queue.QueueFull
+QueueError = _proto.queue.QueueError
 QueueLease = _proto.QueueLease
 QueueMessage = _proto.QueueMessage
 QueueStore = _proto.QueueStore
@@ -166,7 +167,7 @@ def _serializable_caller(context: CallerContext) -> dict[str, Any]:
 
 
 def _caller_from_metadata(value: Any) -> CallerContext | None:
-    """只从 adapter metadata 读取身份坐标，再由 live adapter 重算角色。"""
+    """读取 adapter 写入的 turn-start 身份快照，不被中途配置变化覆盖。"""
     if not isinstance(value, Mapping):
         return None
     try:
@@ -189,13 +190,28 @@ def _caller_from_metadata(value: Any) -> CallerContext | None:
         return None
     if lease_id and not adapter._lease_matches_target(lease_id, chat_type, chat_id):
         return None
-    role = role_for_user(user_id, adapter.super_admins, adapter.trusted_users)
+    if "role" in value or "allowed_tools" in value:
+        role = str(value.get("role") or "").strip()
+        raw_tools = value.get("allowed_tools")
+        if role not in {"user", "trusted_user", "super_admin"} or not isinstance(
+            raw_tools,
+            (list, tuple, set, frozenset),
+        ):
+            return None
+        allowed_tools = frozenset(str(item).strip() for item in raw_tools if str(item).strip())
+        if "delegate_task" in allowed_tools:
+            return None
+    else:
+        # 兼容没有写入快照的旧 synthetic event；新 adapter event 都会
+        # 走上面的 immutable snapshot 分支。
+        role = role_for_user(user_id, adapter.super_admins, adapter.trusted_users)
+        allowed_tools = adapter.role_tools.get(role, frozenset())
     return CallerContext(
         user_id=user_id,
         chat_type=chat_type,
         chat_id=chat_id,
         role=role,
-        allowed_tools=adapter.role_tools.get(role, frozenset()),
+        allowed_tools=allowed_tools,
         lease_id=lease_id,
     )
 
@@ -471,6 +487,8 @@ class OneBot11Adapter(BasePlatformAdapter):
 
     async def _on_ws_event(self, raw: dict) -> None:
         """归一化事件、执行入队前授权并路由到 DM/群 dispatch。"""
+        if self._closed:
+            return
         auxiliary = normalize_auxiliary_event(raw)
         if auxiliary is not None:
             self._aux_event_count += 1
@@ -615,6 +633,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         )
         metadata = {
             "onebot11_raw": ev.raw_metadata,
+            "onebot11_message_key": ev.message_key or ev.message_id,
             "onebot11_markers": ev.markers[:32],
             "mentioned_self": ev.mentioned_self,
             "onebot11_media_paths": media_urls,
@@ -701,12 +720,14 @@ class OneBot11Adapter(BasePlatformAdapter):
             now=time.time(),
         )
         message_id = str(ev.message_id or "")
-        if not message_id:
-            message_id = "hash:" + hashlib.sha256(
+        message_key = str(ev.message_key or message_id or "")
+        if not message_key:
+            message_key = "hash:" + hashlib.sha256(
                 json.dumps(ev.raw_metadata, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
                 + ev.text.encode("utf-8")
             ).hexdigest()
         metadata = {
+            "onebot11_message_key": message_key,
             "onebot11_markers": ev.markers[:32],
             "onebot11_images": ev.images[: self._max_images_per_message],
             "onebot11_image_urls": ev.image_urls[: self._max_images_per_message],
@@ -724,7 +745,10 @@ class OneBot11Adapter(BasePlatformAdapter):
             text=ev.text,
             raw_text=ev.raw_text,
             metadata=metadata,
-            message_key=f"group:{message_id}",
+            # queue 已经按 chat_id 分区；不要再加 group: 前缀，否则
+            # 内部 hash:<sha256> 会变成 group:hash:<sha256>，工具无法
+            # 识别为“没有真实 OneBot message_id”的消息。
+            message_key=message_key,
         )
         caller = self._caller_for_event(
             SimpleNamespace(
@@ -778,6 +802,8 @@ class OneBot11Adapter(BasePlatformAdapter):
 
     async def handle_message(self, event: MessageEvent) -> None:
         """群消息入队并按触发结果 dispatch；私聊沿用 Hermes 直接 turn。"""
+        if self._closed:
+            return
         source = event.source
         if source is None or source.platform != self.platform:
             return
@@ -815,8 +841,13 @@ class OneBot11Adapter(BasePlatformAdapter):
             now=time.time(),
         )
         message_id = str(event.message_id or "")
-        if not message_id:
-            message_id = "hash:" + hashlib.sha256(
+        message_key = str(
+            (event.metadata or {}).get("onebot11_message_key")
+            or message_id
+            or ""
+        )
+        if not message_key:
+            message_key = "hash:" + hashlib.sha256(
                 json.dumps(event.metadata or {}, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
                 + event.text.encode("utf-8")
             ).hexdigest()
@@ -828,8 +859,10 @@ class OneBot11Adapter(BasePlatformAdapter):
             user_name=str(source.user_name or source.user_id or "unknown"),
             text=event.text,
             raw_text=str((event.metadata or {}).get("onebot11_raw_text") or event.text),
-            metadata=event.metadata,
-            message_key=f"group:{message_id}",
+            metadata={**(event.metadata or {}), "onebot11_message_key": message_key},
+            # message_key 与 message_id 分离；hash key 必须保持 hash:<sha256>
+            # 形状，供上下文和工具返回结构化不可查询错误。
+            message_key=message_key,
         )
         trigger = (
             TriggerRequest.create(
@@ -967,6 +1000,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         cursor_after_judgment: int | None = None
         triggered = False
         judgment_started = False
+        failure_recorded = False
         retry_delay: float | None = None
         try:
             if not self._chat_access_allowed("group", chat_id):
@@ -1078,7 +1112,11 @@ class OneBot11Adapter(BasePlatformAdapter):
                 return
             if not self._chat_access_allowed("group", chat_id):
                 return
-            cursor_after_judgment = decision.anchor_seq
+            # 本次 selector 已经观察到 observed_max_seq；即使只选择较早的
+            # anchor，批次中更晚、未被选中的消息也已经完成本轮判断。
+            # 推进到观察游标，避免同一批消息被立即重复判断；它们仍会在
+            # 后续新的精确 anchor 中作为上下文被消费。
+            cursor_after_judgment = observed_max_seq
             request_id = await asyncio.to_thread(
                 self._queue.create_message_anchor,
                 chat_id,
@@ -1089,7 +1127,7 @@ class OneBot11Adapter(BasePlatformAdapter):
             await asyncio.to_thread(
                 self._queue.mark_llm_judged,
                 chat_id,
-                decision.anchor_seq,
+                observed_max_seq,
             )
             if request_id:
                 triggered = True
@@ -1114,6 +1152,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                         judged_seq,
                         str(exc),
                     )
+                    failure_recorded = True
                 except Exception:
                     logger.debug("OneBot11 自动锚点失败状态无法持久化", exc_info=True)
         except Exception:
@@ -1126,25 +1165,42 @@ class OneBot11Adapter(BasePlatformAdapter):
                         judged_seq,
                         "automatic anchor selector auxiliary error",
                     )
+                    failure_recorded = True
                 except Exception:
                     logger.debug("OneBot11 自动锚点失败状态无法持久化", exc_info=True)
         finally:
             current = self._llm_trigger_tasks.get(chat_id)
             if current is asyncio.current_task():
                 self._llm_trigger_tasks.pop(chat_id, None)
-            if judgment_started and cursor_after_judgment is not None:
+            if judgment_started and (
+                cursor_after_judgment is not None or observed_max_seq is not None
+            ):
                 try:
                     latest_messages = await asyncio.to_thread(
                         self._queue.peek_unanchored,
                         chat_id,
                     )
+                    comparison_seq = (
+                        cursor_after_judgment
+                        if cursor_after_judgment is not None
+                        else observed_max_seq
+                    )
                     reschedule = bool(
                         latest_messages
                         and max(int(message.seq or 0) for message in latest_messages)
-                        > cursor_after_judgment
+                        > int(comparison_seq or 0)
                     )
                 except Exception:
                     logger.debug("OneBot11 自动锚点收尾读取队列失败", exc_info=True)
+            if reschedule and failure_recorded and latest_messages and not self._closed:
+                try:
+                    await asyncio.to_thread(
+                        self._queue.wake_llm_for_new_message,
+                        chat_id,
+                        max(int(message.seq or 0) for message in latest_messages),
+                    )
+                except Exception:
+                    logger.debug("OneBot11 自动锚点新消息唤醒失败", exc_info=True)
             if reschedule and not self._closed:
                 self._schedule_llm_trigger(chat_id)
             elif retry_delay is not None and not self._closed:
@@ -1187,7 +1243,7 @@ class OneBot11Adapter(BasePlatformAdapter):
 
     async def _start_queue_turn(self, lease: QueueLease) -> None:
         """把一个 TurnAnchor 编排为独立 synthetic followup turn。"""
-        if not self._chat_access_allowed("group", lease.chat_id):
+        if self._closed or not self._chat_access_allowed("group", lease.chat_id):
             raise PermissionError("当前群已不再满足 OneBot11 allowed_groups 策略")
         if not await asyncio.to_thread(self._queue.mark_agent_started, lease):
             raise PermissionError("OneBot11 queue lease 已失效")
@@ -1340,6 +1396,12 @@ class OneBot11Adapter(BasePlatformAdapter):
                 logger.debug("OneBot11 无法解析 lease 对应 session key", exc_info=True)
             token = _CURRENT_CALLER.set(caller)
             try:
+                if self._closed or not await asyncio.to_thread(
+                    self._queue.is_lease_current,
+                    lease,
+                ):
+                    self._fenced_leases.add(lease.lease_id)
+                    raise PermissionError("OneBot11 turn 在提交 Hermes 前已失效")
                 await super().handle_message(event)
                 handed_off = True
             finally:
@@ -1372,12 +1434,19 @@ class OneBot11Adapter(BasePlatformAdapter):
     ) -> bool:
         """持久记录后单次添加 ⏳；失败不阻断 durable anchor。"""
         if (
+            self._closed
+            or
             not self._queued_reaction_enabled
             or not is_numeric_message_id(str(message_id))
             or not self._chat_access_allowed("group", str(chat_id))
         ):
             return False
         try:
+            existing_before = await asyncio.to_thread(
+                self._queue.reaction,
+                str(anchor_id),
+                reaction_kind="queued",
+            )
             await asyncio.to_thread(
                 self._queue.record_reaction,
                 "",
@@ -1390,18 +1459,38 @@ class OneBot11Adapter(BasePlatformAdapter):
         except Exception:
             logger.warning("OneBot11 queued reaction 状态持久化失败", exc_info=True)
             return False
+        if existing_before is not None:
+            # 旧 anchor/retry 已经留下了持久状态；无论状态是 pending
+            # 还是 maybe_set，都不能再次执行非幂等 set=true。
+            return True
+        try:
+            existing = await asyncio.to_thread(
+                self._queue.reaction,
+                str(anchor_id),
+                reaction_kind="queued",
+            )
+        except Exception:
+            logger.warning("OneBot11 queued reaction 状态读取失败", exc_info=True)
+            return False
+        if existing is not None and existing.state == "maybe_set":
+            # 迁移/恢复得到的 maybe_set 只允许 unset，不能因为 retry 再次 set。
+            return True
+        if self._closed:
+            try:
+                await asyncio.to_thread(
+                    self._queue.delete_reaction,
+                    str(anchor_id),
+                    reaction_kind="queued",
+                )
+            except Exception:
+                logger.debug("OneBot11 shutdown 时 queued reaction pending 状态清理失败", exc_info=True)
+            return False
         try:
             await self._api.set_message_emoji_like(
                 str(message_id),
                 self._queued_reaction_emoji_id,
                 enabled=True,
             )
-            await asyncio.to_thread(
-                self._queue.mark_reaction_set,
-                str(anchor_id),
-                reaction_kind="queued",
-            )
-            return True
         except OneBotApiError as exc:
             if exc.unknown_outcome:
                 try:
@@ -1411,23 +1500,49 @@ class OneBot11Adapter(BasePlatformAdapter):
                         reaction_kind="queued",
                     )
                 except Exception:
-                    logger.warning("OneBot11 queued reaction unknown 状态更新失败", exc_info=True)
+                    logger.warning(
+                        "OneBot11 queued reaction unknown 状态更新失败，保留 pending 记录",
+                        exc_info=True,
+                    )
                 return False
+            try:
+                await asyncio.to_thread(
+                    self._queue.delete_reaction,
+                    str(anchor_id),
+                    reaction_kind="queued",
+                )
+            except Exception:
+                logger.warning("OneBot11 queued reaction 失败记录删除失败", exc_info=True)
+            return False
         except Exception:
             logger.warning("OneBot11 queued reaction 添加失败", exc_info=True)
+            try:
+                await asyncio.to_thread(
+                    self._queue.delete_reaction,
+                    str(anchor_id),
+                    reaction_kind="queued",
+                )
+            except Exception:
+                logger.warning("OneBot11 queued reaction 失败记录删除失败", exc_info=True)
+            return False
         try:
             await asyncio.to_thread(
-                self._queue.delete_reaction,
+                self._queue.mark_reaction_set,
                 str(anchor_id),
                 reaction_kind="queued",
             )
         except Exception:
-            logger.warning("OneBot11 queued reaction 失败记录删除失败", exc_info=True)
-        return False
+            # set 已经成功；落盘更新失败时必须保留 pending 记录，
+            # 下次恢复只允许 unset，不能重新 set。
+            logger.warning(
+                "OneBot11 queued reaction 已添加但状态更新失败，保留 pending 记录",
+                exc_info=True,
+            )
+        return True
 
     async def _set_processing_reaction(self, lease: QueueLease, *, enabled: bool) -> str | None:
         """按当前群 lease 设置处理指示器；reaction 失败不阻断 Agent turn。"""
-        if not self._processing_reaction_enabled:
+        if self._closed or not self._processing_reaction_enabled:
             return None
         if not self._chat_access_allowed("group", lease.chat_id):
             return None
@@ -1440,6 +1555,11 @@ class OneBot11Adapter(BasePlatformAdapter):
             return None
         if enabled:
             try:
+                existing_before = await asyncio.to_thread(
+                    self._queue.reaction,
+                    lease.trigger.anchor_id,
+                    reaction_kind="processing",
+                )
                 await asyncio.to_thread(
                     self._queue.record_reaction,
                     lease.lease_id,
@@ -1452,14 +1572,47 @@ class OneBot11Adapter(BasePlatformAdapter):
             except Exception:
                 logger.warning("OneBot11 reaction 状态持久化失败", exc_info=True)
                 return None
+            if existing_before is not None:
+                # retry 或此前 set 成功但状态更新未知时，只保留 unset
+                # 清理路径；不能再次执行 processing set=true。
+                return existing_before.message_id
+            try:
+                existing = await asyncio.to_thread(
+                    self._queue.reaction,
+                    lease.trigger.anchor_id,
+                    reaction_kind="processing",
+                )
+            except Exception:
+                logger.warning("OneBot11 reaction 状态读取失败", exc_info=True)
+                return None
+            if existing is not None and existing.state == "maybe_set":
+                # 原 anchor 已经可能成功设置过 reaction；新 anchor 只能继续清理，
+                # 绝不能重新发出同一个非幂等 set 请求。
+                return existing.message_id
+            if self._closed:
+                try:
+                    await asyncio.to_thread(
+                        self._queue.delete_reaction,
+                        lease.trigger.anchor_id,
+                        reaction_kind="processing",
+                    )
+                except Exception:
+                    logger.debug(
+                        "OneBot11 shutdown 时 processing reaction pending 状态清理失败",
+                        exc_info=True,
+                    )
+                return None
         try:
-            if enabled and not await asyncio.to_thread(
-                self._queue.is_lease_current,
-                lease,
+            if self._closed or (
+                enabled
+                and not await asyncio.to_thread(
+                    self._queue.is_lease_current,
+                    lease,
+                )
             ):
                 self._fenced_leases.add(lease.lease_id)
                 logger.info(
-                    "OneBot11 reaction 跳过已失效 lease 的远端 set: %s",
+                    "OneBot11 reaction 跳过已关闭或失效 lease 的远端 set: %s",
                     lease.lease_id,
                 )
                 return None
@@ -1608,7 +1761,20 @@ class OneBot11Adapter(BasePlatformAdapter):
 
     async def _unset_reaction(self, reaction: Any) -> None:
         """只清理已可能设置成功的 reaction，失败时保留持久记录。"""
+        if self._closed:
+            return
+        identifier = str(reaction.anchor_id or reaction.lease_id)
         if not self._chat_access_allowed("group", reaction.chat_id):
+            # 白名单收紧后不能再向该群发请求；本地记录也不能永久阻塞
+            # 启动恢复，否则每次重启都会重复扫描一个已失权目标。
+            try:
+                await asyncio.to_thread(
+                    self._queue.delete_reaction,
+                    identifier,
+                    reaction_kind=reaction.reaction_kind,
+                )
+            except Exception:
+                logger.warning("OneBot11 失权 reaction 状态删除失败", exc_info=True)
             return
         emoji_id = str(reaction.emoji_id or "").strip()
         if not emoji_id:
@@ -1617,7 +1783,6 @@ class OneBot11Adapter(BasePlatformAdapter):
                 if reaction.reaction_kind == "queued"
                 else self._processing_reaction_emoji_id
             )
-        identifier = str(reaction.anchor_id or reaction.lease_id)
         try:
             await self._api.set_message_emoji_like(
                 reaction.message_id,
@@ -1670,7 +1835,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         except Exception:
             logger.warning("OneBot11 reaction 恢复读取失败", exc_info=True)
             return
-        for reaction in records:
+        for reaction in records[:32]:
             await self._unset_reaction(reaction)
 
     def _lease_is_current(self, lease_id: str | None) -> bool:
@@ -1717,6 +1882,8 @@ class OneBot11Adapter(BasePlatformAdapter):
         status = self._queue.status_for_lease(lease_id)
         if not status and lease_id not in self._outbound_started:
             return False, False, True, "queue lease 不存在，拒绝确认"
+        if status and status.get("lease_phase") not in {"agent_running", "outbound_started"}:
+            return False, True, False, "lease phase 无法证明，结果必须人工确认"
         started = bool(status.get("outbound_started")) or lease_id in self._outbound_started
         unknown = lease_id in self._unknown_leases
         known_failure = lease_id in self._outbound_known_failure
@@ -1768,6 +1935,11 @@ class OneBot11Adapter(BasePlatformAdapter):
                     )
                 except asyncio.CancelledError:
                     raise
+                except QueueError:
+                    # QueueStore 已关闭时不再重试任何 SQLite 操作；旧 turn
+                    # 只做内存 fencing，持久状态交给下次进程恢复。
+                    self._fenced_leases.add(lease_id)
+                    return
                 except Exception:
                     if self._closed:
                         return
@@ -1962,52 +2134,98 @@ class OneBot11Adapter(BasePlatformAdapter):
         """显式解析 ChatTarget 后发送，并记录部分/未知出站结果。"""
         binding = self._binding_from_context()
         lease_id = binding.lease_id if binding else None
+        system_error_notice = bool(
+            isinstance(metadata, Mapping) and metadata.get("hermes_system_error_notice") is True
+        )
+        track_business_outbound = bool(lease_id and not system_error_notice)
         if self._closed:
-            if lease_id:
+            if track_business_outbound:
                 self._outbound_known_failure.add(lease_id)
             return SendResult(False, error="OneBot11 adapter is closed", error_kind="not_found")
         if lease_id and not self._lease_is_current(lease_id):
             self._fenced_leases.add(lease_id)
-            self._outbound_known_failure.add(lease_id)
+            if track_business_outbound:
+                self._outbound_known_failure.add(lease_id)
             return SendResult(False, error="OneBot11 lease 已失效，拒绝出站", error_kind="fenced")
         target = self._resolve_target(str(chat_id), metadata)
         if target is None:
-            if lease_id:
+            if track_business_outbound:
                 self._outbound_known_failure.add(lease_id)
             return SendResult(False, error="OneBot11 target unknown or ambiguous", error_kind="unknown")
         caller_user_id = binding.caller.user_id if binding is not None else None
         if not self._chat_access_allowed(target.chat_type, target.chat_id, caller_user_id):
-            if lease_id:
+            if track_business_outbound:
                 self._outbound_known_failure.add(lease_id)
             return SendResult(False, error="OneBot11 target 不再满足访问策略", error_kind="permission")
         if self._ws is None:
-            if lease_id:
+            if track_business_outbound:
                 self._outbound_known_failure.add(lease_id)
             return SendResult(False, error="Not connected", error_kind="not_found")
         pieces = chunk_text(content, self.max_message_length_for_chat(target.chat_id))
         if not pieces and content:
             pieces = [content]
         sent: list[str] = []
+
+        def failed_result(error: str, error_kind: str) -> SendResult:
+            """根据已发送块数和 marker 状态区分明确失败与未知结果。"""
+            if track_business_outbound:
+                if sent or lease_id in self._outbound_started:
+                    self._unknown_leases.add(lease_id)
+                else:
+                    self._outbound_known_failure.add(lease_id)
+            return SendResult(
+                False,
+                message_id=sent[-1] if sent else None,
+                error=error,
+                raw_response={"sent_chunks": len(sent), "total_chunks": len(pieces)},
+                error_kind=error_kind,
+            )
+
         for piece in pieces:
-            if lease_id:
-                marked = await asyncio.to_thread(self._queue.mark_outbound_started, lease_id)
+            # 每个块都重新检查目标、adapter 和 lease；前一块成功不能
+            # 让后续块继承旧的出站资格。
+            if self._closed:
+                return failed_result("OneBot11 adapter is closed", "not_found")
+            if not self._chat_access_allowed(target.chat_type, target.chat_id, caller_user_id):
+                return failed_result("OneBot11 target 不再满足访问策略", "permission")
+            if self._ws is None:
+                return failed_result("Not connected", "not_found")
+            if track_business_outbound:
+                if not self._lease_is_current(lease_id):
+                    self._fenced_leases.add(lease_id)
+                    return failed_result("OneBot11 lease 已失效，拒绝出站", "fenced")
+                try:
+                    marked = await asyncio.to_thread(
+                        self._queue.mark_outbound_started,
+                        lease_id,
+                    )
+                except QueueError:
+                    self._fenced_leases.add(lease_id)
+                    return failed_result("OneBot11 queue 已关闭或 lease 无法 fencing", "fenced")
                 if not marked:
                     self._fenced_leases.add(lease_id)
-                    self._outbound_known_failure.add(lease_id)
-                    return SendResult(
-                        False,
-                        message_id=sent[-1] if sent else None,
-                        error="OneBot11 lease 已失效，拒绝出站",
-                        raw_response={"sent_chunks": len(sent), "total_chunks": len(pieces)},
-                        error_kind="fenced",
-                    )
+                    return failed_result("OneBot11 lease 已失效，拒绝出站", "fenced")
                 self._outbound_started.add(lease_id)
+                if (
+                    self._closed
+                    or not self._chat_access_allowed(
+                        target.chat_type,
+                        target.chat_id,
+                        caller_user_id,
+                    )
+                    or not self._lease_is_current(lease_id)
+                ):
+                    self._fenced_leases.add(lease_id)
+                    return failed_result(
+                        "OneBot11 lease 在 marker 后失效，拒绝出站",
+                        "fenced",
+                    )
             try:
                 sent_id = await self._api.send_message(
                     target.chat_id, piece, chat_type=target.chat_type, reply_to=reply_to
                 )
                 if not sent_id:
-                    if lease_id:
+                    if track_business_outbound:
                         self._unknown_leases.add(lease_id)
                     return SendResult(
                         False,
@@ -2016,12 +2234,12 @@ class OneBot11Adapter(BasePlatformAdapter):
                         raw_response={"sent_chunks": len(sent), "total_chunks": len(pieces)},
                         error_kind="unknown",
                     )
-                if lease_id:
+                if track_business_outbound:
                     self._outbound_successful.add(lease_id)
                 sent.append(sent_id)
             except OneBotApiError as exc:
-                if lease_id:
-                    if exc.unknown_outcome or sent:
+                if track_business_outbound:
+                    if exc.unknown_outcome or sent or lease_id in self._outbound_started:
                         self._unknown_leases.add(lease_id)
                     else:
                         self._outbound_known_failure.add(lease_id)
@@ -2033,14 +2251,9 @@ class OneBot11Adapter(BasePlatformAdapter):
                     error_kind="unknown" if exc.unknown_outcome else exc.error_kind,
                 )
             except ValueError as exc:
-                if lease_id:
-                    self._outbound_known_failure.add(lease_id)
-                return SendResult(
-                    False,
-                    message_id=sent[-1] if sent else None,
-                    error=str(exc),
-                    raw_response={"sent_chunks": len(sent), "total_chunks": len(pieces)},
-                    error_kind="failed",
+                return failed_result(
+                    str(exc),
+                    "unknown" if lease_id and lease_id in self._outbound_started else "failed",
                 )
         return SendResult(
             True,
@@ -2152,7 +2365,34 @@ class OneBot11Adapter(BasePlatformAdapter):
                 )
             session_id = kwargs.get("session_id")
             turn_id = kwargs.get("turn_id")
-            binding = self._resolve_binding(session_id, turn_id) if turn_id else self._binding_from_context()
+            explicit_binding = (
+                self._resolve_binding(session_id, turn_id)
+                if session_id and turn_id
+                else None
+            )
+            context_binding = _CURRENT_BINDING.get()
+            context_caller = _CURRENT_CALLER.get()
+            if (
+                explicit_binding is not None
+                and context_binding is not None
+                and explicit_binding != context_binding
+            ) or (
+                context_caller is not None
+                and explicit_binding is not None
+                and explicit_binding.caller != context_caller
+            ) or (
+                context_caller is not None
+                and context_binding is not None
+                and context_binding.caller != context_caller
+            ):
+                return json.dumps(
+                    {
+                        "status": "permission_error",
+                        "error": "ContextVar caller 与显式 session/turn binding 冲突",
+                    },
+                    ensure_ascii=False,
+                )
+            binding = explicit_binding or self._binding_from_context()
             if binding is not None and session_id and binding.session_id != str(session_id):
                 binding = None
             if binding is not None and turn_id and binding.turn_id != str(turn_id):
@@ -2245,17 +2485,43 @@ class OneBot11Adapter(BasePlatformAdapter):
                     else:
                         async def before_write() -> bool:
                             """紧贴真实 HTTP 写请求落盘 outbound marker。"""
+                            if self._closed or not self._chat_access_allowed(
+                                binding.caller.chat_type,
+                                binding.caller.chat_id,
+                                binding.caller.user_id,
+                            ):
+                                if binding.lease_id:
+                                    self._fenced_leases.add(binding.lease_id)
+                                return False
                             if not binding.lease_id:
                                 return True
-                            marked = await asyncio.to_thread(
-                                self._queue.mark_outbound_started,
-                                binding.lease_id,
-                            )
-                            if marked:
-                                self._outbound_started.add(binding.lease_id)
-                            else:
+                            if not self._lease_is_current(binding.lease_id):
                                 self._fenced_leases.add(binding.lease_id)
-                            return marked
+                                return False
+                            try:
+                                marked = await asyncio.to_thread(
+                                    self._queue.mark_outbound_started,
+                                    binding.lease_id,
+                                )
+                            except QueueError:
+                                self._fenced_leases.add(binding.lease_id)
+                                return False
+                            if not marked:
+                                self._fenced_leases.add(binding.lease_id)
+                                return False
+                            self._outbound_started.add(binding.lease_id)
+                            if (
+                                self._closed
+                                or not self._chat_access_allowed(
+                                    binding.caller.chat_type,
+                                    binding.caller.chat_id,
+                                    binding.caller.user_id,
+                                )
+                                or not self._lease_is_current(binding.lease_id)
+                            ):
+                                self._fenced_leases.add(binding.lease_id)
+                                return False
+                            return True
 
                         result = await handle_write_action(
                             self._api,
@@ -2515,13 +2781,15 @@ class OneBot11Adapter(BasePlatformAdapter):
                     "admin_resolve",
                     {"chat_type": event.chat_type, "chat_id": chat_id, "user_id": event.user_id, "action": parts[2], "count": count},
                 )
-                suffix = (
-                    "；旧消息已释放为未锚定 pending，请重新明确触发"
-                    if parts[2] == "retry"
-                    and int((await asyncio.to_thread(self._queue.status, chat_id)).get("pending_trigger_requests", 0)) == 0
-                    else ""
-                )
-                await self._send_direct(event, f"已处理 uncertain/failed 消息 {count} 条: {parts[2]}（retry 可能重复执行）{suffix}")
+                if parts[2] == "retry":
+                    message = (
+                        f"已创建新的 retry anchor 并处理 {count} 条消息（可能重复执行；authority 保留原锚点）"
+                        if count
+                        else "当前记录缺少可验证 authority，不能 retry；请使用 discard 或发送新的明确触发消息"
+                    )
+                else:
+                    message = f"已处理 uncertain/failed 消息 {count} 条: discard"
+                await self._send_direct(event, message)
             else:
                 await self._send_direct(event, "用法: /onebot status|queue|flush|clear|pause|resume|resolve retry|resolve discard")
         except Exception as exc:
@@ -2717,7 +2985,7 @@ def _pre_llm_call_hook(session_id: str = "", turn_id: str = "", platform: Any = 
         if caller.lease_id
         else ""
     )
-    context = role_prompt(caller)
+    context = role_prompt(caller, adapter.role_tools)
     if reminder:
         context = f"{context}\n\n{reminder}"
     return {"context": context}
@@ -2776,7 +3044,33 @@ def _pre_tool_call_hook(tool_name: str = "", session_id: str = "", turn_id: str 
         if adapter is not None and session_id and turn_id
         else None
     )
-    has_onebot_caller = inherited_caller is not None or route_binding is not None
+    context_binding = _CURRENT_BINDING.get()
+    has_onebot_caller = (
+        inherited_caller is not None
+        or context_binding is not None
+        or route_binding is not None
+    )
+    if (
+        (
+            inherited_caller is not None
+            and route_binding is not None
+            and inherited_caller != route_binding.caller
+        )
+        or (
+            inherited_caller is not None
+            and context_binding is not None
+            and inherited_caller != context_binding.caller
+        )
+        or (
+            context_binding is not None
+            and route_binding is not None
+            and context_binding != route_binding
+        )
+    ):
+        return {
+            "action": "block",
+            "message": "权限错误: ContextVar caller 与显式 session/turn binding 冲突",
+        }
     onebot_context = bool(
         platform == _PLATFORM_NAME
         or has_onebot_caller
@@ -3045,6 +3339,27 @@ async def _standalone_send(pconfig: Any, chat_id: str, message: str, **kwargs: A
 
 def register(ctx: Any) -> None:
     """注册平台、全角色工具、权限 hooks 和旁路 trigger auxiliary。"""
+    register_hook = getattr(ctx, "register_hook", None)
+    if not callable(register_hook):
+        raise RuntimeError(
+            "OneBot11 拒绝启用：Hermes 未提供 pre_gateway_dispatch/pre_llm_call/pre_tool_call hooks"
+        )
+    try:
+        from hermes_cli.plugins import VALID_HOOKS
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "OneBot11 拒绝启用：无法读取 Hermes hook capability，不能安全启用权限门禁"
+        ) from exc
+    missing_hooks = {
+        "pre_gateway_dispatch",
+        "pre_llm_call",
+        "pre_tool_call",
+    }.difference(set(VALID_HOOKS))
+    if missing_hooks:
+        raise RuntimeError(
+            "OneBot11 拒绝启用：Hermes 缺少关键 hooks: "
+            + ", ".join(sorted(missing_hooks))
+        )
     ctx.register_platform(
         name="onebot11",
         label="OneBot 11 (QQ)",
@@ -3076,22 +3391,16 @@ def register(ctx: Any) -> None:
             description=_TOOL_DESCRIPTIONS.get(name, name),
             emoji="🔍" if name in READ_TOOL_NAMES else "🛡️",
         )
-    register_hook = getattr(ctx, "register_hook", None)
-    if callable(register_hook):
-        register_hook("pre_gateway_dispatch", _pre_gateway_dispatch_hook)
-        register_hook("pre_llm_call", _pre_llm_call_hook)
-        register_hook("pre_tool_call", _pre_tool_call_hook)
-        register_hook("post_llm_call", _post_llm_call_hook)
-        try:
-            from hermes_cli.plugins import VALID_HOOKS
-        except ImportError:
-            VALID_HOOKS = set()
-        if "pre_provider_request" in VALID_HOOKS:
-            register_hook("pre_provider_request", _pre_provider_request_hook)
-        else:
-            logger.info(
-                "Hermes 当前未提供 pre_provider_request；OneBot11 动态上下文等待上游接口"
-            )
+    register_hook("pre_gateway_dispatch", _pre_gateway_dispatch_hook)
+    register_hook("pre_llm_call", _pre_llm_call_hook)
+    register_hook("pre_tool_call", _pre_tool_call_hook)
+    register_hook("post_llm_call", _post_llm_call_hook)
+    if "pre_provider_request" in VALID_HOOKS:
+        register_hook("pre_provider_request", _pre_provider_request_hook)
+    else:
+        logger.info(
+            "Hermes 当前未提供 pre_provider_request；OneBot11 动态上下文等待上游接口"
+        )
     register_auxiliary = getattr(ctx, "register_auxiliary_task", None)
     if callable(register_auxiliary):
         register_auxiliary(

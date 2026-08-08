@@ -932,10 +932,22 @@ class QueueStore:
                         (message.chat_id, key),
                     ).fetchone()
                     if existing is not None:
+                        existing_trigger = self._conn.execute(
+                            """
+                            SELECT 1 FROM onebot_queue_trigger
+                            WHERE chat_id=? AND message_key=? AND anchor_kind!='legacy'
+                            LIMIT 1
+                            """,
+                            (message.chat_id, key),
+                        ).fetchone()
                         request_id = self._ensure_trigger(
                             trigger_request, message.chat_id, key, now
                         )
-                        if request_id is not None and triggered_at is not None:
+                        if (
+                            request_id is not None
+                            and existing_trigger is None
+                            and triggered_at is not None
+                        ):
                             self._conn.execute(
                                 "UPDATE onebot_queue_chat SET last_trigger_at=?, updated_at=? WHERE chat_id=?",
                                 (float(triggered_at), now, message.chat_id),
@@ -997,10 +1009,22 @@ class QueueStore:
                             now,
                         ),
                     )
+                    existing_trigger = self._conn.execute(
+                        """
+                        SELECT 1 FROM onebot_queue_trigger
+                        WHERE chat_id=? AND message_key=? AND anchor_kind!='legacy'
+                        LIMIT 1
+                        """,
+                        (message.chat_id, key),
+                    ).fetchone()
                     request_id = self._ensure_trigger(
                         trigger_request, message.chat_id, key, now
                     )
-                    if request_id is not None and triggered_at is not None:
+                    if (
+                        request_id is not None
+                        and existing_trigger is None
+                        and triggered_at is not None
+                    ):
                         self._conn.execute(
                             "UPDATE onebot_queue_chat SET last_trigger_at=?, updated_at=? WHERE chat_id=?",
                             (float(triggered_at), now, message.chat_id),
@@ -1252,6 +1276,14 @@ class QueueStore:
                     ).fetchone()
                     self._conn.commit()
                     return str(existing[0]) if existing is not None else None
+                existing_trigger = self._conn.execute(
+                    """
+                    SELECT 1 FROM onebot_queue_trigger
+                    WHERE chat_id=? AND anchor_seq=? AND anchor_kind!='legacy'
+                    LIMIT 1
+                    """,
+                    (str(chat_id), int(row["seq"])),
+                ).fetchone()
                 self._conn.execute(
                     "UPDATE onebot_queue_message SET next_attempt_at=NULL, updated_at=? WHERE row_id=?",
                     (now, int(row["row_id"])),
@@ -1267,7 +1299,11 @@ class QueueStore:
                 request_id = self._ensure_trigger(
                     anchor, str(chat_id), str(row["message_key"]), now
                 )
-                if request_id is not None and triggered_at is not None:
+                if (
+                    request_id is not None
+                    and existing_trigger is None
+                    and triggered_at is not None
+                ):
                     self._conn.execute(
                         "UPDATE onebot_queue_chat SET last_trigger_at=?, updated_at=? WHERE chat_id=?",
                         (float(triggered_at), now, str(chat_id)),
@@ -1569,7 +1605,13 @@ class QueueStore:
                 """
                 SELECT MIN(lease_until) AS lease_until,
                        MAX(outbound_started) AS outbound_started,
-                       MAX(CASE WHEN lease_phase='outbound_started' THEN 1 ELSE 0 END) AS phase_outbound
+                       MAX(
+                           CASE
+                               WHEN lease_phase='outbound_started'
+                                    OR lease_phase != 'agent_running'
+                               THEN 1 ELSE 0
+                           END
+                       ) AS phase_unknown
                 FROM onebot_queue_message
                 WHERE anchor_id=? AND lease_id=? AND state='leased'
                 """,
@@ -1580,7 +1622,7 @@ class QueueStore:
             elif float(message["lease_until"]) > now:
                 continue
             else:
-                uncertain = bool(message["outbound_started"] or message["phase_outbound"])
+                uncertain = bool(message["outbound_started"] or message["phase_unknown"])
             if uncertain:
                 reason = "lease 过期时出站阶段未知，需管理员确认"
                 self._conn.execute(
@@ -1602,23 +1644,55 @@ class QueueStore:
                     (reason, reason, now, str(anchor["request_id"])),
                 )
             else:
+                failure_count = int(anchor["failure_count"] or 0) + 1
+                if failure_count >= self.max_attempts:
+                    state = "failed"
+                    next_attempt_at = None
+                    failure_reason = "turn lease 过期，已达到自动恢复上限"
+                else:
+                    state = "pending"
+                    delay = min(
+                        MAX_BACKOFF_SECONDS,
+                        self.backoff_seconds[
+                            min(failure_count - 1, len(self.backoff_seconds) - 1)
+                        ],
+                    )
+                    next_attempt_at = now + delay
+                    failure_reason = "turn lease 过期，等待退避后自动恢复"
                 self._conn.execute(
                     """
                     UPDATE onebot_queue_message
-                    SET state='pending',lease_id=NULL,lease_until=NULL,lease_owner=NULL,
-                        lease_phase='pending',uncertain_reason=NULL,updated_at=?
+                    SET state=?,lease_id=NULL,lease_until=NULL,lease_owner=NULL,
+                        lease_phase=?,uncertain_reason=NULL,failure_count=?,
+                        next_attempt_at=?,failure_reason=?,updated_at=?
                     WHERE anchor_id=? AND state='leased'
                     """,
-                    (now, str(anchor["request_id"])),
+                    (
+                        state,
+                        state,
+                        failure_count,
+                        next_attempt_at,
+                        failure_reason,
+                        now,
+                        str(anchor["request_id"]),
+                    ),
                 )
                 self._conn.execute(
                     """
                     UPDATE onebot_queue_trigger
-                    SET status='pending',lease_id=NULL,lease_owner=NULL,
-                        uncertain_reason=NULL,updated_at=?
+                    SET status=?,lease_id=NULL,lease_owner=NULL,
+                        uncertain_reason=NULL,failure_count=?,
+                        next_attempt_at=?,failure_reason=?,updated_at=?
                     WHERE request_id=?
                     """,
-                    (now, str(anchor["request_id"])),
+                    (
+                        state,
+                        failure_count,
+                        next_attempt_at,
+                        failure_reason,
+                        now,
+                        str(anchor["request_id"]),
+                    ),
                 )
 
     def renew(self, lease: QueueLease | str, lease_seconds: float = 60.0) -> bool:
@@ -1710,6 +1784,32 @@ class QueueStore:
                 if not rows:
                     self._conn.commit()
                     return False
+                if any(
+                    str(row["lease_phase"] or "") not in {"agent_running", "outbound_started"}
+                    for row in rows
+                ):
+                    reason = "lease phase 无法证明，成功结果也不能安全 ack"
+                    self._conn.execute(
+                        """
+                        UPDATE onebot_queue_message
+                        SET state='uncertain', lease_id=NULL, lease_until=NULL,
+                            lease_owner=NULL, lease_phase='uncertain', outbound_started=1,
+                            uncertain_reason=?, updated_at=?
+                        WHERE lease_id=? AND lease_owner=? AND state='leased'
+                        """,
+                        (reason, now, lease_id, self._owner_id),
+                    )
+                    self._conn.execute(
+                        """
+                        UPDATE onebot_queue_trigger
+                        SET status='uncertain', lease_id=NULL, lease_owner=NULL,
+                            uncertain_reason=?, failure_reason=?, updated_at=?
+                        WHERE lease_id=? AND lease_owner=? AND status='claimed'
+                        """,
+                        (reason, reason, now, lease_id, self._owner_id),
+                    )
+                    self._conn.commit()
+                    return False
                 chat_id = str(rows[0]["chat_id"])
                 self._conn.executemany(
                     "INSERT OR REPLACE INTO onebot_queue_dedupe(chat_id,message_key,seq,created_at) VALUES (?,?,?,?)",
@@ -1781,7 +1881,12 @@ class QueueStore:
                 ):
                     self._conn.commit()
                     return False
-                if message_state == "pending" and any(bool(row["outbound_started"]) for row in rows):
+                if message_state == "pending" and any(
+                    bool(row["outbound_started"])
+                    or str(row["lease_phase"] or "") == "outbound_started"
+                    or str(row["lease_phase"] or "") != "agent_running"
+                    for row in rows
+                ):
                     # marker 一旦落盘，release 也必须立即转 uncertain；
                     # allow_after_outbound 仅保留接口兼容，不能绕过 fencing。
                     message_state = "uncertain"
@@ -1936,44 +2041,64 @@ class QueueStore:
                 ).fetchall()
                 if action == "retry":
                     if str(anchor["anchor_kind"]) == "legacy":
-                        self._conn.execute(
-                            """
-                            UPDATE onebot_queue_message
-                            SET state='pending',anchor_id=NULL,lease_id=NULL,lease_until=NULL,
-                                lease_owner=NULL,lease_phase='pending',outbound_started=0,
-                                uncertain_reason=NULL,failure_reason=NULL,failure_count=0,
-                                attempts=0,next_attempt_at=NULL,updated_at=?
-                            WHERE anchor_id=?
-                            """,
-                            (now, anchor_id),
-                        )
+                        # legacy 没有可验证 authority；retry 不能把它重新交给
+                        # 任意后续用户，只能由管理员 discard 或发送新的明确消息。
+                        self._conn.commit()
+                        return 0
+                    else:
+                        new_anchor_id = uuid.uuid4().hex
                         self._conn.execute(
                             "DELETE FROM onebot_queue_trigger WHERE request_id=?",
                             (anchor_id,),
                         )
-                    else:
+                        self._conn.execute(
+                            """
+                            INSERT INTO onebot_queue_trigger(
+                                request_id,chat_id,message_key,reason,caller_user_id,
+                                caller_user_name,status,anchor_seq,anchor_kind,batch_start_seq,
+                                control_message_id,failure_count,next_attempt_at,failure_reason,
+                                created_at,updated_at
+                            ) VALUES (?,?,?,?,?,?, 'pending', ?, ?, ?, ?, 0, NULL, NULL, ?, ?)
+                            """,
+                            (
+                                new_anchor_id,
+                                str(anchor["chat_id"]),
+                                str(anchor["message_key"]),
+                                f"{str(anchor['reason'])}:admin_retry",
+                                str(anchor["caller_user_id"]),
+                                str(anchor["caller_user_name"]),
+                                anchor["anchor_seq"],
+                                str(anchor["anchor_kind"]),
+                                anchor["batch_start_seq"],
+                                anchor["control_message_id"],
+                                now,
+                                now,
+                            ),
+                        )
                         self._conn.execute(
                             """
                             UPDATE onebot_queue_message
-                            SET state='pending', lease_id=NULL, lease_until=NULL,
+                            SET state='pending',anchor_id=?,lease_id=NULL,lease_until=NULL,
                                 lease_owner=NULL,lease_phase='pending',outbound_started=0,
                                 uncertain_reason=NULL,failure_reason=NULL,failure_count=0,
-                                attempts=0,next_attempt_at=NULL,updated_at=?
+                                next_attempt_at=NULL,updated_at=?
                             WHERE anchor_id=?
                             """,
-                            (now, anchor_id),
+                            (new_anchor_id, now, anchor_id),
                         )
                         self._conn.execute(
                             """
-                            UPDATE onebot_queue_trigger
-                            SET status='pending',lease_id=NULL,lease_owner=NULL,
-                                uncertain_reason=NULL,failure_reason=NULL,failure_count=0,
-                                next_attempt_at=NULL,updated_at=?
-                            WHERE request_id=?
+                            UPDATE onebot_queue_reaction
+                            SET anchor_id=?,lease_id=NULL,updated_at=?
+                            WHERE anchor_id=?
                             """,
-                            (now, anchor_id),
+                            (new_anchor_id, now, anchor_id),
                         )
                 else:
+                    self._conn.execute(
+                        "DELETE FROM onebot_queue_reaction WHERE anchor_id=?",
+                        (anchor_id,),
+                    )
                     self._conn.execute(
                         """
                         INSERT OR REPLACE INTO onebot_queue_dedupe(
@@ -2022,6 +2147,50 @@ class QueueStore:
                     (str(lease_id),),
                 ).fetchone()
                 resolved_anchor = str(row[0]) if row is not None else f"legacy-{lease_id}"
+            same_target = self._conn.execute(
+                """
+                SELECT anchor_id FROM onebot_queue_reaction
+                WHERE chat_id=? AND message_id=? AND reaction_kind=?
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (str(chat_id), str(message_id), reaction_kind),
+            ).fetchone()
+            if same_target is not None and str(same_target["anchor_id"]) != resolved_anchor:
+                current_target = self._conn.execute(
+                    """
+                    SELECT 1 FROM onebot_queue_reaction
+                    WHERE anchor_id=? AND reaction_kind=?
+                    """,
+                    (resolved_anchor, reaction_kind),
+                ).fetchone()
+                if current_target is None:
+                    self._conn.execute(
+                        """
+                        UPDATE onebot_queue_reaction
+                        SET anchor_id=?,lease_id=?,chat_id=?,message_id=?,emoji_id=?,
+                            updated_at=?
+                        WHERE anchor_id=? AND reaction_kind=?
+                        """,
+                        (
+                            resolved_anchor,
+                            str(lease_id) or None,
+                            str(chat_id),
+                            str(message_id),
+                            str(emoji_id),
+                            now,
+                            str(same_target["anchor_id"]),
+                            reaction_kind,
+                        ),
+                    )
+                else:
+                    self._conn.execute(
+                        """
+                        DELETE FROM onebot_queue_reaction
+                        WHERE anchor_id=? AND reaction_kind=?
+                        """,
+                        (str(same_target["anchor_id"]), reaction_kind),
+                    )
             self._conn.execute(
                 """
                 INSERT INTO onebot_queue_reaction(
@@ -2033,11 +2202,27 @@ class QueueStore:
                     chat_id=excluded.chat_id,
                     message_id=excluded.message_id,
                     emoji_id=excluded.emoji_id,
-                    state=excluded.state,
+                    state=CASE
+                        WHEN onebot_queue_reaction.state='maybe_set'
+                        THEN 'maybe_set'
+                        ELSE excluded.state
+                    END,
                     updated_at=excluded.updated_at,
-                    attempts=0,
-                    next_attempt_at=NULL,
-                    last_error=NULL
+                    attempts=CASE
+                        WHEN onebot_queue_reaction.state='maybe_set'
+                        THEN onebot_queue_reaction.attempts
+                        ELSE 0
+                    END,
+                    next_attempt_at=CASE
+                        WHEN onebot_queue_reaction.state='maybe_set'
+                        THEN onebot_queue_reaction.next_attempt_at
+                        ELSE NULL
+                    END,
+                    last_error=CASE
+                        WHEN onebot_queue_reaction.state='maybe_set'
+                        THEN onebot_queue_reaction.last_error
+                        ELSE NULL
+                    END
                 """,
                 (
                     resolved_anchor,
@@ -2175,14 +2360,19 @@ class QueueStore:
                              AND anchor.status='pending'
                        ))
                        OR
-                       (reaction.reaction_kind IN ('processing','legacy_processing')
-                        AND NOT EXISTS (
-                           SELECT 1 FROM onebot_queue_message AS message
-                           WHERE message.lease_id=reaction.lease_id
-                             AND message.state='leased'
-                             AND message.lease_until IS NOT NULL
-                             AND message.lease_until>?
-                       ))
+                        (reaction.reaction_kind IN ('processing','legacy_processing')
+                         AND NOT EXISTS (
+                            SELECT 1 FROM onebot_queue_message AS message
+                            WHERE message.lease_id=reaction.lease_id
+                              AND message.state='leased'
+                              AND message.lease_until IS NOT NULL
+                              AND message.lease_until>?
+                        )
+                         AND NOT EXISTS (
+                            SELECT 1 FROM onebot_queue_trigger AS anchor
+                            WHERE anchor.request_id=reaction.anchor_id
+                              AND anchor.status='pending'
+                        ))
                    )
                 ORDER BY reaction.updated_at
                 """,
@@ -2265,8 +2455,11 @@ class QueueStore:
                 """
                 SELECT DISTINCT failure_reason FROM onebot_queue_message
                 WHERE chat_id=? AND failure_reason IS NOT NULL
+                UNION
+                SELECT DISTINCT failure_reason FROM onebot_queue_trigger
+                WHERE chat_id=? AND failure_reason IS NOT NULL
                 """,
-                (str(chat_id),),
+                (str(chat_id), str(chat_id)),
             ).fetchall()
             uncertain_reasons = self._conn.execute(
                 """
@@ -2280,10 +2473,17 @@ class QueueStore:
             ).fetchall()
             next_retry = self._conn.execute(
                 """
-                SELECT MIN(next_attempt_at) FROM onebot_queue_message
-                WHERE chat_id=? AND state='pending' AND next_attempt_at IS NOT NULL
+                SELECT MIN(next_attempt_at) FROM (
+                    SELECT next_attempt_at
+                    FROM onebot_queue_message
+                    WHERE chat_id=? AND state='pending' AND next_attempt_at IS NOT NULL
+                    UNION ALL
+                    SELECT next_attempt_at
+                    FROM onebot_queue_trigger
+                    WHERE chat_id=? AND status='pending' AND next_attempt_at IS NOT NULL
+                )
                 """,
-                (str(chat_id),),
+                (str(chat_id), str(chat_id)),
             ).fetchall()
             phase = self._conn.execute(
                 """
@@ -2513,62 +2713,31 @@ class QueueStore:
                     "onebot_queue_message.chat_id", allowed_chat_ids
                 )
                 message_select_scope, _ = self._chat_scope("message.chat_id", allowed_chat_ids)
-                self._conn.execute(
+                claimed_chats = self._conn.execute(
                     f"""
-                    UPDATE onebot_queue_trigger SET status='uncertain', lease_id=NULL,
-                        lease_owner=NULL, uncertain_reason=?, updated_at=?
-                    WHERE status='claimed' {trigger_update_scope} AND EXISTS (
-                        SELECT 1 FROM onebot_queue_message
-                        WHERE onebot_queue_message.lease_id=onebot_queue_trigger.lease_id
-                          {message_scope}
-                          AND onebot_queue_message.state='leased'
-                          AND (onebot_queue_message.lease_until IS NULL OR onebot_queue_message.lease_until<=?)
-                          AND (onebot_queue_message.outbound_started=1
-                               OR onebot_queue_message.lease_phase='outbound_started'
-                               OR onebot_queue_message.lease_until IS NULL)
-                    )
+                    SELECT DISTINCT chat_id
+                    FROM onebot_queue_trigger
+                    WHERE status='claimed' {trigger_update_scope}
                     """,
-                    (
-                        "lease 过期时出站阶段未知，需管理员确认",
-                        now,
-                        *trigger_scope_args,
-                        *message_scope_args,
-                        now,
-                    ),
-                )
-                self._conn.execute(
-                    f"""
-                    UPDATE onebot_queue_trigger SET status='pending', lease_id=NULL,
-                        lease_owner=NULL, uncertain_reason=NULL, updated_at=?
-                    WHERE status='claimed' {trigger_update_scope} AND EXISTS (
-                        SELECT 1 FROM onebot_queue_message
-                        WHERE onebot_queue_message.lease_id=onebot_queue_trigger.lease_id
-                          {message_scope}
-                          AND onebot_queue_message.state='leased'
-                          AND onebot_queue_message.lease_until IS NOT NULL
-                          AND onebot_queue_message.lease_until<=?
-                          AND onebot_queue_message.outbound_started=0
-                          AND onebot_queue_message.lease_phase='agent_running'
-                    )
-                    """,
-                    (now, *trigger_scope_args, *message_scope_args, now),
-                )
+                    trigger_scope_args,
+                ).fetchall()
+                for claimed_chat in claimed_chats:
+                    self._recover_expired_anchors(str(claimed_chat[0]), now)
                 self._conn.execute(
                     f"""
                     UPDATE onebot_queue_message
-                    SET state=CASE
-                            WHEN lease_until IS NULL OR outbound_started=1 OR lease_phase='outbound_started'
-                                THEN 'uncertain' ELSE 'pending' END,
+                    SET state='uncertain',
                         lease_id=NULL, lease_until=NULL, lease_owner=NULL,
-                        lease_phase=CASE
-                            WHEN lease_until IS NULL OR outbound_started=1 OR lease_phase='outbound_started'
-                                THEN 'uncertain' ELSE 'agent_running' END,
-                        uncertain_reason=CASE
-                            WHEN lease_until IS NULL OR outbound_started=1 OR lease_phase='outbound_started'
-                                THEN 'lease 过期时出站阶段未知，需管理员确认' ELSE NULL END,
+                        lease_phase='uncertain',outbound_started=1,
+                        uncertain_reason='过期 lease 缺少可验证 TurnAnchor，需管理员处理',
                         updated_at=?
                     WHERE state='leased' {message_scope}
                       AND (lease_until IS NULL OR lease_until<=?)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM onebot_queue_trigger AS trigger
+                          WHERE trigger.request_id=onebot_queue_message.anchor_id
+                             OR trigger.lease_id=onebot_queue_message.lease_id
+                      )
                     """,
                     (now, *message_scope_args, now),
                 )
@@ -2640,7 +2809,7 @@ class QueueStore:
         return QueueMessage(
             chat_id=str(row["chat_id"]),
             chat_type=str(row["chat_type"]),
-            message_id=str(row["message_id"] or row["message_key"]),
+            message_id=str(row["message_id"] or ""),
             user_id=str(row["user_id"]),
             user_name=str(row["user_name"]),
             text=str(row["text"]),

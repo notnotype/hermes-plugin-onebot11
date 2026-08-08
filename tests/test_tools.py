@@ -122,6 +122,22 @@ async def test_私聊历史任一条不含当前参与者时整次拒绝():
     assert result["status"] == "permission_error"
 
 
+async def test_hash_message_key不进入get_msg整数接口():
+    """没有真实 OneBot message_id 时返回结构化边界错误。"""
+    class UnexpectedApi:
+        """不应被 hash message key 调用的最小 API stub。"""
+
+        async def get_message(self, _message_id: str):
+            raise AssertionError("hash message key 不应访问 OneBot get_msg")
+
+    result = await handle_get_message(
+        UnexpectedApi(),
+        {"message_id": "hash:abc"},
+        ToolContext(user_id="123", chat_type="group", chat_id="888"),
+    )
+    assert result["error_code"] == "message_id_unavailable"
+
+
 def test_查询和群管理工具schema齐全():
     assert set(TOOL_SCHEMAS.keys()) == {
         "qq_get_message",

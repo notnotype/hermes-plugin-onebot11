@@ -126,7 +126,9 @@ def test_缺少message_id时忽略时间戳生成稳定去重键():
     first_event = build_inbound_event(first, self_id="1")
     replay_event = build_inbound_event(replay, self_id="1")
     assert first_event is not None and replay_event is not None
-    assert first_event.message_id == replay_event.message_id
+    assert first_event.message_id == replay_event.message_id == ""
+    assert first_event.message_key == replay_event.message_key
+    assert first_event.message_key.startswith("hash:")
 
 
 def test_保留CQ原文供队列最近原文使用():
