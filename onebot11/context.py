@@ -17,15 +17,6 @@ def _truncate_utf8(value: str, limit: int) -> str:
     )
 
 
-def _truncate_utf8_tail(value: str, limit: int) -> str:
-    """按 UTF-8 字节保留末尾，优先保留较新的摘要内容。"""
-    if limit <= 0:
-        return ""
-    return str(value).encode("utf-8", errors="replace")[-limit:].decode(
-        "utf-8", errors="ignore"
-    )
-
-
 def _bounded_field(value: object, limit: int = 256) -> str:
     """限制消息身份字段，避免异常元数据挤占 Agent 输入预算。"""
     return _truncate_utf8(str(value or ""), limit)
@@ -127,6 +118,23 @@ def _message_record(
     return record
 
 
+def _message_identity_record(
+    message: QueueMessage,
+    *,
+    role_snapshot: Mapping[str, str],
+) -> dict[str, object]:
+    """生成正文省略但仍可供工具定位的消息身份记录。"""
+    record = _message_record(
+        message,
+        role_snapshot=role_snapshot,
+        anchor_seq=None,
+        include_original=False,
+    )
+    record["text"] = ""
+    record["omitted"] = True
+    return record
+
+
 def _record_json(record: Mapping[str, object]) -> str:
     """使用稳定、紧凑的 JSON 表示一条消息。"""
     return json.dumps(record, ensure_ascii=False, separators=(",", ":"), default=str)
@@ -172,35 +180,116 @@ def _fit_record_json(record: Mapping[str, object], limit: int) -> str | None:
     return encoded if len(encoded.encode("utf-8")) <= limit else None
 
 
-def _message_line(message: QueueMessage, *, include_original: bool) -> str:
-    """生成一条受限的队列消息上下文。"""
-    markers = " ".join(
-        str(item)[:128] for item in (message.metadata.get("onebot11_markers") or [])
-    )
-    line = f"#{message.seq or '?'} [{message.user_name}] {message.text}"
-    if include_original and message.raw_text and message.raw_text != message.text:
-        line += f" [原文: {message.raw_text}]"
-    if markers:
-        line += f" {markers}"
-    return line
-
-
 def build_queue_batch_summary(
     messages: Iterable[QueueMessage],
     max_bytes: int = 32 * 1024,
+    *,
+    role_snapshot: Mapping[str, str] | None = None,
 ) -> str:
-    """把当前 batch 的早期消息压成确定性摘要，不读取跨轮历史。"""
+    """把当前 batch 的早期消息压成结构化摘要，不读取跨轮历史。"""
     budget = max(256, int(max_bytes))
-    lines = [_message_line(message, include_original=False) for message in messages]
-    if not lines:
+    items = tuple(messages)
+    if not items:
         return ""
-    result = "\n".join(lines)
-    if len(result.encode("utf-8")) <= budget:
-        return result
-    marker = "[本次队列摘要较大，较早消息已裁剪]"
-    marker_bytes = len(marker.encode("utf-8")) + 1
-    tail = _truncate_utf8_tail(result, max(0, budget - marker_bytes))
-    return f"{marker}\n{tail}" if tail else marker[:budget]
+    roles = role_snapshot or {}
+    records = [
+        _message_record(
+            message,
+            role_snapshot=roles,
+            anchor_seq=None,
+            include_original=False,
+        )
+        for message in items
+    ]
+    identity_records = [
+        _message_identity_record(message, role_snapshot=roles)
+        for message in items
+    ]
+
+    def render(
+        selected: list[str],
+        omitted: int,
+        identity_only: list[str] | None = None,
+        identity_omitted: int = 0,
+    ) -> str:
+        """渲染完整 JSONL 记录，避免尾部字节裁剪破坏身份字段。"""
+        identity_only = identity_only or []
+        return "\n".join(
+            [
+                "[OneBot11 消息队列摘要；仅补充本次 turn 已省略的较早消息]",
+                f"messages_total: {len(records)}",
+                f"messages_included: {len(selected)}",
+                f"messages_omitted: {omitted}",
+                f"messages_identity_only: {len(identity_only)}",
+                f"messages_identity_omitted: {identity_omitted}",
+                *(
+                    ["早期消息索引（正文已省略，仍可用 seq/message_id/message_key 定位）："]
+                    + identity_only
+                    if identity_only
+                    else []
+                ),
+                "消息记录（JSONL）：",
+                *selected,
+            ]
+        )
+
+    encoded_records = [_record_json(record) for record in records]
+    for start in range(len(encoded_records)):
+        candidate = render(
+            encoded_records[start:],
+            start,
+            [_record_json(record) for record in identity_records[:start]],
+        )
+        if len(candidate.encode("utf-8")) <= budget:
+            return candidate
+
+    # 单条消息本身过大时仍保留结构化身份、seq 和 message_id，只裁剪正文；
+    # 在为最后一条正文留预算时，尽可能保留更早消息的身份索引。
+    encoded_identity_records = [_record_json(record) for record in identity_records]
+    for identity_count in range(max(0, len(records) - 1), -1, -1):
+        identity_only = encoded_identity_records[:identity_count]
+        identity_omitted = len(records) - 1 - identity_count
+        prefix = render(
+            [],
+            max(0, len(records) - 1),
+            identity_only,
+            identity_omitted,
+        )
+        available = budget - len(prefix.encode("utf-8")) - 1
+        fitted = _fit_record_json(records[-1], available)
+        if fitted is None:
+            continue
+        candidate = render(
+            [fitted],
+            max(0, len(records) - 1),
+            identity_only,
+            identity_omitted,
+        )
+        if len(candidate.encode("utf-8")) <= budget:
+            return candidate
+
+    # 如果所有正文都无法放入预算，仍优先保留尽可能多的早期身份索引；
+    # 这比只留下一个不可定位的“正文已裁剪”提示更适合群管理查询。
+    identity_only: list[str] = []
+    for encoded_identity in encoded_identity_records:
+        candidate = render(
+            [],
+            len(records),
+            identity_only + [encoded_identity],
+            len(encoded_identity_records) - len(identity_only) - 1,
+        )
+        if len(candidate.encode("utf-8")) > budget:
+            break
+        identity_only.append(encoded_identity)
+    candidate = render(
+        [],
+        len(records),
+        identity_only,
+        len(encoded_identity_records) - len(identity_only),
+    )
+    if len(candidate.encode("utf-8")) <= budget:
+        return candidate
+    return _truncate_utf8(candidate, budget)
 
 
 def build_agent_context(
@@ -267,7 +356,11 @@ def build_agent_context(
         summary_source = (
             str(summary or "")
             if anchor_seq is None and summary
-            else build_queue_batch_summary(items[:start], max_bytes=max(0, budget // 4))
+            else build_queue_batch_summary(
+                items[:start],
+                max_bytes=max(0, budget // 4),
+                role_snapshot=roles,
+            )
         )
         candidate = render(selected, omitted, summary_source)
         if len(candidate.encode("utf-8")) > budget and summary_source:

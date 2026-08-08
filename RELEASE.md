@@ -22,8 +22,8 @@
 
 ## v0.4.0 迁移指南
 
-v0.4.0 是触发与权限行为升级：QueueStore v8 → v9 自动迁移；`require_mention=false` 不再直接授予发送者 authority；自动 selector 改为返回 `anchor_seq`；确认令牌被移除；当前 turn 使用不可变权限快照。PR #10 继续收口 lease fencing、崩溃退避、retry 新 anchor、reaction 迁移、真实/内部 message ID 分离和 HTTP redirect 边界。
+v0.4.0 是触发与权限行为升级：QueueStore v8/v9 → v10 自动迁移；`require_mention=false` 不再直接授予发送者 authority；自动 selector 改为返回 `anchor_seq`；确认令牌被移除；当前 turn 使用不可变权限快照。PR #10 继续收口 lease fencing、崩溃退避、retry 新 anchor、reaction 迁移、真实/内部 message ID 分离、私聊作用域和 HTTP redirect 边界。
 
 升级前停止 Hermes 并备份队列和配置。无法证明单一 authority 的旧 batch 会进入 legacy hold，不会自动执行。完整步骤见：[docs/migrations/2026-08-07-v0.4.0.md](docs/migrations/2026-08-07-v0.4.0.md)。
 
-v0.4.0 当前仍未合并/发布；PR #10 当前分支完整 Hermes 测试为 `256 passed`，Ruff、compileall、diff 检查和真实 PluginManager 注册 smoke 已通过。Arch 已部署 `87b8dbd` 并完成白名单范围内合成 WS/LLBot 联调，但这不等同于真人 QQ 或 OneBot 11 exactly-once 保证；白名单仍只允许群 `1072992996` 与私聊用户 `2056963663`。
+v0.4.0 当前仍未合并/发布；本 worktree 使用 Hermes 源码和 site-packages 的完整测试为 `272 passed`，Ruff 与 compileall 已通过。Arch 已部署的 `87b8dbd` 是修复前基线，当前 authority v10/严格作用域修复仍需重新联调；这不等同于真人 QQ 或 OneBot 11 exactly-once 保证。白名单仍只允许群 `1072992996` 与私聊用户 `2056963663`。

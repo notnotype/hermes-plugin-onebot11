@@ -34,7 +34,9 @@ CONFIG_WRITE_TOOLS = frozenset({"onebot_set_role_tools", "onebot_set_trusted_use
 ALL_TOOLS = READ_ONLY_TOOLS | WRITE_TOOLS | CONFIG_READ_TOOLS | CONFIG_WRITE_TOOLS
 ROLE_NAMES = ("user", "trusted_user", "super_admin")
 ONEBOT_TOOL_PREFIXES = ("qq_", "onebot_")
-FORBIDDEN_ROLE_TOOLS = frozenset({"delegate_task"})
+FORBIDDEN_ROLE_TOOLS = frozenset(
+    {"delegate_task", "tool_search", "tool_describe", "tool_call"}
+)
 
 
 @dataclass(frozen=True)
@@ -240,7 +242,9 @@ def build_role_tools(extra: Mapping[str, Any]) -> dict[str, frozenset[str]]:
             else parse_exact_tool_names(value, name=f"roles.{role}.tools")
         )
         if FORBIDDEN_ROLE_TOOLS.intersection(parsed):
-            raise ValueError("OneBot11 角色暂不允许配置 delegate_task")
+            raise ValueError(
+                "OneBot11 角色暂不允许配置 tool_search、tool_describe、tool_call 或 delegate_task"
+            )
         result[role] = parsed
     return result
 
@@ -311,7 +315,35 @@ def role_prompt(
     )
 
 
-def validate_message_scope(message: Mapping[str, Any], context: CallerContext) -> str | None:
+def validate_private_message_scope(
+    message: Mapping[str, Any],
+    context: CallerContext,
+    *,
+    self_id: str | None,
+) -> str | None:
+    """严格校验私聊消息双方正好是当前用户和当前机器人。"""
+    if not self_id:
+        return "当前机器人 QQ 号缺失，拒绝验证私聊作用域"
+    if str(context.chat_id) == str(self_id):
+        return "当前私聊用户不能与机器人 QQ 号相同"
+    participant_values = {
+        str(message.get(name) or "")
+        for name in ("user_id", "target_id", "friend_id", "sender_id")
+    }
+    sender = message.get("sender")
+    if isinstance(sender, Mapping):
+        participant_values.add(str(sender.get("user_id") or ""))
+    participant_values.discard("")
+    expected = {str(context.chat_id), str(self_id)}
+    return None if participant_values == expected else "消息不属于当前私聊"
+
+
+def validate_message_scope(
+    message: Mapping[str, Any],
+    context: CallerContext,
+    *,
+    self_id: str | None = None,
+) -> str | None:
     """校验 OneBot get_msg 返回的消息属于当前群或当前私聊。"""
     message_type = str(message.get("message_type") or "")
     if context.chat_type == "group":
@@ -320,16 +352,7 @@ def validate_message_scope(message: Mapping[str, Any], context: CallerContext) -
         return None
     if message_type != "private":
         return "消息不属于当前私聊"
-    participant_values = {
-        str(message.get(name) or "")
-        for name in ("user_id", "target_id", "friend_id", "sender_id")
-    }
-    sender = message.get("sender")
-    if isinstance(sender, Mapping):
-        participant_values.add(str(sender.get("user_id") or ""))
-    if context.chat_id not in participant_values:
-        return "消息不属于当前私聊"
-    return None
+    return validate_private_message_scope(message, context, self_id=self_id)
 
 
 def validate_group_payload(payload: Mapping[str, Any], context: CallerContext) -> str | None:
@@ -338,6 +361,21 @@ def validate_group_payload(payload: Mapping[str, Any], context: CallerContext) -
         return "该响应只能在群聊中使用"
     if str(payload.get("group_id") or "") != context.chat_id:
         return "OneBot 响应不属于当前群"
+    return None
+
+
+def validate_group_member_payload(
+    payload: Mapping[str, Any],
+    context: CallerContext,
+    requested_user_id: str,
+) -> str | None:
+    """校验群成员响应同时属于当前群且对应请求成员。"""
+    error = validate_group_payload(payload, context)
+    if error:
+        return error
+    returned_user_id = str(payload.get("user_id") or "").strip()
+    if not returned_user_id or returned_user_id != str(requested_user_id):
+        return "OneBot 响应不属于请求的当前群成员"
     return None
 
 
@@ -352,6 +390,8 @@ def validate_tool_call(
     normalized_tool = str(tool_name).strip()
     if not normalized_tool:
         return "工具名不能为空"
+    if normalized_tool in FORBIDDEN_ROLE_TOOLS:
+        return f"OneBot11 当前禁止调用 {normalized_tool}"
     if is_onebot_tool_name(normalized_tool) and normalized_tool not in ALL_TOOLS:
         return "未知工具（权限系统 fail-closed）"
     if normalized_tool not in ctx.allowed_tools:

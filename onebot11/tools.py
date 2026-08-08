@@ -13,6 +13,7 @@ from .http_api import OneBotHttpApi
 from .permissions import (
     CallerContext,
     parse_bool,
+    validate_group_member_payload,
     validate_group_payload,
     validate_message_scope,
 )
@@ -133,20 +134,33 @@ def _count(params: dict[str, Any]) -> int:
     return max(1, min(value, 50))
 
 
-async def handle_get_message(api: OneBotHttpApi, params: dict[str, Any], ctx: CallerContext) -> dict[str, Any]:
+async def handle_get_message(
+    api: OneBotHttpApi,
+    params: dict[str, Any],
+    ctx: CallerContext,
+    *,
+    self_id: str | None = None,
+) -> dict[str, Any]:
     """查询当前群或当前私聊中的单条消息。"""
     unavailable = _unqueryable_message_id(params.get("message_id"))
     if unavailable is not None:
         return unavailable
     message = await api.get_message(str(params["message_id"]))
-    error = validate_message_scope(message, ctx)
+    error = validate_message_scope(message, ctx, self_id=self_id)
     if error:
         return {"status": "permission_error", "error": error}
     return {"status": "ok", "message": message}
 
 
-async def handle_get_group_msg_history(api: OneBotHttpApi, params: dict[str, Any], ctx: CallerContext) -> dict[str, Any]:
+async def handle_get_group_msg_history(
+    api: OneBotHttpApi,
+    params: dict[str, Any],
+    ctx: CallerContext,
+    *,
+    self_id: str | None = None,
+) -> dict[str, Any]:
     """查询当前群最近消息。"""
+    del self_id
     messages = await api.get_group_msg_history(ctx.chat_id, _count(params))
     for message in messages:
         error = validate_message_scope(message, ctx)
@@ -155,19 +169,31 @@ async def handle_get_group_msg_history(api: OneBotHttpApi, params: dict[str, Any
     return {"status": "ok", "group_id": ctx.chat_id, "messages": messages}
 
 
-async def handle_get_friend_msg_history(api: OneBotHttpApi, params: dict[str, Any], ctx: CallerContext) -> dict[str, Any]:
+async def handle_get_friend_msg_history(
+    api: OneBotHttpApi,
+    params: dict[str, Any],
+    ctx: CallerContext,
+    *,
+    self_id: str | None = None,
+) -> dict[str, Any]:
     """查询当前私聊最近消息。"""
     messages = await api.get_friend_msg_history(ctx.user_id, _count(params))
     for message in messages:
-        error = validate_message_scope(message, ctx)
+        error = validate_message_scope(message, ctx, self_id=self_id)
         if error:
             return {"status": "permission_error", "user_id": ctx.user_id, "error": error}
     return {"status": "ok", "user_id": ctx.user_id, "messages": messages}
 
 
-async def handle_get_group_info(api: OneBotHttpApi, params: dict[str, Any], ctx: CallerContext) -> dict[str, Any]:
+async def handle_get_group_info(
+    api: OneBotHttpApi,
+    params: dict[str, Any],
+    ctx: CallerContext,
+    *,
+    self_id: str | None = None,
+) -> dict[str, Any]:
     """查询当前群基本信息。"""
-    del params
+    del params, self_id
     group = await api.call_action("get_group_info", {"group_id": int(ctx.chat_id)})
     error = validate_group_payload(group, ctx)
     if error:
@@ -175,13 +201,21 @@ async def handle_get_group_info(api: OneBotHttpApi, params: dict[str, Any], ctx:
     return {"status": "ok", "group_id": ctx.chat_id, "group": group}
 
 
-async def handle_get_group_member_info(api: OneBotHttpApi, params: dict[str, Any], ctx: CallerContext) -> dict[str, Any]:
+async def handle_get_group_member_info(
+    api: OneBotHttpApi,
+    params: dict[str, Any],
+    ctx: CallerContext,
+    *,
+    self_id: str | None = None,
+) -> dict[str, Any]:
     """查询当前群指定成员信息。"""
+    del self_id
+    requested_user_id = str(params["user_id"])
     member = await api.call_action(
         "get_group_member_info",
-        {"group_id": int(ctx.chat_id), "user_id": int(str(params["user_id"]))},
+        {"group_id": int(ctx.chat_id), "user_id": int(requested_user_id)},
     )
-    error = validate_group_payload(member, ctx)
+    error = validate_group_member_payload(member, ctx, requested_user_id)
     if error:
         return {"status": "permission_error", "error": error}
     return {"status": "ok", "group_id": ctx.chat_id, "member": member}

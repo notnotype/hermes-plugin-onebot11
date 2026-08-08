@@ -25,7 +25,7 @@
 - 自动 selector 只看未锚定消息的有限投影，只能返回一个现存 `anchor_seq` 或 null；它看不到角色/工具配置。
 - message anchor 完全继承锚点发送者；`/onebot flush` 创建 operator anchor，继承命令管理员。
 - 同群多个 anchor 串行进入同一个 session，不合并权限，不使用 steer。
-- turn 开始时快照角色与精确工具名。配置变化从下一 turn 生效；白名单、目标、lease 和关闭状态仍立即 fencing。
+- 首次 claim、Agent 启动前把角色与精确工具名持久化到 QueueStore schema v10；同一 anchor 不能换绑。配置变化从下一 turn 生效；白名单、目标、lease 和关闭状态仍立即 fencing。v9 pending anchor 可以首次 claim 时绑定，旧 active/uncertain/failed 且无快照的记录进入 hold。
 
 ## Agent 输入与缓存
 
@@ -67,7 +67,7 @@ platforms:
 
 `user` 默认只有作用域受限的 OneBot 只读工具；`trusted_user` 默认无工具；`super_admin` 默认只有本插件工具。网页、浏览器、终端、文件、MCP 和 `execute_code` 必须显式授予；`execute_code` 等价于高风险本机代码执行。
 
-共享 session 的 schema 是所有角色工具并集，`pre_tool_call` 与 handler 按当前 authority 硬拦截。`delegate_task` 在 Hermes 提供传递性 per-turn policy 前禁止配置和调用；Docker 子代理另行设计。
+共享 session 的 schema 是所有角色工具并集，`pre_tool_call` 与 handler 按当前 authority 硬拦截。`delegate_task`、`tool_search`、`tool_describe`、`tool_call` 在 OneBot 角色中禁止配置和调用；Hermes tool-search bridge 的目录可见不等于工具获得授权，缺少精确 turn 身份的实际调用必须拒绝。Docker 子代理另行设计。
 
 模型会看到一个有界 role catalog，列出三个角色当前配置的工具集合。catalog 只是解释性提示；当前 turn authority 只来自锚点，其他消息的 role 不能授予权限。`tool_search` 不是权限绕过入口，但在 Hermes 上游完整传递 `turn_id` 前，缺少精确 turn 身份的工具搜索请求必须拒绝。
 
@@ -77,16 +77,16 @@ platforms:
 - `onebot_set_role_tools`：替换角色精确工具列表。
 - `onebot_set_trusted_users`：替换受信 QQ 列表。
 
-配置写工具仅 super admin 可用，只修改 `platforms.onebot11.extra.roles`。写入成功后更新 adapter 的下一-turn 配置；当前 turn 继续使用创建时快照。
+配置写工具仅 super admin 可用，只修改 `platforms.onebot11.extra.roles`。写入前和 YAML 原子写入前都会再次检查 adapter、当前目标白名单、authority 和 lease；这不是跨 SQLite/YAML 的事务。写入成功后更新 adapter 的下一-turn 配置；当前 turn 继续使用创建时快照。
 
 ## 写操作与 unknown
 
 撤回、禁言、踢人、全员禁言在角色、目标和 lease 校验通过后直接执行，不再生成 confirmation token。真实 HTTP 写请求前原子写入 outbound marker。
 
-OneBot 11 非幂等请求无法保证 exactly-once。超时、断线、非 JSON、5xx 或部分成功会使 anchor 进入 `uncertain`，阻塞后续 anchor；同一 turn 的相同 unknown 动作禁止重复调用。管理员核对 QQ 端状态后使用 `/onebot resolve retry|discard`。`resolve retry` 为可验证的 `message`/`operator` anchor 创建新的 request id，保留原 authority、消息范围和 reaction 状态；legacy hold 不能 retry，只能 discard 或等待新的明确触发。
+OneBot 11 非幂等请求无法保证 exactly-once。超时、断线、非 JSON、5xx、缺少合法数字 message ID 或部分成功会使 anchor 进入 `uncertain`，阻塞后续 anchor；同一 turn 的相同 unknown 动作禁止重复调用。管理员核对 QQ 端状态后使用 `/onebot resolve retry|discard`。`resolve retry` 为可验证的 `message`/`operator` anchor 创建新的 request id，保留原 authority、消息范围和 reaction 状态；legacy 或缺少 authority 快照的记录不能 retry。`resolve discard` 不删除 reaction cleanup record，直到 unset 成功、目标失权或管理员明确清理。
 
 ## 目标与命令
 
-工具和出站目标绑定精确 `(session_id, turn_id)` 与 `ChatTarget(group|dm, id)`。群号和 QQ 号相同时不猜目标。
+工具和出站目标绑定精确 `(session_id, turn_id)` 与 `ChatTarget(group|dm, id)`。群号和 QQ 号相同时不猜目标。私聊历史和单条消息响应逐条要求参与者集合正好等于“当前用户 + 当前机器人”；群成员响应还必须匹配当前群和请求的成员 QQ。
 
-群 `/context`、`/status`、`/whoami`、`/help`、`/commands` 在入队前旁路；`/new`、`/reset`、`/restart`、`/model`、`/compress` 拒绝。`/onebot status|queue|flush|clear|pause|resume|resolve` 仅 super admin 可用。
+群 `/context`、`/status`、`/whoami`、`/help`、`/commands` 在入队前旁路；`/new`、`/reset`、`/restart`、`/model`、`/compress` 拒绝。`/onebot status|queue|flush|clear|pause|resume|reaction clear <message_id>|resolve` 仅 super admin 可用。`reaction clear` 只删除本地 cleanup 责任，不调用 OneBot；活动 turn 期间拒绝。

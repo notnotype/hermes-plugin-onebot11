@@ -177,6 +177,45 @@ def test_context按UTF8字节预算裁剪():
     assert build_queue_batch_summary(messages, max_bytes=512).encode("utf-8")
 
 
+def test_队列摘要裁剪仍保留消息身份字段():
+    """摘要裁剪不能只留下尾部正文，工具所需的消息 ID 和发送者必须仍可定位。"""
+    messages = tuple(
+        _message(
+            index,
+            "很长的消息" * 200,
+            user_id=f"user-{index}",
+            metadata={"onebot11_reply_to": f"reply-{index}"},
+        )
+        for index in range(1, 4)
+    )
+    result = build_queue_batch_summary(
+        messages,
+        max_bytes=1400,
+        role_snapshot={"user-1": "user", "user-2": "trusted_user", "user-3": "user"},
+    )
+    records = _records(result)
+    assert records
+    assert all(
+        {
+            "seq",
+            "message_id",
+            "message_key",
+            "user_id",
+            "user_name",
+            "role",
+            "reply_to",
+            "text",
+        }.issubset(record)
+        for record in records
+    )
+    assert {record["message_key"] for record in records} >= {
+        "group:1",
+        "group:2",
+        "group:3",
+    }
+    assert any(record["message_key"] == "group:3" for record in records)
+
+
 def test_authority_reminder是纯构造且明确授权边界():
     """提醒包含锚点、角色、工具和目标，但不冒充真实权限门禁。"""
     anchor = _message(7, "@bot 查询", user_id="2056963663")

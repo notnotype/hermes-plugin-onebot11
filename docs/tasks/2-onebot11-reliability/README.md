@@ -30,7 +30,7 @@
 ## 验证
 
 - 本地协议和状态机：`uv run --extra dev pytest -q`，当前结果 `108 passed, 1 skipped`；adapter 文件在没有 Hermes 依赖的环境按设计跳过。
-- Hermes 集成：使用本地 Hermes 源码和依赖环境运行全套测试，当前结果 `163 passed`，覆盖 adapter import、注册、hooks、工具 handler、shared session key、lease 恢复、cooldown 重唤醒、reaction 清理、媒体根目录和非幂等出站。
+- Hermes 集成：该 Task 的历史基线为 `163 passed`；当前完整结果以 Task 5 walkthrough 和仓库根 `PROJECT-STATUS.md` 为准。
 - 静态检查：`.venv\\Scripts\\python.exe -m ruff check .`，当前通过。
 - Arch + LLBot 8.1.5 外部联调已完成：Hermes 实际加载 0.2.0 插件，群 `1072992996` 使用 shared session，私聊白名单只有 `2056963663`；真实 WS/HTTP 连接、允许群 @/私聊 Agent 回复、pending 重启恢复、管理员 flush、非白名单拒绝、审计和群处理 reaction（`set=true` -> 回复 -> `set=false`）均已验证。Agent 入站使用真实 WS 的合成 OneBot payload，真人 QQ 入站、双用户并发、确认写操作和 unknown 出站仍待验收。
 

@@ -73,6 +73,7 @@ async def test_其他进程退出后lease到期自动恢复(tmp_path, monkeypatc
     owner.enqueue(message, TriggerRequest.create("888", "group:1", "mention", "1", "用户1"))
     lease = owner.claim("888", lease_seconds=5)
     assert lease is not None
+    assert owner.bind_authority(lease, "user", {"qq_get_message"}) is not None
 
     started = asyncio.Event()
     allow_return = asyncio.Event()
@@ -143,6 +144,7 @@ async def test_持久化完成失败会移除本地活动状态(tmp_path, monkey
     dispatcher = GroupDispatcher(store, start_turn)
     assert await dispatcher.notify("888")
     heartbeat = dispatcher._heartbeat_tasks["888"]
+    assert store.bind_authority(captured[0], "user", {"qq_get_message"}) is not None
     monkeypatch.setattr(store, "ack", lambda _lease: False)
     assert not await dispatcher.complete(captured[0].lease_id, outcome="success", unknown=False)
     assert dispatcher.active("888") is None
@@ -245,6 +247,7 @@ async def test_complete_false后heartbeat停止且lease可被恢复接管(tmp_pa
     )
     assert await dispatcher.notify("888")
     heartbeat = dispatcher._heartbeat_tasks["888"]
+    assert store.bind_authority(captured[0], "user", {"qq_get_message"}) is not None
     monkeypatch.setattr(store, "ack", lambda _lease: False)
 
     assert not await dispatcher.complete(captured[0].lease_id, outcome="success", unknown=False)

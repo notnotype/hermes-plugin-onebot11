@@ -11,7 +11,7 @@
 - **图片与消息段**：兼容 array/CQ 字符串，支持图片、reply、文件、语音、视频、转发和未知段标记；图片下载有 host、端口、类型、魔数和大小限制。
 - **工具与管理**：authority 完全继承锚点消息发送者的 turn-start 角色快照。角色允许、目标和 lease 有效时写工具直接执行；unknown 不自动重试。
 - **可靠性**：队列支持崩溃恢复、去重、lease heartbeat、过期 lease 退避和人工处理 `uncertain`/`failed` 出站结果。OneBot 非幂等请求不自动重试，不承诺 exactly-once；`resolve retry` 会创建新的 retry anchor。
-- **安全边界**：白名单同时约束实时入站、cron 和恢复；普通 OneBot caller 不能跨到 subagent。`delegate_task` 在 Hermes 支持 per-turn 工具权限前禁止配置和调用。
+- **安全边界**：白名单同时约束实时入站、cron 和恢复；普通 OneBot caller 不能跨到 subagent。`delegate_task`、`tool_search`、`tool_describe`、`tool_call` 在 Hermes 提供可靠 per-turn 工具权限前禁止配置和调用。
 
 ## 环境要求
 
@@ -134,11 +134,11 @@ platforms:
 自动锚点 selector 仍沿用 `llm_trigger` 配置名以兼容 0.3.x。它默认关闭，启用时必须配置明确的旁路 `provider`、`model` 和群 allowlist。模型只能返回一个现存 `anchor_seq` 或 null，看不到角色和工具配置，也不能授予权限。
 `media_orphan_ttl_seconds` 到期后由下一次 adapter 启动或 turn 收尾清理遗留媒体目录。
 `processing_reaction_enabled` 默认开启；它使用 LLBot 的 `set_msg_emoji_like` 扩展，只作用于群聊真实消息 ID。添加或移除 reaction 的未知结果不会重放 Agent turn，也不会阻断队列 ack。
-reaction 的清理状态持久化在队列数据库中；重启或恢复只会有限重试 `unset`，不会重放 `set`、Agent turn 或群管理动作。非 URL 图片会先调用 OneBot `get_image`，只有返回路径位于 `media_source_roots` 时才复制到临时目录。
+reaction 的清理状态持久化在队列数据库中；重启或恢复只会有限重试 `unset`，不会重放 `set`、Agent turn 或群管理动作。`resolve discard` 也会保留清理责任，直到 `unset` 成功、目标失权或管理员明确清理。管理员确认 QQ 端状态后可在当前群执行 `/onebot reaction clear <message_id>` 删除本地 cleanup 责任；该命令不访问 OneBot，且活动 turn 期间拒绝执行。非 URL 图片会先调用 OneBot `get_image`，只有返回路径位于 `media_source_roots` 时才复制到临时目录。
 
 authority reminder 由 `pre_llm_call` 追加到当前 user request，不修改稳定 system prompt；Hermes 保存该 turn 的 wire sidecar，后续历史可按相同字节重放。它只是模型提醒，真实权限由 binding、lease 和不可变工具快照校验。时间等易变信息仍只适合 request-only 动态上下文。
 
-插件会同时注入有界 role catalog，帮助模型理解 `user`、`trusted_user`、`super_admin` 的工具集合；catalog 不是授权来源。未来 Hermes 若为系统错误通知提供 `hermes_system_error_notice=true`，插件会避免把该通知计入业务 outbound marker；在此之前保持保守的 `uncertain` 行为。
+插件会同时注入有界 role catalog，帮助模型理解 `user`、`trusted_user`、`super_admin` 的工具集合；catalog 不是授权来源。QueueStore schema v10 在首次 claim 时固定 authority，配置变化只影响下一 turn。未来 Hermes 若为系统错误通知提供 `hermes_system_error_notice=true`，插件会避免把该通知计入业务 outbound marker；在此之前保持保守的 `uncertain` 行为。
 
 ## 权限说明
 
@@ -146,10 +146,10 @@ authority reminder 由 `pre_llm_call` 追加到当前 user request，不修改�
 
 1. **谁能入队**：群消息先按 `allowed_groups` 判断；私聊必须满足 `allowlist`，或在 `open` 策略下显式配置 allow-all。
 2. **谁能用工具**：`super_admins` 对应超级管理员；`roles.trusted_user.users` 指定受信用户；工具集合按精确工具名匹配，普通用户默认只有当前目标范围内的只读工具。
-3. **会话范围**：工具和出站目标都绑定当前 `(session_id, turn_id)`，群里只能查/操作本群。
+3. **会话范围**：工具和出站目标都绑定当前 `(session_id, turn_id)`，群里只能查/操作本群；私聊历史逐条验证“当前用户 + 当前机器人”。
 4. **写操作**：按锚点 authority 直接硬校验并执行；同一 turn 的同一 unknown 动作禁止自动重复调用，管理员 retry 需先核对目标端且会生成新的 anchor。
 
-群内任何已授权用户都可以旁路发送 `/context`、`/status`、`/whoami`、`/help`、`/commands`；这些命令不进入队列或 Agent session。`/new`、`/reset`、`/restart`、`/model`、`/compress` 会被明确拒绝。群级运维命令由超级管理员直接发送：`/onebot status`、`queue`、`flush`、`clear`、`pause`、`resume`、`resolve retry|discard`。`flush` 创建继承命令管理员权限的 operator anchor；`clear` 不删除 Hermes session 历史。
+群内任何已授权用户都可以旁路发送 `/context`、`/status`、`/whoami`、`/help`、`/commands`；这些命令不进入队列或 Agent session。`/new`、`/reset`、`/restart`、`/model`、`/compress` 会被明确拒绝。群级运维命令由超级管理员直接发送：`/onebot status`、`queue`、`flush`、`clear`、`pause`、`resume`、`reaction clear <message_id>`、`resolve retry|discard`。`flush` 创建继承命令管理员权限的 operator anchor；`clear` 不删除 Hermes session 历史。
 
 ## 开发
 

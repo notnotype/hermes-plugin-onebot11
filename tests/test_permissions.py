@@ -127,8 +127,9 @@ def test_角色优先级和精确工具名():
     assert role_for_user("200", {"200"}, set()) == "super_admin"
     with pytest.raises(ValueError):
         build_role_tools({"roles": {"user": {"tools": ["browser_*"]}}})
-    with pytest.raises(ValueError):
-        build_role_tools({"roles": {"user": {"tools": ["delegate_task"]}}})
+    for forbidden in ("delegate_task", "tool_search", "tool_describe", "tool_call"):
+        with pytest.raises(ValueError):
+            build_role_tools({"roles": {"user": {"tools": [forbidden]}}})
 
 
 def test_通用Hermes工具也遵守角色快照():
@@ -151,3 +152,15 @@ def test_OneBot工具命名空间未知名称也必须识别():
     assert is_onebot_tool_name("onebot_set_role_tools")
     assert is_onebot_tool_name("onebot_unknown")
     assert not is_onebot_tool_name("web_search")
+
+
+def test_禁止的Hermes桥接工具不能成为OneBot权限():
+    """tool-search/delegation 名称不因配置或 caller 快照而获得 OneBot 授权。"""
+    ctx = CallerContext(
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+        allowed_tools=frozenset({"tool_search", "tool_describe", "tool_call", "delegate_task"}),
+    )
+    for forbidden in ("tool_search", "tool_describe", "tool_call", "delegate_task"):
+        assert validate_tool_call(forbidden, {}, ctx, set()) is not None

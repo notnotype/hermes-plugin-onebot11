@@ -400,7 +400,16 @@ class OneBotHttpApi:
         action = "send_group_msg" if chat_type == "group" else "send_private_msg"
         key = "group_id" if chat_type == "group" else "user_id"
         data = await self.call_action(action, {key: int(chat_id), "message": message}, retryable=False)
-        return str(data.get("message_id", ""))
+        message_id = str(data.get("message_id", "")).strip()
+        if not is_numeric_message_id(message_id):
+            raise OneBotApiError(
+                action,
+                "missing_message_id",
+                -1,
+                unknown_outcome=True,
+                error_kind="unknown",
+            )
+        return message_id
 
     async def set_message_emoji_like(
         self, message_id: str, emoji_id: str, *, enabled: bool

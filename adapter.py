@@ -46,6 +46,7 @@ ChatTarget = _proto.ChatTarget
 GroupDispatcher = _proto.GroupDispatcher
 QueueFull = _proto.queue.QueueFull
 QueueError = _proto.queue.QueueError
+QueueBusy = _proto.queue.QueueBusy
 QueueLease = _proto.QueueLease
 QueueMessage = _proto.QueueMessage
 QueueStore = _proto.QueueStore
@@ -81,6 +82,7 @@ parse_id_list = _proto.permissions.parse_id_list
 role_for_user = _proto.permissions.role_for_user
 role_prompt = _proto.permissions.role_prompt
 validate_tool_call = _proto.permissions.validate_tool_call
+FORBIDDEN_ROLE_TOOLS = _proto.permissions.FORBIDDEN_ROLE_TOOLS
 handle_get_friend_msg_history = _proto.tools.handle_get_friend_msg_history
 handle_get_group_info = _proto.tools.handle_get_group_info
 handle_get_group_member_info = _proto.tools.handle_get_group_member_info
@@ -199,7 +201,7 @@ def _caller_from_metadata(value: Any) -> CallerContext | None:
         ):
             return None
         allowed_tools = frozenset(str(item).strip() for item in raw_tools if str(item).strip())
-        if "delegate_task" in allowed_tools:
+        if FORBIDDEN_ROLE_TOOLS.intersection(allowed_tools):
             return None
     else:
         # 兼容没有写入快照的旧 synthetic event；新 adapter event 都会
@@ -1245,8 +1247,6 @@ class OneBot11Adapter(BasePlatformAdapter):
         """把一个 TurnAnchor 编排为独立 synthetic followup turn。"""
         if self._closed or not self._chat_access_allowed("group", lease.chat_id):
             raise PermissionError("当前群已不再满足 OneBot11 allowed_groups 策略")
-        if not await asyncio.to_thread(self._queue.mark_agent_started, lease):
-            raise PermissionError("OneBot11 queue lease 已失效")
         trigger = lease.trigger
         if trigger.anchor_kind in {"legacy", "service"}:
             raise PermissionError(f"当前 anchor kind 不可自动执行: {trigger.anchor_kind}")
@@ -1263,16 +1263,34 @@ class OneBot11Adapter(BasePlatformAdapter):
                 raise PermissionError("TurnAnchor 锚点消息不存在")
             caller_user_id = anchor_message.user_id
             caller_user_name = anchor_message.user_name
+            if str(trigger.caller_user_id) != str(caller_user_id):
+                raise PermissionError("TurnAnchor authority 来源与锚点消息不一致")
         else:
             caller_user_id = trigger.caller_user_id
             caller_user_name = trigger.caller_user_name
-        role = role_for_user(caller_user_id, self.super_admins, self.trusted_users)
+        if trigger.authority_role is None or trigger.authority_tools is None:
+            role = role_for_user(caller_user_id, self.super_admins, self.trusted_users)
+            allowed_tools = self.role_tools.get(role, frozenset())
+            bound_trigger = await asyncio.to_thread(
+                self._queue.bind_authority,
+                lease,
+                role,
+                allowed_tools,
+            )
+            if bound_trigger is None:
+                raise PermissionError("OneBot11 authority 快照绑定失败或 lease 已失效")
+            trigger = bound_trigger
+        else:
+            role = trigger.authority_role
+            allowed_tools = trigger.authority_tools
+        if not await asyncio.to_thread(self._queue.mark_agent_started, lease):
+            raise PermissionError("OneBot11 queue lease 已失效或 authority 快照缺失")
         caller = CallerContext(
             user_id=caller_user_id,
             chat_type="group",
             chat_id=lease.chat_id,
             role=role,
-            allowed_tools=self.role_tools.get(role, frozenset()),
+            allowed_tools=allowed_tools,
             lease_id=lease.lease_id,
         )
         media_paths: list[str] = []
@@ -1339,7 +1357,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                 anchor_seq=trigger.anchor_seq,
                 role_snapshot=role_snapshot,
             )
-            reminder_anchor = anchor_message or QueueMessage(
+            reminder_anchor = anchor_message if trigger.anchor_kind == "message" else QueueMessage(
                 chat_id=lease.chat_id,
                 chat_type="group",
                 message_id=str(trigger.control_message_id or trigger.message_key),
@@ -1475,7 +1493,10 @@ class OneBot11Adapter(BasePlatformAdapter):
         if existing is not None and existing.state == "maybe_set":
             # 迁移/恢复得到的 maybe_set 只允许 unset，不能因为 retry 再次 set。
             return True
-        if self._closed:
+        if self._closed or (
+            str(chat_id) in self._ambiguous_targets
+            or not self._chat_access_allowed("group", str(chat_id))
+        ):
             try:
                 await asyncio.to_thread(
                     self._queue.delete_reaction,
@@ -1544,7 +1565,10 @@ class OneBot11Adapter(BasePlatformAdapter):
         """按当前群 lease 设置处理指示器；reaction 失败不阻断 Agent turn。"""
         if self._closed or not self._processing_reaction_enabled:
             return None
-        if not self._chat_access_allowed("group", lease.chat_id):
+        if (
+            not self._chat_access_allowed("group", lease.chat_id)
+            or lease.chat_id in self._ambiguous_targets
+        ):
             return None
         message_id = self._reaction_message_id(lease)
         if message_id is None:
@@ -1863,6 +1887,27 @@ class OneBot11Adapter(BasePlatformAdapter):
             and self._lease_is_current(str(lease_id))
         )
 
+    def _authority_matches_binding(self, binding: TurnBinding) -> bool:
+        """确认当前 binding 使用的是 QueueStore 持久 authority 快照。"""
+        if not binding.lease_id:
+            return True
+        try:
+            snapshot = self._queue.authority_for_lease(binding.lease_id)
+        except Exception:
+            logger.warning(
+                "OneBot11 authority 快照读取失败，按 fail-closed 处理: %s",
+                binding.lease_id,
+                exc_info=True,
+            )
+            return False
+        if snapshot is None:
+            return False
+        role, allowed_tools = snapshot
+        return (
+            role == binding.caller.role
+            and allowed_tools == binding.caller.allowed_tools
+        )
+
     async def _on_lease_lost(self, lease: QueueLease) -> None:
         """heartbeat fencing 后取消旧 Hermes task，避免它继续调用工具。"""
         self._fenced_leases.add(lease.lease_id)
@@ -2046,6 +2091,7 @@ class OneBot11Adapter(BasePlatformAdapter):
             self._outbound_successful.discard(lease_id)
             self._outbound_known_failure.discard(lease_id)
             self._unknown_tool_operations.pop(lease_id, None)
+            self._fenced_leases.discard(lease_id)
             self._pending_completions.pop(lease_id, None)
             self._lease_session_keys.pop(lease_id, None)
             self._authority_reminders.pop(lease_id, None)
@@ -2164,6 +2210,14 @@ class OneBot11Adapter(BasePlatformAdapter):
         pieces = chunk_text(content, self.max_message_length_for_chat(target.chat_id))
         if not pieces and content:
             pieces = [content]
+        if not pieces:
+            if track_business_outbound:
+                self._outbound_known_failure.add(lease_id)
+            return SendResult(
+                False,
+                error="OneBot11 不发送空消息",
+                error_kind="failed",
+            )
         sent: list[str] = []
 
         def failed_result(error: str, error_kind: str) -> SendResult:
@@ -2411,6 +2465,24 @@ class OneBot11Adapter(BasePlatformAdapter):
                     },
                 )
                 return json.dumps({"status": "permission_error", "error": "当前 turn lease 已失效"}, ensure_ascii=False)
+            if not self._authority_matches_binding(binding):
+                self._audit.record(
+                    "permission_denied",
+                    {
+                        "tool": tool_name,
+                        "user_id": binding.caller.user_id,
+                        "chat_type": binding.caller.chat_type,
+                        "chat_id": binding.caller.chat_id,
+                        "reason": "authority 快照缺失或不一致",
+                    },
+                )
+                return json.dumps(
+                    {
+                        "status": "permission_error",
+                        "error": "当前 turn authority 快照缺失或不一致",
+                    },
+                    ensure_ascii=False,
+                )
             caller = binding.caller
             if not self._chat_access_allowed(caller.chat_type, caller.chat_id, caller.user_id):
                 self._audit.record(
@@ -2481,7 +2553,22 @@ class OneBot11Adapter(BasePlatformAdapter):
                             ensure_ascii=False,
                         )
                     if tool_name in CONFIG_WRITE_TOOLS:
-                        result = self._save_permission_change(tool_name, args)
+                        if self._closed or (
+                            binding.lease_id
+                            and not self._lease_is_current(binding.lease_id)
+                        ):
+                            return json.dumps(
+                                {
+                                    "status": "permission_error",
+                                    "error": "当前 turn lease 已失效，拒绝修改权限配置",
+                                },
+                                ensure_ascii=False,
+                            )
+                        result = self._save_permission_change(
+                            tool_name,
+                            args,
+                            binding=binding,
+                        )
                     else:
                         async def before_write() -> bool:
                             """紧贴真实 HTTP 写请求落盘 outbound marker。"""
@@ -2554,7 +2641,12 @@ class OneBot11Adapter(BasePlatformAdapter):
                             },
                             ensure_ascii=False,
                         )
-                    result = await _TOOL_HANDLERS[tool_name](self._api, args, caller)
+                    result = await _TOOL_HANDLERS[tool_name](
+                        self._api,
+                        args,
+                        caller,
+                        self_id=self.self_id,
+                    )
                 else:
                     result = {"status": "permission_error", "error": "OneBot11 工具未注册"}
                 return json.dumps(result, ensure_ascii=False, default=str)
@@ -2635,10 +2727,44 @@ class OneBot11Adapter(BasePlatformAdapter):
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-    def _save_permission_change(self, tool_name: str, params: Mapping[str, Any]) -> dict[str, Any]:
+    def _save_permission_change(
+        self,
+        tool_name: str,
+        params: Mapping[str, Any],
+        *,
+        binding: TurnBinding | None = None,
+    ) -> dict[str, Any]:
         """串行执行权限配置读改写，避免同进程管理员更新互相覆盖。"""
+        if binding is not None and not self._permission_write_allowed(binding):
+            return {
+                "status": "permission_error",
+                "error": "当前 adapter、白名单、authority 或 lease 已失效",
+            }
         with self._config_write_lock:
+            if binding is not None and not self._permission_write_allowed(binding):
+                return {
+                    "status": "permission_error",
+                    "error": "当前 adapter、白名单、authority 或 lease 已失效",
+                }
             return self._save_permission_change_unlocked(tool_name, params)
+
+    def _permission_write_allowed(self, binding: TurnBinding) -> bool:
+        """在权限 YAML 读改写前再次确认当前 turn 仍有安全写入资格。"""
+        if self._closed:
+            return False
+        caller = binding.caller
+        if not self._chat_access_allowed(
+            caller.chat_type,
+            caller.chat_id,
+            caller.user_id,
+        ):
+            return False
+        if binding.lease_id and (
+            not self._lease_is_current(binding.lease_id)
+            or not self._authority_matches_binding(binding)
+        ):
+            return False
+        return True
 
     def _save_permission_change_unlocked(
         self, tool_name: str, params: Mapping[str, Any]
@@ -2671,8 +2797,10 @@ class OneBot11Adapter(BasePlatformAdapter):
                     params.get("tools"),
                     name=f"roles.{role}.tools",
                 )
-                if "delegate_task" in tools:
-                    raise ValueError("OneBot11 角色暂不允许配置 delegate_task")
+                if FORBIDDEN_ROLE_TOOLS.intersection(tools):
+                    raise ValueError(
+                        "OneBot11 角色暂不允许配置 tool_search、tool_describe、tool_call 或 delegate_task"
+                    )
                 role_entry = roles.setdefault(role, {})
                 if not isinstance(role_entry, dict):
                     raise ValueError(f"roles.{role} 必须是 mapping")
@@ -2717,6 +2845,42 @@ class OneBot11Adapter(BasePlatformAdapter):
             )
             await self._send_direct(event, "当前目标不再满足 OneBot11 访问策略")
             return
+        words = event.text.strip().split()
+        if (
+            event.chat_type == "group"
+            and len(words) == 4
+            and words[1].casefold() == "reaction"
+            and words[2].casefold() == "clear"
+        ):
+            message_id = words[3].strip()
+            if not is_numeric_message_id(message_id):
+                await self._send_direct(event, "reaction clear 需要真实的数字 OneBot message_id")
+                return
+            try:
+                count = await asyncio.to_thread(
+                    self._queue.clear_reaction_state,
+                    event.chat_id,
+                    message_id,
+                )
+            except QueueBusy as exc:
+                await self._send_direct(event, str(exc))
+                return
+            self._audit.record(
+                "admin_reaction_clear",
+                {
+                    "chat_type": event.chat_type,
+                    "chat_id": event.chat_id,
+                    "user_id": event.user_id,
+                    "message_id": message_id,
+                    "count": count,
+                },
+            )
+            await self._send_direct(
+                event,
+                f"已删除当前群 {count} 条本地 reaction cleanup 记录；未访问 OneBot，请确认 QQ 端状态",
+            )
+            return
+
         parts = event.text.strip().split(maxsplit=2)
         command = parts[1].casefold() if len(parts) > 1 else "status"
         chat_id = event.chat_id
@@ -2791,7 +2955,11 @@ class OneBot11Adapter(BasePlatformAdapter):
                     message = f"已处理 uncertain/failed 消息 {count} 条: discard"
                 await self._send_direct(event, message)
             else:
-                await self._send_direct(event, "用法: /onebot status|queue|flush|clear|pause|resume|resolve retry|resolve discard")
+                await self._send_direct(
+                    event,
+                    "用法: /onebot status|queue|flush|clear|pause|resume|"
+                    "reaction clear <message_id>|resolve retry|resolve discard",
+                )
         except Exception as exc:
             logger.warning("OneBot11 管理命令失败", exc_info=True)
             await self._send_direct(event, f"命令失败: {type(exc).__name__}: {str(exc)[:200]}")
@@ -2974,6 +3142,14 @@ def _pre_llm_call_hook(session_id: str = "", turn_id: str = "", platform: Any = 
         _CURRENT_BINDING.set(None)
         return {"context": "OneBot11 caller binding unavailable; all OneBot11 tools must be denied."}
     binding = TurnBinding(normalized_session_id, normalized_turn_id, caller, caller.lease_id)
+    if not adapter._authority_matches_binding(binding):
+        _CURRENT_BINDING.set(None)
+        return {
+            "context": (
+                "OneBot11 authority snapshot unavailable or mismatched; "
+                "all OneBot11 tools must be denied."
+            )
+        }
     try:
         adapter._bindings.bind(binding)
     except ValueError:
@@ -3010,6 +3186,8 @@ def _pre_provider_request_hook(
     ):
         return None
     if binding.lease_id and not adapter._lease_is_current(binding.lease_id):
+        return None
+    if not adapter._authority_matches_binding(binding):
         return None
     if not isinstance(request, Mapping):
         return None
@@ -3083,12 +3261,12 @@ def _pre_tool_call_hook(tool_name: str = "", session_id: str = "", turn_id: str 
             "action": "block",
             "message": "权限错误: OneBot11 caller 不能跨到其他 platform 或 subagent",
         }
-    if normalized_tool == "delegate_task" and (
+    if normalized_tool in FORBIDDEN_ROLE_TOOLS and (
         platform == _PLATFORM_NAME or has_onebot_caller
     ):
         return {
             "action": "block",
-            "message": "权限错误: OneBot11 当前禁止 delegate_task",
+            "message": f"权限错误: OneBot11 当前禁止 {normalized_tool}",
         }
     unknown_onebot_tool = is_onebot_tool_name(normalized_tool) and normalized_tool not in ALL_TOOLS
     if not unknown_onebot_tool and not normalized_tool:
@@ -3101,8 +3279,11 @@ def _pre_tool_call_hook(tool_name: str = "", session_id: str = "", turn_id: str 
     try:
         if unknown_onebot_tool:
             return {"action": "block", "message": "权限错误: 未知 OneBot11 工具"}
-        if normalized_tool == "delegate_task":
-            return {"action": "block", "message": "权限错误: OneBot11 当前禁止 delegate_task"}
+        if normalized_tool in FORBIDDEN_ROLE_TOOLS:
+            return {
+                "action": "block",
+                "message": f"权限错误: OneBot11 当前禁止 {normalized_tool}",
+            }
         binding = route_binding or adapter._resolve_binding(session_id, turn_id)
         if binding is None:
             return {"action": "block", "message": "OneBot11 current turn binding unavailable"}
@@ -3118,6 +3299,11 @@ def _pre_tool_call_hook(tool_name: str = "", session_id: str = "", turn_id: str 
                 },
             )
             return {"action": "block", "message": "权限错误: 当前 turn lease 已失效"}
+        if not adapter._authority_matches_binding(binding):
+            return {
+                "action": "block",
+                "message": "权限错误: 当前 turn authority 快照缺失或不一致",
+            }
         if not adapter._chat_access_allowed(
             binding.caller.chat_type, binding.caller.chat_id, binding.caller.user_id
         ):

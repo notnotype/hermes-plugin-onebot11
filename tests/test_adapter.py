@@ -146,8 +146,8 @@ async def test_真实工具handler可从当前binding补齐缺失turn_id(monkeyp
     caller = adapter._caller_for_event(event.source)
     event.metadata["onebot11_caller_context"] = adapter_module._serializable_caller(caller)
 
-    async def fake_group_info(api, params, ctx):
-        del api, params
+    async def fake_group_info(api, params, ctx, **kwargs):
+        del api, params, kwargs
         return {"status": "ok", "chat_id": ctx.chat_id, "user_id": ctx.user_id}
 
     monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
@@ -497,6 +497,37 @@ async def test_queued_reaction添加成功但状态更新失败保留pending(mon
         assert record.state == "pending"
         assert await adapter._set_queued_reaction("anchor-queued", "888", "1001")
         assert calls == [True]
+    finally:
+        await adapter.disconnect()
+
+
+async def test_queued_reaction白名单收紧竞态不调用远端(monkeypatch):
+    """reaction 落盘后白名单收紧时，最后一道门禁必须阻止 set=true。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_ALLOWED_GROUPS="888",
+    )
+    calls: list[bool] = []
+
+    async def fake_reaction(_message_id: str, _emoji_id: str, *, enabled: bool) -> None:
+        calls.append(enabled)
+
+    access_checks = 0
+
+    def access_allowed(chat_type: str, chat_id: str, user_id: str | None = None) -> bool:
+        nonlocal access_checks
+        del chat_type, chat_id, user_id
+        access_checks += 1
+        return access_checks == 1
+
+    monkeypatch.setattr(adapter, "_chat_access_allowed", access_allowed)
+    monkeypatch.setattr(adapter._api, "set_message_emoji_like", fake_reaction)
+    try:
+        assert not await adapter._set_queued_reaction("anchor-race", "888", "1001")
+        assert calls == []
+        assert adapter._queue.reaction("anchor-race", reaction_kind="queued") is None
     finally:
         await adapter.disconnect()
 
@@ -1769,6 +1800,10 @@ async def test_send走HTTP并返回SendResult(monkeypatch, fake_http_server):
         assert result.success
         assert calls[0]["path"] == "/send_group_msg"
         assert calls[0]["params"]["group_id"] == 888
+        empty = await adapter.send("888", "")
+        assert not empty.success
+        assert empty.message_id is None
+        assert len(calls) == 1
     finally:
         await adapter.disconnect()
 
@@ -2109,8 +2144,8 @@ async def test_completion重试耗尽后停止续租并fence旧turn(monkeypatch)
         await adapter._finish_queue_turn(event, ProcessingOutcome.SUCCESS)
         assert ack_attempts == 4
         assert adapter._dispatcher.active("888") is None
-        assert lease_id in adapter._fenced_leases
-        assert not adapter._lease_is_current(lease_id)
+        assert lease_id not in adapter._fenced_leases
+        assert adapter._bindings.get("session-1", "turn-1") is None
         assert adapter._queue.status("888")["leased"] == 1
         assert adapter._bindings.get("session-1", "turn-1") is None
         assert lease_id not in adapter._pending_completions
@@ -2276,6 +2311,14 @@ async def test_写工具按锚点权限直接执行且unknown后同turn禁止重
     )
     lease = adapter._queue.claim("888")
     assert lease is not None
+    assert (
+        adapter._queue.bind_authority(
+            lease,
+            "super_admin",
+            adapter.role_tools["super_admin"],
+        )
+        is not None
+    )
     caller = adapter_module.CallerContext(
         user_id="123",
         chat_type="group",
@@ -2385,6 +2428,58 @@ async def test_metadata权限快照不被pre_gateway重新计算(monkeypatch):
     finally:
         adapter_module._CURRENT_BINDING.set(None)
         adapter_module._CURRENT_CALLER.set(None)
+        await adapter.disconnect()
+
+
+async def test_持久authority与binding不一致时工具拒绝(monkeypatch):
+    """ContextVar 或显式 binding 不能替换 QueueStore 已固定的 authority。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    message = adapter_module.QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1001",
+        user_id="123",
+        user_name="小明",
+        text="@bot 查询",
+        message_key="group:1001",
+    )
+    adapter._queue.enqueue(
+        message,
+        adapter_module.TriggerRequest.create(
+            "888",
+            "group:1001",
+            "mention",
+            "123",
+            "小明",
+        ),
+    )
+    lease = adapter._queue.claim("888")
+    assert lease is not None
+    assert adapter._queue.bind_authority(lease, "user", {"qq_get_message"}) is not None
+    caller = adapter_module.CallerContext(
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+        role="super_admin",
+        allowed_tools=adapter.role_tools["super_admin"],
+        lease_id=lease.lease_id,
+    )
+    adapter._bindings.bind(adapter_module.TurnBinding("s", "t", caller, lease.lease_id))
+    try:
+        result = json.loads(
+            await adapter._make_tool_handler("qq_get_message")(
+                {"message_id": "1001"},
+                session_id="s",
+                turn_id="t",
+            )
+        )
+        assert result["status"] == "permission_error"
+        assert "authority" in result["error"]
+    finally:
         await adapter.disconnect()
 
 
@@ -2660,6 +2755,38 @@ async def test_delegate_task不阻断其他platform(monkeypatch):
         await adapter.disconnect()
 
 
+@pytest.mark.parametrize("tool_name", ["tool_search", "tool_describe", "tool_call"])
+async def test_OneBot桥接工具运行时硬阻断(monkeypatch, tool_name):
+    """OneBot caller 即使伪造允许列表，也不能调用 Hermes bridge 工具。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    adapter_module._CURRENT_CALLER.set(
+        adapter_module.CallerContext(
+            user_id="123",
+            chat_type="group",
+            chat_id="888",
+            allowed_tools=frozenset({tool_name}),
+        )
+    )
+    try:
+        result = adapter_module._pre_tool_call_hook(
+            tool_name=tool_name,
+            session_id="s",
+            turn_id="t",
+            args={},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+    finally:
+        adapter_module._CURRENT_BINDING.set(None)
+        adapter_module._CURRENT_CALLER.set(None)
+        await adapter.disconnect()
+
+
 async def test_未知onebot工具hook直接拒绝(monkeypatch):
     """没有注册的 onebot_ 工具同样不能绕过 pre_tool_call。"""
     adapter = _make_adapter(
@@ -2802,6 +2929,59 @@ async def test_私聊运维命令拒绝群队列操作(monkeypatch):
         for response in responses
     )
     await adapter.disconnect()
+
+
+async def test_管理员可以明确清理reaction本地责任(monkeypatch):
+    """reaction clear 只删本地记录，不把未确认的活动 turn 一并清掉。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_ALLOWED_GROUPS="888",
+        ONEBOT11_SUPER_ADMINS="123",
+    )
+    message = adapter_module.QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1001",
+        user_id="123",
+        user_name="管理员",
+        text="待清理",
+        message_key="group:1001",
+    )
+    result = adapter._queue.enqueue(message, adapter_module.TriggerRequest.create(
+        "888", "group:1001", "mention", "123", "管理员"
+    ))
+    assert result.trigger_request_id is not None
+    adapter._queue.record_reaction(
+        "",
+        "888",
+        "1001",
+        anchor_id=result.trigger_request_id,
+        reaction_kind="queued",
+        emoji_id="9203",
+    )
+    responses: list[str] = []
+
+    async def fake_send(_event, text: str) -> None:
+        responses.append(text)
+
+    monkeypatch.setattr(adapter, "_send_direct", fake_send)
+    try:
+        await adapter._handle_admin_command(
+            InboundEvent(
+                text="/onebot reaction clear 1001",
+                chat_id="888",
+                chat_type="group",
+                user_id="123",
+                user_name="管理员",
+                message_id="2001",
+            )
+        )
+        assert adapter._queue.reaction(result.trigger_request_id, reaction_kind="queued") is None
+        assert responses and "未访问 OneBot" in responses[0]
+    finally:
+        await adapter.disconnect()
 
 
 async def test_resolve_retry缺少anchor时保持legacy_hold(monkeypatch):

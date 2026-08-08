@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_BACKOFF_SECONDS = (2.0, 4.0, 8.0)
 MAX_BACKOFF_SECONDS = 60.0
@@ -76,6 +76,8 @@ class TurnAnchor:
     status: str = "pending"
     lease_id: str | None = None
     uncertain_reason: str | None = None
+    authority_role: str | None = None
+    authority_tools: frozenset[str] | None = None
 
     @property
     def anchor_id(self) -> str:
@@ -230,6 +232,8 @@ class QueueStore:
                 self._migrate_columns(version)
                 if version < 9:
                     self._migrate_to_v9(version)
+                if version < 10:
+                    self._migrate_to_v10(version)
                 self._create_indexes()
                 if version < SCHEMA_VERSION:
                     self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -305,6 +309,8 @@ class QueueStore:
             ),
             ("onebot_queue_trigger", trigger_columns, "next_attempt_at", "REAL"),
             ("onebot_queue_trigger", trigger_columns, "failure_reason", "TEXT"),
+            ("onebot_queue_trigger", trigger_columns, "authority_role", "TEXT"),
+            ("onebot_queue_trigger", trigger_columns, "authority_tools_json", "TEXT"),
         )
         for table, columns, name, definition in additions:
             if name not in columns:
@@ -498,6 +504,50 @@ class QueueStore:
         self._conn.execute("DROP INDEX IF EXISTS idx_onebot_queue_trigger_status")
         self._create_indexes()
 
+    def _migrate_to_v10(self, version: int) -> None:
+        """补齐 authority 快照；无法证明的旧活动状态进入 hold。"""
+        del version
+        now = self._now()
+        missing_authority = "(authority_role IS NULL OR authority_tools_json IS NULL)"
+        reason = "旧 anchor 缺少不可变 authority 快照，需管理员处理"
+        self._conn.execute(
+            f"""
+            UPDATE onebot_queue_message
+            SET state='uncertain',
+                lease_id=NULL, lease_until=NULL, lease_owner=NULL,
+                lease_phase='uncertain', outbound_started=1,
+                uncertain_reason=?, updated_at=?
+            WHERE state='leased'
+              AND anchor_id IN (
+                  SELECT request_id FROM onebot_queue_trigger
+                  WHERE {missing_authority}
+              )
+            """,
+            (reason, now),
+        )
+        self._conn.execute(
+            f"""
+            UPDATE onebot_queue_trigger
+            SET status='uncertain',
+                lease_id=NULL, lease_owner=NULL,
+                uncertain_reason=COALESCE(uncertain_reason, ?),
+                failure_reason=COALESCE(failure_reason, ?),
+                updated_at=?
+            WHERE status='claimed' AND {missing_authority}
+            """,
+            (reason, reason, now),
+        )
+        self._conn.execute(
+            f"""
+            UPDATE onebot_queue_trigger
+            SET uncertain_reason=COALESCE(uncertain_reason, ?),
+                failure_reason=COALESCE(failure_reason, ?),
+                updated_at=?
+            WHERE status IN ('uncertain','failed') AND {missing_authority}
+            """,
+            (reason, reason, now),
+        )
+
     def _rebuild_reaction_table_v9(self) -> None:
         """把 lease 主键 reaction 表迁移为每 anchor/阶段一条清理记录。"""
         columns = {
@@ -636,6 +686,8 @@ class QueueStore:
                 failure_count INTEGER NOT NULL DEFAULT 0,
                 next_attempt_at REAL,
                 failure_reason TEXT,
+                authority_role TEXT,
+                authority_tools_json TEXT,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
                 UNIQUE(chat_id, message_key)
@@ -1601,6 +1653,10 @@ class QueueStore:
         ).fetchall()
         for anchor in rows:
             lease_id = str(anchor["lease_id"] or "")
+            authority_missing = (
+                not str(anchor["authority_role"] or "").strip()
+                or self._decode_authority_tools(anchor["authority_tools_json"]) is None
+            )
             message = self._conn.execute(
                 """
                 SELECT MIN(lease_until) AS lease_until,
@@ -1617,6 +1673,28 @@ class QueueStore:
                 """,
                 (str(anchor["request_id"]), lease_id),
             ).fetchone()
+            if authority_missing:
+                reason = "lease 缺少不可变 authority 快照，需管理员确认"
+                self._conn.execute(
+                    """
+                    UPDATE onebot_queue_message
+                    SET state='uncertain',lease_id=NULL,lease_until=NULL,lease_owner=NULL,
+                        lease_phase='uncertain',outbound_started=1,
+                        uncertain_reason=?,updated_at=?
+                    WHERE anchor_id=? AND state='leased'
+                    """,
+                    (reason, now, str(anchor["request_id"])),
+                )
+                self._conn.execute(
+                    """
+                    UPDATE onebot_queue_trigger
+                    SET status='uncertain',lease_id=NULL,lease_owner=NULL,
+                        uncertain_reason=?,failure_reason=?,updated_at=?
+                    WHERE request_id=?
+                    """,
+                    (reason, reason, now, str(anchor["request_id"])),
+                )
+                continue
             if message is None or message["lease_until"] is None:
                 uncertain = True
             elif float(message["lease_until"]) > now:
@@ -1730,23 +1808,174 @@ class QueueStore:
             ).fetchone()
             return row is not None
 
+    def bind_authority(
+        self,
+        lease: QueueLease | str,
+        role: str,
+        allowed_tools: Any,
+    ) -> TurnAnchor | None:
+        """在首次 Agent 启动前原子固定 authority 快照。"""
+        lease_id = lease.lease_id if isinstance(lease, QueueLease) else str(lease)
+        normalized_role = str(role or "").strip()
+        if normalized_role not in {"user", "trusted_user", "super_admin"}:
+            raise ValueError("authority role 必须是 user、trusted_user 或 super_admin")
+        values = [allowed_tools] if isinstance(allowed_tools, str) else allowed_tools
+        if values is None:
+            raise ValueError("authority tools 不能为空")
+        normalized_tools = sorted(
+            {
+                str(item).strip()
+                for item in values
+                if str(item).strip()
+            }
+        )
+        if any(
+            name in {"delegate_task", "tool_search", "tool_describe", "tool_call"}
+            for name in normalized_tools
+        ):
+            raise ValueError("authority tools 包含 OneBot11 禁止的工具")
+        with self._operation():
+            try:
+                self._transaction()
+                now = self._now()
+                active = self._conn.execute(
+                    """
+                    SELECT anchor_id FROM onebot_queue_message
+                    WHERE lease_id=? AND lease_owner=? AND state='leased'
+                      AND lease_until IS NOT NULL AND lease_until>?
+                    LIMIT 1
+                    """,
+                    (lease_id, self._owner_id, now),
+                ).fetchone()
+                if active is None:
+                    self._conn.commit()
+                    return None
+                trigger = self._conn.execute(
+                    """
+                    SELECT * FROM onebot_queue_trigger
+                    WHERE request_id=? AND lease_id=? AND lease_owner=? AND status='claimed'
+                    """,
+                    (str(active["anchor_id"]), lease_id, self._owner_id),
+                ).fetchone()
+                if trigger is None:
+                    self._conn.commit()
+                    return None
+                existing_role = (
+                    str(trigger["authority_role"]).strip()
+                    if trigger["authority_role"] is not None
+                    else None
+                )
+                existing_tools = self._decode_authority_tools(
+                    trigger["authority_tools_json"]
+                )
+                if existing_role is not None or existing_tools is not None:
+                    if existing_role != normalized_role or existing_tools != frozenset(
+                        normalized_tools
+                    ):
+                        self._conn.rollback()
+                        return None
+                    self._conn.commit()
+                    return self._row_to_trigger(trigger)
+                self._conn.execute(
+                    """
+                    UPDATE onebot_queue_trigger
+                    SET authority_role=?, authority_tools_json=?, updated_at=?
+                    WHERE request_id=? AND lease_id=? AND lease_owner=? AND status='claimed'
+                    """,
+                    (
+                        normalized_role,
+                        json.dumps(
+                            normalized_tools,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        now,
+                        str(active["anchor_id"]),
+                        lease_id,
+                        self._owner_id,
+                    ),
+                )
+                updated = self._conn.execute(
+                    "SELECT * FROM onebot_queue_trigger WHERE request_id=?",
+                    (str(active["anchor_id"]),),
+                ).fetchone()
+                self._conn.commit()
+                return self._row_to_trigger(updated) if updated is not None else None
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def authority_for_lease(self, lease_id: str) -> tuple[str, frozenset[str]] | None:
+        """读取当前 lease 的持久 authority 快照，缺失或损坏时拒绝推断。"""
+        with self._operation():
+            row = self._conn.execute(
+                """
+                SELECT authority_role, authority_tools_json
+                FROM onebot_queue_trigger
+                WHERE lease_id=? AND status='claimed'
+                LIMIT 1
+                """,
+                (str(lease_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            role = str(row["authority_role"] or "").strip()
+            tools = self._decode_authority_tools(row["authority_tools_json"])
+            if not role or tools is None:
+                return None
+            return role, tools
+
     def mark_agent_started(self, lease: QueueLease | str) -> bool:
         """确认 Agent 可以继续运行；失效 lease 不会重新获得执行权。"""
         lease_id = lease.lease_id if isinstance(lease, QueueLease) else str(lease)
         with self._operation():
-            now = self._now()
-            cursor = self._conn.execute(
-                """
-                UPDATE onebot_queue_message
-                SET lease_phase='agent_running', updated_at=?
-                WHERE lease_id=? AND lease_owner=? AND state='leased'
-                  AND lease_until IS NOT NULL AND lease_until>?
-                  AND outbound_started=0
-                """,
-                (now, lease_id, self._owner_id, now),
-            )
-            self._conn.commit()
-            return cursor.rowcount > 0
+            try:
+                self._transaction()
+                now = self._now()
+                active = self._conn.execute(
+                    """
+                    SELECT anchor_id
+                    FROM onebot_queue_message
+                    WHERE lease_id=? AND lease_owner=? AND state='leased'
+                      AND lease_until IS NOT NULL AND lease_until>?
+                      AND outbound_started=0
+                    LIMIT 1
+                    """,
+                    (lease_id, self._owner_id, now),
+                ).fetchone()
+                if active is None:
+                    self._conn.commit()
+                    return False
+                trigger = self._conn.execute(
+                    """
+                    SELECT authority_role, authority_tools_json
+                    FROM onebot_queue_trigger
+                    WHERE request_id=? AND lease_id=? AND lease_owner=? AND status='claimed'
+                    """,
+                    (str(active["anchor_id"]), lease_id, self._owner_id),
+                ).fetchone()
+                if (
+                    trigger is None
+                    or not str(trigger["authority_role"] or "").strip()
+                    or self._decode_authority_tools(trigger["authority_tools_json"]) is None
+                ):
+                    self._conn.commit()
+                    return False
+                cursor = self._conn.execute(
+                    """
+                    UPDATE onebot_queue_message
+                    SET lease_phase='agent_running', updated_at=?
+                    WHERE lease_id=? AND lease_owner=? AND state='leased'
+                      AND lease_until IS NOT NULL AND lease_until>?
+                      AND outbound_started=0
+                    """,
+                    (now, lease_id, self._owner_id, now),
+                )
+                self._conn.commit()
+                return cursor.rowcount > 0
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def mark_outbound_started(self, lease: QueueLease | str) -> bool:
         """在访问非幂等 OneBot API 前持久化出站阶段并执行 fencing。"""
@@ -2045,6 +2274,15 @@ class QueueStore:
                         # 任意后续用户，只能由管理员 discard 或发送新的明确消息。
                         self._conn.commit()
                         return 0
+                    authority_role = str(anchor["authority_role"] or "").strip()
+                    authority_tools = self._decode_authority_tools(
+                        anchor["authority_tools_json"]
+                    )
+                    if not authority_role or authority_tools is None:
+                        # 旧 v9 anchor 没有可证明的 turn-start 权限快照；
+                        # retry 不能按当前配置猜测原 authority。
+                        self._conn.commit()
+                        return 0
                     else:
                         new_anchor_id = uuid.uuid4().hex
                         self._conn.execute(
@@ -2057,8 +2295,8 @@ class QueueStore:
                                 request_id,chat_id,message_key,reason,caller_user_id,
                                 caller_user_name,status,anchor_seq,anchor_kind,batch_start_seq,
                                 control_message_id,failure_count,next_attempt_at,failure_reason,
-                                created_at,updated_at
-                            ) VALUES (?,?,?,?,?,?, 'pending', ?, ?, ?, ?, 0, NULL, NULL, ?, ?)
+                                authority_role,authority_tools_json,created_at,updated_at
+                            ) VALUES (?,?,?,?,?,?, 'pending', ?, ?, ?, ?, 0, NULL, NULL, ?, ?, ?, ?)
                             """,
                             (
                                 new_anchor_id,
@@ -2071,6 +2309,12 @@ class QueueStore:
                                 str(anchor["anchor_kind"]),
                                 anchor["batch_start_seq"],
                                 anchor["control_message_id"],
+                                authority_role,
+                                json.dumps(
+                                    sorted(authority_tools),
+                                    ensure_ascii=False,
+                                    separators=(",", ":"),
+                                ),
                                 now,
                                 now,
                             ),
@@ -2095,10 +2339,6 @@ class QueueStore:
                             (new_anchor_id, now, anchor_id),
                         )
                 else:
-                    self._conn.execute(
-                        "DELETE FROM onebot_queue_reaction WHERE anchor_id=?",
-                        (anchor_id,),
-                    )
                     self._conn.execute(
                         """
                         INSERT OR REPLACE INTO onebot_queue_dedupe(
@@ -2416,6 +2656,74 @@ class QueueStore:
             )
             self._conn.commit()
             return cursor.rowcount > 0
+
+    def clear_reaction_state(
+        self,
+        chat_id: str,
+        message_id: str,
+        *,
+        reaction_kind: str | None = None,
+    ) -> int:
+        """管理员确认外部状态后删除当前群的本地 reaction cleanup 责任。"""
+        if reaction_kind is not None and reaction_kind not in {
+            "queued",
+            "processing",
+            "legacy_processing",
+        }:
+            raise ValueError("未知 reaction_kind")
+        with self._operation():
+            try:
+                self._transaction()
+                active = self._conn.execute(
+                    """
+                    SELECT 1
+                    FROM onebot_queue_reaction AS reaction
+                    WHERE reaction.chat_id=? AND reaction.message_id=?
+                      AND (? IS NULL OR reaction.reaction_kind=?)
+                      AND (
+                          EXISTS (
+                              SELECT 1 FROM onebot_queue_trigger AS trigger
+                              WHERE trigger.request_id=reaction.anchor_id
+                                AND trigger.status='claimed'
+                          )
+                          OR (
+                              reaction.lease_id IS NOT NULL
+                              AND EXISTS (
+                                  SELECT 1 FROM onebot_queue_message AS message
+                                  WHERE message.lease_id=reaction.lease_id
+                                    AND message.state='leased'
+                              )
+                          )
+                      )
+                    LIMIT 1
+                    """,
+                    (
+                        str(chat_id),
+                        str(message_id),
+                        reaction_kind,
+                        reaction_kind,
+                    ),
+                ).fetchone()
+                if active is not None:
+                    raise QueueBusy("当前 reaction 仍属于活动 turn，不能手工清理")
+                cursor = self._conn.execute(
+                    """
+                    DELETE FROM onebot_queue_reaction
+                    WHERE chat_id=? AND message_id=?
+                      AND (? IS NULL OR reaction_kind=?)
+                    """,
+                    (
+                        str(chat_id),
+                        str(message_id),
+                        reaction_kind,
+                        reaction_kind,
+                    ),
+                )
+                self._conn.commit()
+                return int(cursor.rowcount)
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def status(self, chat_id: str) -> dict[str, Any]:
         """读取队列数量、阶段、退避原因、摘要和暂停状态。"""
@@ -2759,6 +3067,10 @@ class QueueStore:
                     f"""
                     SELECT trigger.* FROM onebot_queue_trigger AS trigger
                     WHERE trigger.status='pending' {trigger_select_scope}
+                      AND (
+                          trigger.next_attempt_at IS NULL
+                          OR trigger.next_attempt_at<=?
+                      )
                       AND trigger.anchor_kind NOT IN ('legacy','service')
                       AND EXISTS (
                         SELECT 1 FROM onebot_queue_message AS message
@@ -2773,7 +3085,7 @@ class QueueStore:
                           )
                     ) ORDER BY trigger.created_at
                     """,
-                    (*trigger_scope_args, *message_scope_args),
+                    (*trigger_scope_args, now, *message_scope_args),
                 ).fetchall()
                 return tuple(self._row_to_trigger(row) for row in rows)
             except Exception:
@@ -2822,8 +3134,35 @@ class QueueStore:
             anchor_id=str(row["anchor_id"]) if row["anchor_id"] is not None else None,
         )
 
+    def _decode_authority_tools(self, value: Any) -> frozenset[str] | None:
+        """解析持久 authority 工具集合；损坏数据按缺失处理。"""
+        if value is None:
+            return None
+        try:
+            decoded = json.loads(str(value))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(decoded, list):
+            return None
+        tools = frozenset(str(item).strip() for item in decoded if str(item).strip())
+        if any(
+            name in {"delegate_task", "tool_search", "tool_describe", "tool_call"}
+            for name in tools
+        ):
+            return None
+        return tools
+
     def _row_to_trigger(self, row: sqlite3.Row) -> TriggerRequest:
         """把 SQLite 行转换为 TurnAnchor。"""
+        authority_role = (
+            str(row["authority_role"]).strip()
+            if row["authority_role"] is not None
+            else None
+        )
+        authority_tools = self._decode_authority_tools(row["authority_tools_json"])
+        if not authority_role or authority_tools is None:
+            authority_role = None
+            authority_tools = None
         return TurnAnchor(
             request_id=str(row["request_id"]),
             chat_id=str(row["chat_id"]),
@@ -2862,6 +3201,8 @@ class QueueStore:
                 if row["uncertain_reason"] is not None
                 else None
             ),
+            authority_role=authority_role,
+            authority_tools=authority_tools,
         )
 
     def _row_to_reaction(self, row: sqlite3.Row) -> ReactionRecord:

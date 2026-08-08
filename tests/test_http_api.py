@@ -94,6 +94,25 @@ async def test_私聊发送组包(fake_server):
     await api.close()
 
 
+@pytest.mark.parametrize("data", [{}, {"message_id": "not-a-number"}])
+async def test_发送响应缺少合法message_id进入unknown(data, monkeypatch):
+    """OneBot 成功响应没有合法数字 ID 时不能伪造成功。"""
+    api = OneBotHttpApi("http://127.0.0.1:3000")
+
+    async def fake_call_action(_action, _params, *, retryable=None):
+        del retryable
+        return data
+
+    monkeypatch.setattr(api, "call_action", fake_call_action)
+    try:
+        with pytest.raises(OneBotApiError) as error:
+            await api.send_message("123", "消息", chat_type="dm")
+        assert error.value.unknown_outcome is True
+        assert error.value.status == "missing_message_id"
+    finally:
+        await api.close()
+
+
 async def test_发送拒绝未知目标类型(fake_server):
     """协议客户端也不把未知类型猜成私聊。"""
     base, _calls, _ = fake_server

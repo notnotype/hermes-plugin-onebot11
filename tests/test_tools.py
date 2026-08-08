@@ -8,6 +8,7 @@ from onebot11.permissions import ToolContext
 from onebot11.tools import (
     TOOL_SCHEMAS,
     handle_get_friend_msg_history,
+    handle_get_group_member_info,
     handle_get_group_msg_history,
     handle_get_message,
 )
@@ -30,9 +31,29 @@ async def fake_server():
                 "message": [{"type": "text", "data": {"text": "原消息"}}],
             }
         elif action == "get_group_msg_history":
-            data = {"messages": [{"message_id": 1, "message": [{"type": "text", "data": {"text": "历史1"}}]}]}
+            data = {
+                "messages": [
+                    {
+                        "message_id": 1,
+                        "message_type": "group",
+                        "group_id": 888,
+                        "user_id": 123,
+                        "message": [{"type": "text", "data": {"text": "历史1"}}],
+                    }
+                ]
+            }
         else:
-            data = {"messages": [{"message_id": 2, "message": [{"type": "text", "data": {"text": "私聊历史"}}]}]}
+            data = {
+                "messages": [
+                    {
+                        "message_id": 2,
+                        "message_type": "private",
+                        "user_id": 999,
+                        "target_id": 3101482118,
+                        "message": [{"type": "text", "data": {"text": "私聊历史"}}],
+                    }
+                ]
+            }
         return web.json_response({"status": "ok", "retcode": 0, "data": data})
 
     app = web.Application()
@@ -84,7 +105,12 @@ async def test_私聊历史QQ从会话注入(fake_server):
     base, calls = fake_server
     api = OneBotHttpApi(base_url=base)
     ctx = ToolContext(user_id="999", chat_type="dm", chat_id="999")
-    result = await handle_get_friend_msg_history(api, {"count": 10}, ctx)
+    result = await handle_get_friend_msg_history(
+        api,
+        {"count": 10},
+        ctx,
+        self_id="3101482118",
+    )
     assert result["user_id"] == "999"
     assert calls[0]["path"] == "/get_friend_msg_history"
     assert calls[0]["params"]["user_id"] == 999  # 注入的是会话本人
@@ -117,9 +143,100 @@ async def test_私聊历史任一条不含当前参与者时整次拒绝():
             return [{"message_type": "private", "user_id": 999, "target_id": 998}]
 
     result = await handle_get_friend_msg_history(
-        StubApi(), {}, ToolContext(user_id="123", chat_type="dm", chat_id="123")
+        StubApi(),
+        {},
+        ToolContext(user_id="123", chat_type="dm", chat_id="123"),
+        self_id="3101482118",
     )
     assert result["status"] == "permission_error"
+
+
+async def test_私聊历史必须正好是当前用户和机器人():
+    """第三方或缺少机器人参与者的私聊响应整次 fail-closed。"""
+    class StubApi:
+        """按构造结果返回私聊历史。"""
+
+        def __init__(self, messages: list[dict]):
+            self.messages = messages
+
+        async def get_friend_msg_history(self, _user_id: str, _count: int) -> list[dict]:
+            return self.messages
+
+    ctx = ToolContext(user_id="123", chat_type="dm", chat_id="123")
+    valid = await handle_get_friend_msg_history(
+        StubApi(
+            [
+                {
+                    "message_type": "private",
+                    "user_id": 123,
+                    "target_id": 3101482118,
+                }
+            ]
+        ),
+        {},
+        ctx,
+        self_id="3101482118",
+    )
+    assert valid["status"] == "ok"
+
+    third_party = await handle_get_friend_msg_history(
+        StubApi(
+            [
+                {
+                    "message_type": "private",
+                    "user_id": 123,
+                    "target_id": 3101482118,
+                    "sender": {"user_id": 999},
+                }
+            ]
+        ),
+        {},
+        ctx,
+        self_id="3101482118",
+    )
+    assert third_party["status"] == "permission_error"
+
+    missing_bot = await handle_get_friend_msg_history(
+        StubApi(
+            [
+                {
+                    "message_type": "private",
+                    "user_id": 123,
+                    "target_id": 456,
+                }
+            ]
+        ),
+        {},
+        ctx,
+        self_id="3101482118",
+    )
+    assert missing_bot["status"] == "permission_error"
+
+
+async def test_群成员响应必须匹配当前群和请求成员():
+    """群成员查询不能接受跨群或第三方成员响应。"""
+    class StubApi:
+        """返回指定群成员响应。"""
+
+        def __init__(self, member: dict):
+            self.member = member
+
+        async def call_action(self, _action: str, _params: dict) -> dict:
+            return self.member
+
+    ctx = ToolContext(user_id="123", chat_type="group", chat_id="888")
+    valid = await handle_get_group_member_info(
+        StubApi({"group_id": 888, "user_id": 456, "nickname": "成员"}),
+        {"user_id": "456"},
+        ctx,
+    )
+    assert valid["status"] == "ok"
+    invalid = await handle_get_group_member_info(
+        StubApi({"group_id": 999, "user_id": 456}),
+        {"user_id": "456"},
+        ctx,
+    )
+    assert invalid["status"] == "permission_error"
 
 
 async def test_hash_message_key不进入get_msg整数接口():

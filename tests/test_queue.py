@@ -169,6 +169,7 @@ def test_retry只恢复最早锚点原消息范围(tmp_path):
     store.enqueue(first_message, _trigger(first_message))
     lease = store.claim("888")
     assert lease is not None
+    assert store.bind_authority(lease, "user", {"qq_get_message"}) is not None
     assert store.mark_uncertain(lease, "未知")
     store.enqueue(second_message, _trigger(second_message))
 
@@ -178,6 +179,99 @@ def test_retry只恢复最早锚点原消息范围(tmp_path):
     assert retried.trigger.request_id != lease.trigger.request_id
     assert retried.trigger.caller_user_id == lease.trigger.caller_user_id
     assert [message.message_id for message in retried.messages] == ["1"]
+    store.close()
+
+
+def test首次claim固定authority且不能换绑(tmp_path):
+    """authority 在首次 claim 后持久化，后续换绑必须失败。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    message = _message("authority")
+    store.enqueue(message, _trigger(message))
+    lease = store.claim("888")
+    assert lease is not None
+    bound = store.bind_authority(lease, "user", {"qq_get_message"})
+    assert bound is not None
+    assert bound.authority_role == "user"
+    assert bound.authority_tools == frozenset({"qq_get_message"})
+    assert store.bind_authority(lease, "super_admin", {"terminal"}) is None
+    assert store.mark_agent_started(lease)
+    reopened = QueueStore(tmp_path / "queue.sqlite3")
+    authority = reopened.authority_for_lease(lease.lease_id)
+    assert authority == ("user", frozenset({"qq_get_message"}))
+    reopened.close()
+    store.close()
+
+
+def test没有authority的过期lease进入hold而不是重放(tmp_path, monkeypatch):
+    """claim 后进程在 authority 落盘前崩溃时，恢复不得猜测权限。"""
+    now = [1000.0]
+    monkeypatch.setattr("onebot11.queue.time.time", lambda: now[0])
+    path = tmp_path / "queue.sqlite3"
+    store = QueueStore(path)
+    message = _message("authority-crash")
+    store.enqueue(message, _trigger(message))
+    lease = store.claim("888", lease_seconds=5)
+    assert lease is not None
+    store.close()
+    now[0] = 1006.0
+    recovered = QueueStore(path)
+    assert recovered.recover_trigger_requests({"888"}) == ()
+    status = recovered.status("888")
+    assert status["uncertain"] == 1
+    assert status["pending_trigger_requests"] == 0
+    recovered.close()
+
+
+def test_discard保留reaction清理责任(tmp_path):
+    """discard 业务消息不能丢掉已经可能成功设置的 reaction。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    message = _message("discard-reaction")
+    result = store.enqueue(message, _trigger(message))
+    assert result.trigger_request_id is not None
+    lease = store.claim("888")
+    assert lease is not None
+    assert store.bind_authority(lease, "user", {"qq_get_message"}) is not None
+    store.record_reaction(
+        lease.lease_id,
+        "888",
+        "1001",
+        anchor_id=result.trigger_request_id,
+        reaction_kind="processing",
+        emoji_id="eyes",
+    )
+    assert store.mark_reaction_set(result.trigger_request_id, reaction_kind="processing")
+    assert store.mark_uncertain(lease, "unknown")
+    assert store.resolve_uncertain("888", "discard") == 1
+    assert store.reaction(result.trigger_request_id, reaction_kind="processing") is not None
+    store.close()
+
+
+def test_retry复制authority快照和reaction(tmp_path):
+    """retry 新 anchor 必须继承旧 authority，不能按当前配置猜测。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    message = _message("retry-authority")
+    result = store.enqueue(message, _trigger(message))
+    assert result.trigger_request_id is not None
+    lease = store.claim("888")
+    assert lease is not None
+    bound = store.bind_authority(lease, "trusted_user", {"web_search"})
+    assert bound is not None
+    store.record_reaction(
+        lease.lease_id,
+        "888",
+        "1001",
+        anchor_id=lease.trigger.request_id,
+        reaction_kind="processing",
+        emoji_id="eyes",
+    )
+    assert store.mark_reaction_set(lease.trigger.request_id, reaction_kind="processing")
+    assert store.mark_uncertain(lease, "unknown")
+    assert store.resolve_uncertain("888", "retry") == 1
+    retried = store.list_anchors("888")[0]
+    assert retried.request_id != lease.trigger.request_id
+    assert retried.authority_role == "trusted_user"
+    assert retried.authority_tools == frozenset({"web_search"})
+    assert store.reaction(retried.request_id, reaction_kind="processing") is not None
     store.close()
 
 
@@ -201,6 +295,7 @@ def test_过期agent_lease恢复使用退避并在第三次进入failed(tmp_path
             store._conn.commit()
             lease = store.claim("888")
         assert lease is not None
+        assert store.bind_authority(lease, "user", {"qq_get_message"}) is not None
         store._conn.execute(
             "UPDATE onebot_queue_message SET lease_until=0 WHERE lease_id=?",
             (lease.lease_id,),
@@ -229,6 +324,7 @@ def test_lease_phase未知即使marker为零也进入uncertain(tmp_path):
     store.enqueue(message, _trigger(message))
     lease = store.claim("888")
     assert lease is not None
+    assert store.bind_authority(lease, "user", {"qq_get_message"}) is not None
     store._conn.execute(
         """
         UPDATE onebot_queue_message
@@ -254,6 +350,7 @@ def test_当前lease_phase未知时成功结果也不能ack(tmp_path):
     store.enqueue(message, _trigger(message))
     lease = store.claim("888")
     assert lease is not None
+    assert store.bind_authority(lease, "user", {"qq_get_message"}) is not None
     store._conn.execute(
         "UPDATE onebot_queue_message SET lease_phase='unexpected' WHERE lease_id=?",
         (lease.lease_id,),
@@ -336,11 +433,15 @@ def test_恢复不抢占仍有效的其他进程租约(tmp_path, monkeypatch):
     owner.enqueue(message, _trigger(message))
     lease = owner.claim("888", lease_seconds=30)
     assert lease is not None
+    assert owner.bind_authority(lease, "user", {"qq_get_message"}) is not None
 
     assert other.recover_trigger_requests() == ()
     assert other.claim("888") is None
 
     now[0] = 1031.0
+    recovered = other.recover_trigger_requests()
+    assert recovered == ()
+    now[0] = 1033.0
     recovered = other.recover_trigger_requests()
     assert len(recovered) == 1
     assert recovered[0].request_id == lease.trigger.request_id
@@ -360,9 +461,14 @@ def test_恢复白名单在修改lease前过滤目标(tmp_path, monkeypatch):
     for chat_id in ("888", "777"):
         message = _message(chat_id, chat_id=chat_id)
         owner.enqueue(message, _trigger(message))
-        assert owner.claim(chat_id, lease_seconds=5) is not None
+        lease = owner.claim(chat_id, lease_seconds=5)
+        assert lease is not None
+        assert owner.bind_authority(lease, "user", {"qq_get_message"}) is not None
     now[0] = 1006.0
 
+    recovered = recovery.recover_trigger_requests({"888"})
+    assert recovered == ()
+    now[0] = 1008.0
     recovered = recovery.recover_trigger_requests({"888"})
     assert [item.chat_id for item in recovered] == ["888"]
     assert recovery.status("888")["pending"] == 1
@@ -842,6 +948,42 @@ def test_v7迁移补齐LLM判断列(tmp_path):
     migrated.close()
 
 
+def test_v9迁移固定处理authority缺失的活动anchor(tmp_path):
+    """v9 活动 anchor 进入 hold，v9 pending anchor 仍可首次 claim 后绑定权限。"""
+    path = tmp_path / "queue.sqlite3"
+    store = QueueStore(path)
+    claimed_message = _message("claimed", chat_id="888")
+    pending_message = _message("pending", chat_id="777")
+    store.enqueue(claimed_message, _trigger(claimed_message))
+    store.enqueue(pending_message, _trigger(pending_message))
+    lease = store.claim("888", lease_seconds=3600)
+    assert lease is not None
+    store.close()
+
+    connection = sqlite3.connect(path)
+    connection.execute("PRAGMA user_version=9")
+    connection.commit()
+    connection.close()
+
+    migrated = QueueStore(path)
+    assert migrated.status("888")["leased"] == 0
+    assert migrated.status("888")["uncertain"] == 1
+    assert migrated.status("777")["pending"] == 1
+
+    pending_lease = migrated.claim("777")
+    assert pending_lease is not None
+    assert pending_lease.trigger.authority_role is None
+    bound = migrated.bind_authority(
+        pending_lease,
+        "user",
+        {"qq_get_message"},
+    )
+    assert bound is not None
+    assert bound.authority_role == "user"
+    assert migrated.mark_agent_started(pending_lease)
+    migrated.close()
+
+
 def test_llm判断游标和退避持久化(tmp_path, monkeypatch):
     """LLM false 不重复判断；失败有退避且下一次重启仍可读取。"""
     now = [1000.0]
@@ -897,12 +1039,12 @@ def test关闭等待已进入SQLite操作且关闭后拒绝新操作(tmp_path):
 
 
 def test_未知更高schema仍然拒绝启动(tmp_path):
-    """schema 10 及以上不能被当前插件猜测迁移。"""
+    """schema 11 及以上不能被当前插件猜测迁移。"""
     path = tmp_path / "queue.sqlite3"
     store = QueueStore(path)
     store.close()
     connection = sqlite3.connect(path)
-    connection.execute("PRAGMA user_version=10")
+    connection.execute("PRAGMA user_version=11")
     connection.commit()
     connection.close()
 
@@ -1069,6 +1211,41 @@ def test_reaction同目标只保留一条且maybe_set退避不被重置(tmp_path
     assert after.state == "maybe_set"
     assert after.attempts == before.attempts
     assert after.next_attempt_at == before.next_attempt_at
+    store.close()
+
+
+def test_管理员确认后可清理本地reaction责任但活动turn拒绝(tmp_path):
+    """本地手工清理只删除 cleanup 记录，不能绕过活动 turn。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    message = _message("reaction-clear")
+    result = store.enqueue(message, _trigger(message))
+    assert result.trigger_request_id is not None
+    store.record_reaction(
+        "",
+        "888",
+        "1001",
+        anchor_id=result.trigger_request_id,
+        reaction_kind="queued",
+        emoji_id="hourglass",
+    )
+    assert store.clear_reaction_state("888", "1001") == 1
+    assert store.reaction(result.trigger_request_id, reaction_kind="queued") is None
+
+    second = _message("reaction-clear-active")
+    result = store.enqueue(second, _trigger(second))
+    assert result.trigger_request_id is not None
+    lease = store.claim("888")
+    assert lease is not None
+    store.record_reaction(
+        lease.lease_id,
+        "888",
+        "1002",
+        anchor_id=lease.trigger.anchor_id,
+        reaction_kind="processing",
+        emoji_id="eyes",
+    )
+    with pytest.raises(QueueBusy, match="活动 turn"):
+        store.clear_reaction_state("888", "1002")
     store.close()
 
 
