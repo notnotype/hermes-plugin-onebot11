@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- **阶段**：v0.4.0 TurnAnchor 实现位于 Issue #9 stacked 分支；基线 PR #7 仍未合并，尚未创建或合并本 Task PR。Arch v0.4.0 联调暂因 SSH host key 冲突阻塞。
+- **阶段**：v0.4.0 TurnAnchor 实现位于 Issue #9 stacked 分支；基线 PR #7 仍未合并，本 Task PR #10 已创建为 draft。已完成 Arch v0.4.0 指定白名单 smoke；仍未执行破坏性群管理写操作。
 - **核心合同**：群固定 shared session；每条锚点消息对应一个 authority 和一个串行 followup；自动 selector 只选 seq；非幂等 unknown 不自动重放。
 - **本地验证**：本地 Hermes 源码与 site-packages 全套 `242 passed`，Ruff 通过；临时 Hermes smoke 已通过；Arch 尚未部署 v0.4.0。
 
@@ -27,7 +27,7 @@
 ## 验证证据
 
 - 使用本地 Hermes 源码与 site-packages：全套测试 `242 passed`，覆盖 schema v9、多个独立 anchor、batch 边界、immutable authority、selector、双阶段 reaction、unknown 写操作、媒体端口边界、关闭 fencing 和 adapter 生命周期。
-- 本轮 Arch + LLBot：服务加载 `0.3.0`；群 `1072992996` 和私聊 `2056963663` 是唯一出站目标。已验证 `/context` 旁路、紧凑 `/status`、普通用户高风险工具拒绝、shared session key、群 reaction 生命周期、允许私聊回复，以及非白名单群/私聊 fail-closed。
+- 本轮 Arch + LLBot：服务加载 commit `f8c14ac` / v0.4.0；群 `1072992996` 和私聊 `2056963663` 是唯一允许目标。已验证 v8→v9 迁移、群 `/status`/`/onebot clear`、两个独立 @ anchor、普通用户权限拒绝、允许私聊回复、reaction recovery，以及非白名单群/私聊 fail-closed。
 - `.venv\\Scripts\\python.exe -m ruff check .`：通过。
 - 临时 `HERMES_HOME` 真实注册 smoke 已完成：插件版本 `0.4.0`、12 个 OneBot 工具、4 个 hooks、`onebot11_trigger` auxiliary、QueueStore schema v9 和 `group_sessions_per_user=False` 均已确认。
 - 本轮未修改 Hermes 安装目录；OneBot `delegate_task` 明确 fail-closed，等待 Hermes 上游 per-turn 工具策略后再评估恢复。
@@ -36,9 +36,9 @@
 
 2026-08-06 在 Arch `192.168.1.18` 使用真实 Hermes + LLBot direct compose 部署 `0.3.0` 完成 Task 4 指定白名单联调。机器人 QQ 为 `3101482118`，唯一允许群为 `1072992996`，唯一允许私聊用户为 `2056963663`；Hermes/LLBot WS 与 HTTP token 已配置一致且未记录在文档中。以下外部事件仍是通过真实反向 WS 注入的合成 OneBot payload，不等同于真人 QQ 客户端发言，也不代表 v0.4.0。
 
-当前 v0.4.0 外部联调被安全阻塞：SSH alias `archlinux` 对应服务器当前提供的 host key 指纹为 `SHA256:EF3F5Zw6/acnlb2FL/ktuwLGZUuilbMhZKuo/9YNyv8`，与本机 `known_hosts` 中的旧 key 不一致。未确认是否发生主机密钥轮换前，不关闭 host key 校验、不接受新 key，也不部署。
+2026-08-08 已通过 SSH 主机校验连接指定 Arch `192.168.1.18`。当前 v0.4.0 部署在独立 worktree，旧 v0.3.3 symlink 和队列均已备份；LLBot compose 健康，Hermes gateway active。
 
-以下是 v0.3.0/Task 4 历史证据，不代表 v0.4.0 已外部验收：
+以下是 v0.3.0/Task 4 历史证据，不代表 v0.4.0 当前证据：
 
 - 群普通用户和超级管理员消息落在同一 session key `agent:main:onebot11:group:1072992996`；v0.4.0 已改为两个独立 anchor，尚待外部验证。
 - `/context` 在入队前旁路返回待处理 batch；`/status` 返回 `chat_type=group`、lease/失败计数等紧凑状态，不再发送旧 summary 原文。
@@ -46,20 +46,21 @@
 - 群处理 reaction 在指定群的真实消息 ID 上按 `set=true -> 回复 -> set=false` 完成；允许私聊用户收到正常 Agent 回复。
 - 非白名单群 `786830134` 和私聊 `999999999` 只记录 `access_denied`，没有队列记录和出站请求。
 
-已确认：
+v0.4.0 本轮已确认：
 
-- Hermes 实际加载既有 0.3.0 插件，`session=shared`，WS 监听和 LLBot 反向 WS 自动重连均成功；v0.3.1 尚未重新部署。
-- OneBot `get_login_info`、目标群/用户查询、群消息和私聊测试发送均返回 `retcode=0`，出站目标只有上述群和用户。
-- 通过真实 WS 服务注入允许群 @ 事件，消息进入持久 SQLite 队列，Agent 回复 `OneBot11联调成功` 并成功发回目标群；允许用户私聊回复 `OneBot11私聊成功`。
-- 不带 @ 的消息在 pending 中持久化；重启 Hermes 后仍在队列，管理员 `flush` 后完成处理并清空消息/trigger。
-- 真实 LLBot 上报的其他群消息和合成的非白名单私聊均被拒绝并写入审计；没有产生出站。
-- 在指定群用真实消息 ID `-71496113` 完成 reaction smoke：`set=true` 后收到 Hermes 群回复，再发送 `set=false`；`fetch_emoji_like` 返回空列表，确认 👀 已清理。
+- Hermes 日志确认 `groups=['1072992996'] dm_policy=allowlist super_admins=['2056963663'] mention=True session=shared`；WS 监听 `0.0.0.0:18880`，LLBot HTTP `get_login_info` 返回机器人 QQ `3101482118`。
+- v8 队列迁移到 schema v9，迁移前的 pending 数据已备份；使用 `/onebot clear` 只清理插件队列，不删除 Hermes session 历史。
+- 两条合成反向 WS @ 事件分别生成 anchor `115`、`116`，目标群实际收到 `TurnAnchor 测试 A` 和 `TurnAnchor 测试 B`，处理后队列、trigger、reaction 均为空。
+- 普通群成员 `3199036352` 的 `/whoami` 返回 role `user` 和 5 个当前范围只读工具；请求 `terminal` 被真实 `pre_tool_call` 拒绝并写入 `permission_denied` 审计。
+- 允许私聊用户 `2056963663` 收到 `OneBot11 DM v0.4.0 smoke`；私聊使用独立 DM session。
+- 非白名单群 `786830134`、非白名单私聊 `999999999` 均只记录 `access_denied`，SQLite 中没有入队记录和 trigger。
+- 对真实群消息 ID `1197886633` 进行 reaction recovery：持久化 `maybe_set` 记录后重启 gateway，记录恢复为 0 条，`fetch_emoji_like` 返回空列表；未执行群管理写操作。
 
-仍需单独完成：
+外部验收边界：
 
-- 以上 Agent 入站事件使用了真实反向 WS 的合成 OneBot payload，不等同于 QQ 客户端真人发言；还未完成两名真人群成员同时触发时的外部观察。
-- v0.4.0 的直接写工具、非幂等出站断线后的 `uncertain` 与人工 resolve 尚未在真实 QQ 上执行；未获额外授权时不执行破坏性写动作。
-- 未在本轮使用 NapCat，也未把 WS 重连重放行为提升为协议保证。
+- 两个 anchor 和权限测试使用真实反向 WS 连接注入的合成 OneBot payload，不等同于两名真人 QQ 客户端同时发言；真实 LLBot 消息 `1197886633` 已走过当前 v0.4.0 anchor。
+- v0.4.0 直接群管理写工具、非幂等出站断线后的 `uncertain` 与人工 resolve 未执行；未获额外授权时不执行禁言、踢人、撤回或全员禁言。
+- 未在本轮使用 NapCat，也未把 WS 重连重放行为提升为 OneBot 11 协议保证；LLBot 关闭时仍出现已有 Discord/Weixin 关闭异常和 OneBot disconnect timeout，但不影响本次重启后的 v0.4.0 gateway active。
 
 ## 约束与取舍
 

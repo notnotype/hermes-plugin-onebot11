@@ -34,7 +34,7 @@
 
 ## 外部验收边界
 
-Arch 联调只允许群 `1072992996` 与私聊用户 `2056963663`。未获额外授权时不执行禁言、踢人、撤回或全员禁言。当前联调尚未开始：SSH host key 与本机 `known_hosts` 不一致，待确认主机指纹后再部署。真人双用户触发、⏳ Emoji ID、重启 reaction 清理和 v0.4.0 unknown 行为仍需真实 LLBot/NapCat 验证。
+Arch 联调只允许群 `1072992996` 与私聊用户 `2056963663`。2026-08-08 已在 `192.168.1.18` 部署 commit `f8c14ac` / v0.4.0，并验证 schema v9 迁移、两个独立 @ anchor、普通用户权限拒绝、允许 DM、非白名单拒绝和 reaction recovery。两个 anchor 使用真实反向 WS 的合成 payload；未执行禁言、踢人、撤回、全员禁言或 unknown 管理动作。
 
 ## 后续
 

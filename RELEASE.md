@@ -26,4 +26,4 @@ v0.4.0 是触发与权限行为升级：QueueStore v8 → v9 自动迁移；`req
 
 升级前停止 Hermes 并备份队列和配置。无法证明单一 authority 的旧 batch 会进入 legacy hold，不会自动执行。完整步骤见：[docs/migrations/2026-08-07-v0.4.0.md](docs/migrations/2026-08-07-v0.4.0.md)。
 
-当前 v0.4.0 已通过本地 Hermes smoke 和 `242 passed`/Ruff 门禁；真实 Arch/LLBot 联调仍待确认 SSH host key 后完成。联调白名单只允许群 `1072992996` 与私聊用户 `2056963663`。
+当前 v0.4.0 已通过本地 Hermes smoke、`242 passed`/Ruff 门禁，并在 Arch `192.168.1.18` 完成指定白名单 smoke。真人双用户同时发言、群管理写工具和 unknown resolve 仍未执行；联调白名单只允许群 `1072992996` 与私聊用户 `2056963663`。
