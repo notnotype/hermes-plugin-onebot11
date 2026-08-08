@@ -35,15 +35,15 @@
 
 ## 验证
 
-- 当前本地完整环境：使用 Hermes 源码和 site-packages 导入真实 gateway，`272 passed`；没有因缺少 Hermes 依赖跳过 adapter 测试。独立 `.venv` 无 gateway 时为 `178 passed, 1 skipped`。
+- 当前本地完整环境：使用 Hermes 源码和 site-packages 导入真实 gateway，`274 passed`；没有因缺少 Hermes 依赖跳过 adapter 测试。独立 `.venv` 无 gateway 时为 `179 passed, 1 skipped`。
 - `ruff check .`：通过；`compileall` 和 `git diff --check` 通过。
-- 真实 Hermes `PluginManager` 临时注册 smoke：通过，OneBot 平台、12 个工具、4 个 hooks 和 `onebot11_trigger` auxiliary 均注册成功。
+- 真实 Hermes `PluginManager` 临时注册 smoke：通过，OneBot 平台、19 个插件工具、4 个 hooks 和 `onebot11_trigger` auxiliary 均注册成功。
 - 覆盖崩溃恢复退避上限、phase fencing、resolve 新 anchor、reaction 状态迁移、分块出站 fencing、binding mismatch、hash message key、HTTP redirect，以及 selector 实际观察游标和失败竞态。
-- Arch 已验证的 `87b8dbd` 是本轮收口前的基线部署；本 worktree 的 authority v10、私聊严格作用域和 reaction 竞态修复尚未重新部署，不把旧 smoke 当作本轮验收证据。
+- Arch 独立 worktree 已部署 Task 5 提交 `5b657e5`；只读核对确认 Hermes/反向 WS/LLBot compose 运行中且 QueueStore 为 schema v10。合成 WS 入站 smoke 不等同于真人 QQ 客户端；真实 QQ reply、reaction 重启清理和 unknown 出站仍不计为通过。
 
 ## 外部验收边界
 
-Arch 联调只允许群 `1072992996` 与私聊用户 `2056963663`。已完成的旧基线 smoke 使用真实反向 WS 的合成 payload，验证了 shared session、独立 anchor、允许私聊和 reaction；当前修复完成后需重新部署再验证 authority 恢复、reaction discard/restart、严格私聊作用域和非白名单恢复。未执行禁言、踢人、撤回、全员禁言或 unknown 管理动作；合成 payload 不等同于真人 QQ 客户端协议保证。
+Arch 联调只允许群 `1072992996` 与私聊用户 `2056963663`。Task 5 当前部署已完成合成反向 WS 入站/持久状态 smoke，验证范围包括 shared session、独立 anchor、authority 快照和 schema v10；真实 QQ 客户端 reply、reaction discard/restart、严格私聊作用域、非白名单恢复和 unknown 管理动作不因合成 payload 自动视为通过。未执行禁言、踢人、撤回或全员禁言；合成 payload 不等同于真人 QQ 客户端协议保证。
 
 ## 后续
 

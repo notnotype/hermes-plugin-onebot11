@@ -26,4 +26,4 @@ v0.4.0 是触发与权限行为升级：QueueStore v8/v9 → v10 自动迁移；
 
 升级前停止 Hermes 并备份队列和配置。无法证明单一 authority 的旧 batch 会进入 legacy hold，不会自动执行。完整步骤见：[docs/migrations/2026-08-07-v0.4.0.md](docs/migrations/2026-08-07-v0.4.0.md)。
 
-v0.4.0 当前仍未合并/发布；本 worktree 使用 Hermes 源码和 site-packages 的完整测试为 `272 passed`，Ruff 与 compileall 已通过。Arch 已部署的 `87b8dbd` 是修复前基线，当前 authority v10/严格作用域修复仍需重新联调；这不等同于真人 QQ 或 OneBot 11 exactly-once 保证。白名单仍只允许群 `1072992996` 与私聊用户 `2056963663`。
+v0.4.0 当前仍未合并/发布；本 worktree 使用 Hermes 源码和 site-packages 的完整测试为 `274 passed`，Ruff、compileall 与 `git diff --check` 已通过。Task 5 提交 `5b657e5` 已部署到 Arch 独立 worktree，QueueStore schema v10、Hermes 进程、反向 WS `18880` 和 LLBot compose 已只读核对；外部输入使用合成 WS payload，真实 QQ reply/reaction/unknown 仍不计为已验收。这不等同于真人 QQ 或 OneBot 11 exactly-once 保证。白名单仍只允许群 `1072992996` 与私聊用户 `2056963663`。
