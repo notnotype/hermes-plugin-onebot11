@@ -59,7 +59,7 @@
 
 外部验收边界：
 
-- 两个 anchor 和权限测试使用真实反向 WS 连接注入的合成 OneBot payload，不等同于两名真人 QQ 客户端同时发言；当前 `TASK5_ANCHOR_A/B` 也属于该边界。reaction set 在本次 LLBot 返回失败，插件未自动重试且没有遗留 reaction 记录；这记录为实际框架行为，不升级为 OneBot 11 协议保证。
+- 两个 anchor 和权限测试使用真实反向 WS 连接注入的合成 OneBot payload，不等同于两名真人 QQ 客户端同时发言；当前 `TASK5_ANCHOR_A/B` 也属于该边界。合成 payload 使用的伪造 message ID 无法用于 reaction，LLBot 对其返回失败；随后使用真实群消息 ID `2119419776` 完成 `set=true -> set=false`，证明当前 LLBot action 可用。该结果不升级为 OneBot 11 exactly-once 保证。
 - v0.4.0 直接群管理写工具、非幂等出站断线后的 `uncertain` 与人工 resolve 未执行；未获额外授权时不执行禁言、踢人、撤回或全员禁言。
 - 未在本轮使用 NapCat，也未把 WS 重连重放行为提升为 OneBot 11 协议保证；LLBot 关闭时仍出现已有 Discord/Weixin 关闭异常和 OneBot disconnect timeout，但不影响本次重启后的 v0.4.0 gateway active。
 

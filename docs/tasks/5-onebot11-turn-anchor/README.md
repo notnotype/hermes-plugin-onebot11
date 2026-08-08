@@ -39,7 +39,7 @@
 
 ## 外部验收边界
 
-Arch 联调只允许群 `1072992996` 与私聊用户 `2056963663`。当前 `87b8dbd` 已通过真实反向 WS 的合成 payload 验证：普通用户和超级管理员各创建一个独立 message anchor，分别得到 `TASK5_ANCHOR_A/B`；允许私聊得到 `TASK5_DM`；收尾后 queue、trigger、reaction 均为空，gateway 保持 active。未执行禁言、踢人、撤回、全员禁言、unknown 管理动作或非白名单目标事件；合成 payload 不等同于真人 QQ 客户端协议保证。
+Arch 联调只允许群 `1072992996` 与私聊用户 `2056963663`。当前 `87b8dbd` 已通过真实反向 WS 的合成 payload 验证：普通用户和超级管理员各创建一个独立 message anchor，分别得到 `TASK5_ANCHOR_A/B`；允许私聊得到 `TASK5_DM`；收尾后 queue、trigger、reaction 均为空，gateway 保持 active。合成 payload 的伪造 message ID 不能验证 reaction；另用真实群消息 ID `2119419776` 完成 `set=true -> set=false`。未执行禁言、踢人、撤回、全员禁言、unknown 管理动作或非白名单目标事件；合成 payload 不等同于真人 QQ 客户端协议保证。
 
 ## 后续
 
