@@ -80,7 +80,15 @@ optional_env:
     description: "可选 pi-ai 旁路 model；启用 LLM trigger 时必须明确配置"
     prompt: "LLM trigger model"
     password: false
+  - name: ONEBOT11_LLM_TRIGGER_BASE_URL
+    description: "custom provider 的 OpenAI-compatible HTTP/HTTPS 地址"
+    prompt: "LLM trigger base URL"
+    password: false
   - name: ONEBOT11_LLM_TRIGGER_API_KEY_ENV
     description: "API key 环境变量名，不是 API key 值"
     prompt: "LLM trigger API key 环境变量名"
+    password: false
+  - name: ONEBOT11_LLM_TRIGGER_GROUPS
+    description: "允许 selector 调用旁路模型的群号列表（逗号分隔）"
+    prompt: "LLM trigger 群白名单"
     password: false

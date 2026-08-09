@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -139,3 +140,78 @@ async def test_pi_ai客户端超时会结束helper(monkeypatch: pytest.MonkeyPat
         await client.complete("判断", timeout_seconds=0.01)
     assert error.value.kind == "timeout"
     assert process.killed
+
+
+@pytest.mark.asyncio
+async def test_pi_ai真实custom_endpoint使用system_prompt和环境变量key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实 helper 必须能调用本地 OpenAI-compatible endpoint。"""
+    plugin_root = Path(__file__).resolve().parents[1]
+    if (
+        shutil.which("node") is None
+        or not (plugin_root / "node_modules" / "@earendil-works" / "pi-ai").is_dir()
+    ):
+        pytest.skip("未安装 Node.js 或 pi-ai npm 依赖")
+
+    expected = '{"decision":"ignore","wait_seconds":0}'
+    captured: dict[str, object] = {}
+
+    async def handle(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        """读取一次 OpenAI-compatible 请求并返回最小 SSE 响应。"""
+        request_line = await reader.readline()
+        headers: dict[str, str] = {}
+        while True:
+            line = await reader.readline()
+            if line in {b"", b"\r\n"}:
+                break
+            name, separator, value = line.decode("latin-1").partition(":")
+            if separator:
+                headers[name.casefold()] = value.strip()
+        content_length = int(headers.get("content-length", "0"))
+        body = await reader.readexactly(content_length) if content_length else b""
+        captured["path"] = request_line.decode("latin-1").split(" ", 2)[1]
+        captured["authorization"] = headers.get("authorization", "")
+        captured["body"] = json.loads(body.decode("utf-8"))
+        events = (
+            f"data: {json.dumps({'id': 'test', 'object': 'chat.completion.chunk', 'created': 1, 'model': 'test-model', 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': expected}, 'finish_reason': None}]}, ensure_ascii=False)}\n\n"
+            f"data: {json.dumps({'id': 'test', 'object': 'chat.completion.chunk', 'created': 1, 'model': 'test-model', 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+            "data: [DONE]\n\n"
+        ).encode()
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/event-stream\r\n"
+            b"Cache-Control: no-cache\r\n"
+            b"Connection: close\r\n"
+            + f"Content-Length: {len(events)}\r\n\r\n".encode("ascii")
+            + events
+        )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = int(server.sockets[0].getsockname()[1])
+    monkeypatch.setenv("ONEBOT11_TEST_TRIGGER_KEY", "local-test-secret")
+    client = PiAiTriggerClient(
+        provider="custom",
+        model="test-model",
+        base_url=f"http://127.0.0.1:{port}/v1",
+        api_key_env="ONEBOT11_TEST_TRIGGER_KEY",
+    )
+    try:
+        result = await client.complete("本地 custom provider smoke", timeout_seconds=5)
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert result == expected
+    assert captured["path"] == "/v1/chat/completions"
+    assert captured["authorization"] == "Bearer local-test-secret"
+    body = captured["body"]
+    assert isinstance(body, dict)
+    assert body["messages"][0]["role"] == "system"
+    assert body["messages"][1]["content"] == "本地 custom provider smoke"

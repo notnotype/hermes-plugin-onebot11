@@ -27,13 +27,14 @@
 
 ## 验证证据
 
-- `.venv\\Scripts\\python.exe -m pytest -q`：`165 passed, 1 skipped`；纯插件环境只跳过没有 Hermes gateway 的 adapter 集成测试。
+- `.venv\\Scripts\\python.exe -m pytest -q`：`166 passed, 1 skipped`；纯插件环境只跳过没有 Hermes gateway 的 adapter 集成测试。
 - `.venv\\Scripts\\python.exe -m ruff check .`：通过。
 - `uv pip install --python .venv\\Scripts\\python.exe -e ".[dev]" --no-deps`：editable build 通过；`import onebot11` 通过。当前精简 `.venv` 没有 pip 模块，因此使用 uv 完成等价安装验证。
 - `scripts/verify_hermes_integration.py` 已移除 Hermes auxiliary 注入和 strict 参数检查；当前 smoke 目标是最新 Hermes 组合、9 个工具、4 个 hooks、shared session、queue recovery、reconnect、图片 base64 segment 和 pi-ai helper 离线失败分类。
 - `@earendil-works/pi-ai@0.83.0` 已固定在 `package-lock.json`；Node helper 缺失、provider/model 不存在、超时、非零退出和非法输出均按不触发处理。
 - `npm ci --omit=dev`、`node --check scripts/onebot11-pi-trigger.mjs`：通过。
-- Hermes `v0.20.0` 本地组合：`248 passed`，smoke 通过，`tools=9 hooks=4 pi_ai_trigger=True reconnect=True`；不再注入 auxiliary worktree，也不修改 Hermes 源码。
+- 自定义 OpenAI-compatible endpoint 本地 smoke：通过；验证 `systemPrompt`、`/v1/chat/completions`、环境变量 Bearer key 和严格 JSON 返回。
+- Hermes `v0.20.0` 本地组合：`249 passed`，smoke 通过，`tools=9 hooks=4 pi_ai_trigger=True reconnect=True`；不再注入 auxiliary worktree，也不修改 Hermes 源码。
 - Hermes strict auxiliary/media 结果合同不再是本插件依赖，也不创建 Hermes PR；旧 Hermes 的差异只保留为历史调研，不进入当前 adapter 代码。
 
 ## 外部联调状态

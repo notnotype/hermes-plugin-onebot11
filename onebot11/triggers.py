@@ -552,6 +552,10 @@ def build_trigger_config(extra: dict[str, Any]) -> TriggerConfig:
         raise ValueError("llm_trigger provider/model 必须是字符串")
     provider = raw_provider.strip()
     model = raw_model.strip()
+    if provider.casefold() == "custom":
+        # Node helper 使用这个保留字选择 OpenAI-compatible 自定义 provider；
+        # 统一大小写，避免配置验证通过但运行时被当作内置 provider。
+        provider = "custom"
     if llm_enabled and (not provider or not model):
         raise ValueError("启用 LLM trigger 时必须配置 provider 和 model")
     raw_base_url = _setting(extra, raw_llm, "llm_trigger_base_url", raw_llm.get("base_url", ""))

@@ -198,6 +198,19 @@ def test_custom_llm_trigger必须使用安全endpoint和环境变量():
     )
     assert runtime.trigger_config.llm_base_url == "https://example.invalid/v1"
     assert runtime.trigger_config.llm_api_key_env == "ONEBOT11_TRIGGER_KEY"
+    uppercase_runtime = parse_runtime_config(
+        _extra(
+            llm_trigger={
+                "enabled": True,
+                "provider": "CUSTOM",
+                "model": "small",
+                "base_url": "https://example.invalid/v1",
+                "api_key_env": "ONEBOT11_TRIGGER_KEY",
+                "groups": ["888"],
+            }
+        )
+    )
+    assert uppercase_runtime.trigger_config.llm_provider == "custom"
     with pytest.raises(ValueError):
         parse_runtime_config(
             _extra(
