@@ -26,6 +26,7 @@ QUERY_ACTIONS = frozenset(
         "get_group_info",
         "get_group_member_info",
         "get_group_list",
+        "get_image",
     }
 )
 WRITE_ACTIONS = frozenset(
@@ -490,6 +491,22 @@ class OneBotHttpApi:
     async def get_message(self, message_id: str) -> dict:
         """查询单条消息。"""
         return await self.call_action("get_msg", {"message_id": int(message_id)})
+
+    async def get_image(self, file_id: str) -> str | None:
+        """通过 OneBot 解析 file 标识，只接受可再次安全校验的 HTTP URL。"""
+        normalized = str(file_id or "").strip()
+        if not normalized:
+            raise ValueError("图片 file 标识不能为空")
+        data = await self.call_action("get_image", {"file": normalized})
+        url = data.get("url")
+        if not isinstance(url, str):
+            return None
+        normalized_url = url.strip()
+        return (
+            normalized_url
+            if normalized_url.startswith(("http://", "https://"))
+            else None
+        )
 
     async def get_group_msg_history(self, group_id: str, count: int = 20) -> list[dict]:
         """查询群消息历史。"""

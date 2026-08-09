@@ -214,31 +214,36 @@ class GroupDispatcher:
         try:
             while not self._closed:
                 await asyncio.sleep(self.recovery_poll_seconds)
-                requests = await asyncio.to_thread(
-                    self.store.recover_trigger_requests,
-                    self._recovery_chat_ids()
-                    if self._recovery_chat_ids is not None
-                    else None,
-                )
-                for request in requests:
-                    chat_id = request.chat_id
-                    if (
-                        not self._can_dispatch(chat_id)
-                        or chat_id in self._active
-                        or chat_id in self._recovery_dispatch_tasks
-                    ):
-                        continue
-                    task = asyncio.create_task(self.notify(chat_id))
-                    self._recovery_dispatch_tasks[chat_id] = task
-                    task.add_done_callback(
-                        lambda finished, chat_id=chat_id: self._finish_recovery_dispatch(
-                            chat_id, finished
-                        )
+                try:
+                    requests = await asyncio.to_thread(
+                        self.store.recover_trigger_requests,
+                        self._recovery_chat_ids()
+                        if self._recovery_chat_ids is not None
+                        else None,
                     )
+                    for request in requests:
+                        chat_id = request.chat_id
+                        if (
+                            not self._can_dispatch(chat_id)
+                            or chat_id in self._active
+                            or chat_id in self._recovery_dispatch_tasks
+                        ):
+                            continue
+                        task = asyncio.create_task(self.notify(chat_id))
+                        self._recovery_dispatch_tasks[chat_id] = task
+                        task.add_done_callback(
+                            lambda finished, chat_id=chat_id: self._finish_recovery_dispatch(
+                                chat_id, finished
+                            )
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # SQLite/OneBot 临时故障只影响当前轮询；下一轮仍需继续
+                    # 尝试，不能把整个恢复后台 task 静默杀死。
+                    logger.exception("OneBot11 lease 恢复轮询单轮失败")
         except asyncio.CancelledError:
             return
-        except Exception:
-            logger.exception("OneBot11 lease 恢复轮询失败")
 
     def _finish_recovery_dispatch(self, chat_id: str, task: asyncio.Task[None]) -> None:
         """清理恢复任务引用，并记录启动失败。"""

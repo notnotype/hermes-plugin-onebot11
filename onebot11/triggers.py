@@ -288,6 +288,11 @@ class LayeredTriggerState:
             or has_hard_trigger
             or self.mode in {"debounce", "judging", "waiting"}
         ):
+            if not success:
+                # 失败 turn 不得继承成功回复建立的 engaged；同时令尚未返回的
+                # 旁路结果失效，避免旧 task 在失败后重新唤醒群。
+                self._judgement_generation += 1
+                self._leave_engaged()
             return
         self._judgement_generation += 1
         self.debounce_due = None

@@ -159,3 +159,29 @@ async def test_reopen会取消旧heartbeat和恢复任务(tmp_path):
     assert not dispatcher._closed
     await dispatcher.close()
     store.close()
+
+
+async def test_recovery_loop单轮异常后继续运行(tmp_path, monkeypatch):
+    """一次 SQLite 临时异常不能让恢复轮询永久退出。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    calls = 0
+
+    def flaky_recovery(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("temporary sqlite failure")
+        return ()
+
+    monkeypatch.setattr(store, "recover_trigger_requests", flaky_recovery)
+    dispatcher = GroupDispatcher(
+        store,
+        lambda _lease: asyncio.sleep(0),
+        recovery_poll_seconds=0.01,
+    )
+    dispatcher._ensure_recovery_loop()
+    await asyncio.sleep(0.2)
+
+    assert calls >= 2
+    await dispatcher.close()
+    store.close()

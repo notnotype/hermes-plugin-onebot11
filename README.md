@@ -9,9 +9,36 @@
 - **连续对话**：成功回复后进入最多 60 秒的活跃窗口；窗口内普通消息经过 5 秒 trailing debounce，再交给低成本旁路模型判断是否回复，单窗口最多仲裁 3 次。
 - **处理指示器**：群 turn 认领后给触发消息添加 👀，Hermes turn 收尾时自动移除；没有真实消息 ID 或 QQ 框架不支持该扩展时按 best-effort 跳过，不影响回复。
 - **上下文**：队列有条数、字节数和单条消息上限，确认后形成滚动摘要，并保留最近消息原文；当前批次作为普通 user message，摘要优先通过 Hermes `channel_prompt` 临时注入，不重复写入 shared session transcript。旧 Hermes 不支持时退回有界文本模式并记录审计。
-- **图片与消息段**：兼容 array/CQ 字符串，支持图片、reply、文件、语音、视频、转发和未知段标记；入站图片下载有 host、端口、类型、魔数和大小限制，出站图片使用受限 `base64://` segment，适配 Hermes 宿主机与 LLBot 容器路径隔离。
+- **图片与消息段**：兼容 array/CQ 字符串，支持图片、reply、文件、语音、视频、转发和未知段标记；入站图片下载有 host、端口、类型、魔数和大小限制，OneBot 只提供 `file` 标识时先调用 `get_image` 解析，出站图片使用受限 `base64://` segment，适配 Hermes 宿主机与 LLBot 容器路径隔离。
 - **工具与管理**：提供当前群/私聊范围内的查询工具，以及撤回、禁言、踢人、全员禁言工具。写操作只生成预览，必须由同一超级管理员在同一目标群发送短期确认命令。
 - **可靠性**：队列支持崩溃恢复、去重、lease heartbeat 和人工处理 `uncertain` 出站结果。OneBot 非幂等请求不自动重试、unknown 不走 plain-text 或 cron standalone fallback，不承诺 exactly-once。
+
+当前 `0.5.0` 收口代码在 Issue #13 分支上开发，并已按该分支部署到 Arch。Arch 使用
+`/home/notnotype/CodeRepository/hermes-plugin-onebot11` 作为唯一源码 checkout，
+`/home/notnotype/.hermes/plugins/onebot11-platform` 通过 symlink 指向该 checkout；
+Hermes 由 `systemctl --user hermes-gateway.service` 管理。当前部署 commit 为
+`fc81edf`，queue 已迁移到 schema 11。Arch Hermes 仍是旧版本，因此会安全禁用严格旁路
+LLM trigger 与 OneBot 出站图片，不会偷偷回退主模型或把图片 URL 当文本发送。插件本地测试、
+Hermes 独立 worktree 组合测试和真实 Arch/LLBot 验收是三种不同证据，不能互相替代。
+
+## Arch 部署约定
+
+Arch 不再使用手工复制的插件目录。日常更新流程是：
+
+```bash
+# 本机：完成代码、测试并推送目标分支
+git push origin <branch>
+
+# Arch：只快进更新源码 checkout
+cd /home/notnotype/CodeRepository/hermes-plugin-onebot11
+git pull --ff-only
+systemctl --user restart hermes-gateway.service
+```
+
+部署前后检查 `git log -1`、`systemctl --user is-active hermes-gateway.service`、
+`ss -ltnp | grep 18880` 和当前 OneBot 白名单。当前受控部署只允许群
+`1072992996`、私聊用户 `2056963663` 和机器人 `3101482118`。如需回滚，在 Arch
+checkout 中切换到已验证 commit 后重启服务，不直接改写 Hermes 插件目录。
 
 ## 环境要求
 
@@ -146,8 +173,9 @@ LLM trigger 默认关闭，启用时必须同时配置明确的旁路 `provider`
 出站图片只接受 Hermes 允许的媒体目录中的 PNG、JPEG、GIF、WebP，发送前
 编码为 `base64://` OneBot image segment，并可带 caption/reply。旧 Hermes
 缺少媒体结果合同或返回 unknown 时，插件不会把图片 URL/路径发成普通文本，
-也不会自动重发整轮 Agent。当前图片/unknown 结果合同已在本地 Hermes 组合环境
-验证；部署到真实 Agent 前还需要安装对应的 Hermes 独立 PR。
+也不会自动重发整轮 Agent。当前图片/unknown 结果合同已在本地 Hermes 独立 worktree
+组合环境验证（插件组合 `263 passed`，strict auxiliary 定向 `3 passed`）；部署到真实
+Agent 前还需要交付对应的 Hermes 独立 PR。
 
 ## 权限说明
 
@@ -196,6 +224,10 @@ python scripts/verify_hermes_integration.py \
 不会把测试队列、审计或 session 写入真实 Hermes home。CI 只负责插件可安装、`onebot11/`
 协议/状态机测试和 Ruff；Hermes 组合测试是本地验收证据。纯插件环境只保证
 `import onebot11`，根目录 `adapter.py` 需要 Hermes gateway 依赖。
+
+当前本地证据为：纯插件 `171 passed, 1 skipped`，Hermes 组合 `263 passed`；
+Arch/LLBot 已完成源码 checkout、schema 迁移、服务启动、WS 建连和旧 pending 清理；
+当前版本真人并发、重启恢复和 unknown 管理动作仍需单独验收。
 
 ## License
 

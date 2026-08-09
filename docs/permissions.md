@@ -61,6 +61,8 @@ platforms:
 
 出站目标使用明确的 `ChatTarget(group|dm, chat_id)`。当前 turn 只能向它绑定的目标发送；同一个数字同时被识别为群号和 QQ 号时，未带明确类型的发送会被拒绝。
 
+binding 还带有 `task_id`、adapter epoch 和 lease id。旧 task、旧 ContextVar 或旧 epoch 即使在 reconnect 后延迟运行，也不能获得新 turn 的工具/出站权限；completion 清理必须匹配完整 snapshot，不能只按复用的 `(session_id, turn_id)` 删除新 binding。持久 TurnAnchor 的 authority 只能收紧：如果超级管理员被撤销，旧 anchor 最多降为当前用户的只读角色，不能因为旧快照重新获得写权限；损坏、缺失或属于其他机器人的 `self_id` 快照进入 `uncertain`。
+
 ## 队列与不确定结果
 
 群队列是持久 SQLite 状态机；当前 schema 为 11，启动时真实迁移支持 v7/v8/v9/v10 表结构。缺少或损坏 authority 快照的旧 anchor 会进入 `uncertain`，不自动执行；同一群可以有多个 pending TurnAnchor，但同一时间最多一个活动 lease，并按 anchor 序号串行处理。每个 anchor 绑定一个真实消息和固定 batch 边界，后续消息不会被旧 turn 偷吃。旧 lease 在失败、恢复或断开结算时保留自己的 anchor，不会通过唯一索引冲突卡住后续 anchor。
@@ -81,7 +83,10 @@ failed --管理员 discard--> deleted
 
 主动 disconnect 不增加失败次数；只有过期的明确 `agent_running` lease 才消耗有限恢复预算。lease phase 缺失或未知时统一进入 `uncertain`，不自动重放。
 
-OneBot 出站图片只能来自 Hermes 允许的媒体根目录，并在发送前校验扩展名、
+OneBot 入站图片只保存受限媒体标记；如果消息只有非 HTTP `file` 标识，先通过
+`get_image` 查询动作解析为 HTTP/HTTPS URL，再重复执行媒体 SSRF、host、端口、
+Content-Type、魔数和大小校验。不会猜测宿主机路径，也不会把 OneBot Bearer token
+发送到外部媒体地址。出站图片只能来自 Hermes 允许的媒体根目录，并在发送前校验扩展名、
 魔数和大小；插件把文件编码为受限 `base64://` image segment，不向外部
 图片 URL 携带 OneBot Bearer token，也不把失败的图片 URL/路径回退成文本。
 Hermes 会聚合每个图片块的 `SendResult`：图片-only turn 只有全部明确成功才

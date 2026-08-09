@@ -1,7 +1,7 @@
 # Task 3：OneBot 11 分层触发与活跃窗口
 
 - 关联 Issue：[Issue #5：OneBot 11 分层触发与活跃窗口](https://github.com/notnotype/hermes-plugin-onebot11/issues/5)
-- 状态：balanced 策略已落入生产代码，并接入 TurnAnchor；spike 保留为设计依据
+- 状态：balanced 策略已落入代码，并接入 TurnAnchor；Issue #13 收口分支继续保留其严格顺序、authority shrink 和旧 Hermes 安全降级；spike 保留为设计依据
 - 类型：逻辑/状态机 + Hermes auxiliary 集成
 
 ## 背景
@@ -55,4 +55,4 @@ Hermes 自优化只适合生成配置 diff/建议并由管理员审核，不允�
 
 ## 计划出入
 
-spike 没有接真实 provider；生产代码通过 Hermes auxiliary API 接入显式旁路 provider/model，并把 provider fallback 与隐式重试关掉。Hermes 侧的 strict 参数和 OneBot 插件分成两个 PR，插件在旧 API 上安全禁用 LLM trigger。没有加入 RAG、向量库、自动语义压缩或运行时自优化。活跃窗口仍是内存状态，重启后回到 idle，只恢复 SQLite 消息和显式 trigger request。
+spike 没有接真实 provider；生产代码通过 Hermes auxiliary API 接入显式旁路 provider/model，并把 provider fallback 与隐式重试关掉。Hermes 侧的 strict 参数和 OneBot 插件分成两个 PR，插件在旧 API 上安全禁用 LLM trigger。Issue #13 的组合证据为插件 `263 passed` 加 strict auxiliary `3 passed`，但 Arch 仍运行旧 Hermes，不能把本地 worktree 证据称为已部署能力。没有加入 RAG、向量库、自动语义压缩或运行时自优化。活跃窗口仍是内存状态，重启后回到 idle，只恢复 SQLite 消息和显式 trigger request。

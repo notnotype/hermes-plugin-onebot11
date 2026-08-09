@@ -1,8 +1,8 @@
 # Task 5：OneBot 11 TurnAnchor 与 shared session 收口
 
 - 关联需求：OneBot 11 原始需求中的“群一个 shared session + 队列上下文”
-- 状态：本地实现和 Hermes 媒体/unknown 组合验证完成；将以 `fix/i9-turn-anchor-contract` 独立插件 PR 交付。真实 OneBot adapter 图片/reaction smoke 已通过，但真实 Agent 图片 pipeline、真人并发、unknown resolve 和 Hermes 独立媒体 PR 仍未完成。
-- 分支：`fix/i9-turn-anchor-contract`
+- 状态：PR #12 已合并；Issue #13 的 `fix/i13-onebot11-closeout` 在 PR #12 基础上补齐恢复顺序、authority shrink、旧 task/epoch fencing、畸形 WS 隔离、`get_image` 和图片发送前置检查，已创建插件 PR #14 且 CI 通过。真实 Agent 图片 pipeline、真人并发、unknown resolve 和 Hermes 独立 PR 仍未完成。
+- 分支：`fix/i13-onebot11-closeout`
 
 ## 目标
 
@@ -21,9 +21,9 @@
 4. selector 使用显式 message key；目标消息消失时丢弃旧判断，不静默改绑到最早消息。
 5. queue turn 从 anchor 真实消息推导 `CallerContext`，写入 anchor id/seq/kind/message id 元数据。
 6. `👀` reaction 和 reply 只使用真实 anchor message id；内部 hash 不作为 OneBot 目标。
-7. `trusted_user` 通过 `roles.trusted_user.users` 配置，只允许明确配置的只读工具，不能修改权限或白名单。
+7. `trusted_user` 通过 `roles.trusted_user.users` 配置，只允许明确配置的只读工具，不能修改权限或白名单；旧 authority 只能按当前角色收紧，不能扩大。
 8. 旧 Hermes 不支持 strict auxiliary 或 `channel_prompt` 时安全降级并审计；不回退主 Agent。
-9. OneBot 出站图片使用 Hermes 允许目录中的 `base64://` segment；Hermes 媒体结果全部明确成功才确认 image-only turn，unknown 不重试、不 fallback。
+9. OneBot 入站 `file` 图片先通过 `get_image` 解析；出站图片使用 Hermes 允许目录中的 `base64://` segment；Hermes 媒体结果全部明确成功才确认 image-only turn，unknown 不重试、不 fallback。
 
 ## 不纳入
 
@@ -35,7 +35,7 @@
 ## 验证
 
 - 纯插件：`pytest -q`、`ruff check .`、editable install、`import onebot11`。
-- Hermes 组合：`scripts/verify_hermes_integration.py` 使用临时 `HERMES_HOME` 验证真实注册、9 个工具、4 个 hooks、shared session、TurnAnchor authority、reconnect、queue recovery、图片 base64 segment 和 strict auxiliary。
+- Hermes 组合：`scripts/verify_hermes_integration.py` 使用临时 `HERMES_HOME` 验证真实注册、9 个工具、4 个 hooks、shared session、TurnAnchor authority、reconnect、queue recovery、图片 base64 segment 和 strict auxiliary；当前结果为 `263 passed`，strict auxiliary 定向 `3 passed`。
 - 外部：只允许群 `1072992996`、用户 `2056963663`，机器人 QQ `3101482118`；已验证真实历史 message ID 的 reaction 添加/移除、TurnAnchor batch 边界、重启 pending 保留和白名单外拒绝，并在隔离 queue 上验证真实 OneBot image-only、文字+图片和多图 `base64://` segment。该 smoke 未经过生产 Agent pipeline；真人并发、部分成功/unknown resolve 和生产 schema 10→11 迁移仍需联调。
 
 ## 计划出入
