@@ -84,8 +84,9 @@ failed --管理员 discard--> deleted
 OneBot 出站图片只能来自 Hermes 允许的媒体根目录，并在发送前校验扩展名、
 魔数和大小；插件把文件编码为受限 `base64://` image segment，不向外部
 图片 URL 携带 OneBot Bearer token，也不把失败的图片 URL/路径回退成文本。
-Hermes 会聚合每个图片块的 `SendResult`：图片-only turn 只有全部明确成功才
-允许 ack，部分成功或 unknown 进入失败/uncertain 生命周期。
+Agent 最终回复图片是 best-effort；图片-only、文字+图片和多图都由插件逐块
+尝试发送，部分成功或 unknown 不自动重放整轮 Agent。通用 `send_message`、
+cron 和 standalone sender 的 plugin media 不在本轮可靠性合同内。
 
 ## 运维命令
 
@@ -102,7 +103,8 @@ Hermes 会聚合每个图片块的 `SendResult`：图片-only turn 只有全部�
 - @、关键词、`always` 和管理员命令直接创建持久 trigger，不调用 LLM。
 - 空闲状态只把问句或带有“之前/上次/刚才/继续”等回指词、且当前群已有摘要或最近原文的消息送入候选。
 - 候选消息使用 5 秒 trailing debounce；每群最多一个判断任务，冷却期间不创建判断。
-- 旁路模型必须显式配置 provider、model 和群 allowlist，并且 Hermes auxiliary API 必须支持 `fallback_policy`、`max_attempts`。插件固定使用 `fallback_policy=none`、`max_attempts=1`；旧 API 会安全跳过，绝不调用主 Agent 作为隐式 fallback。
+- 旁路模型必须显式配置 provider、model 和群 allowlist。判断由插件自有 Node/pi-ai helper 发起，不经过 Hermes auxiliary，不调用主 Agent 作为隐式 fallback，也不主动切换 provider。`api_key_env` 只保存环境变量名，密钥值只从进程环境读取。
+- 启用旁路判断需要 Node.js ≥22.19 和插件目录中的 `npm ci --omit=dev`；Node、依赖、provider/model、超时或模型结果异常时按 `ignore`，消息保留在 pending。
 - 模型只能返回 `{"decision":"trigger|wait|ignore","wait_seconds":0}`。`wait` 的 `wait_seconds` 只能为 `5/10/30/60`，`trigger` 和 `ignore` 必须为 `0`；非法 JSON、超时、模型错误均按 `ignore`，消息留在 pending，不创建 lease。
 - 成功 turn 后进入最多 60 秒 idle 活跃窗口，最长连续活跃时间 300 秒，最多 3 次 LLM 仲裁；重启后 active/engaged 状态回到 idle，只恢复 SQLite 消息和显式 durable trigger。
 - status 中的 debounce/wait/engaged 时间以剩余秒数展示；LLM 审计区分实际 semaphore 等待时长、模型失败和结果未知。

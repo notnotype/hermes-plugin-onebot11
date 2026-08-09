@@ -17,6 +17,7 @@
 
 - Hermes Agent（源码安装,版本 ≥ 0.20）
 - Python ≥ 3.11
+- Node.js ≥ 22.19（仅启用 LLM trigger 时需要）
 - 一个支持 OneBot 11 的 QQ 框架,比如 [LLBot](https://luckylillia.com) 或 [NapCat](https://napneko.github.io/)
 
 ## 安装
@@ -76,6 +77,11 @@ hermes plugins install notnotype/hermes-plugin-onebot11
 | `ONEBOT11_QUEUE_DB` | Hermes home | SQLite 队列路径；未配置时使用 Hermes home 下的 `onebot11/queue.sqlite3` |
 | `ONEBOT11_HOME_CHANNEL` | 空 | 定时任务目标 ID；必须同时在 `platforms.onebot11.extra.home_channel_type` 指定 `group` 或 `dm` |
 | `ONEBOT11_HOME_CHANNEL_TYPE` | 空 | 定时任务目标类型：`group` 或 `dm`；不会根据 QQ 号形状猜测 |
+| `ONEBOT11_LLM_TRIGGER_PROVIDER` | YAML 可替代 | 旁路 provider；启用时必须明确配置 |
+| `ONEBOT11_LLM_TRIGGER_MODEL` | YAML 可替代 | 旁路 model；启用时必须明确配置 |
+| `ONEBOT11_LLM_TRIGGER_BASE_URL` | 空 | 自定义 provider 的 HTTP/HTTPS OpenAI-compatible 地址 |
+| `ONEBOT11_LLM_TRIGGER_API_KEY_ENV` | 空 | API key 的环境变量名，不是密钥值 |
+| `ONEBOT11_LLM_TRIGGER_GROUPS` | 空 | 允许调用 selector 的群号列表 |
 
 启动网关时带上环境变量即可,例如：
 
@@ -86,8 +92,9 @@ ONEBOT11_SELF_ID=3101482118 \
 hermes gateway run
 ```
 
-队列、媒体和 LLM trigger 的高级参数放在 Hermes `config.yaml` 的
-`platforms.onebot11.extra` 中（不是环境变量）。默认值已经适合单实例运行；生产部署通常只需要指定持久队列路径、共享 session 合同和恢复参数：
+队列和媒体的高级参数放在 Hermes `config.yaml` 的
+`platforms.onebot11.extra` 中；LLM trigger 的 provider/model/key-env/group
+也可以使用上面的环境变量。默认值已经适合单实例运行；生产部署通常只需要指定持久队列路径、共享 session 合同和恢复参数：
 
 ```yaml
 platforms:
@@ -112,6 +119,8 @@ platforms:
         enabled: false
         provider: ""
         model: ""
+        base_url: ""
+        api_key_env: OPENCODE_API_KEY
         groups: []
         timeout: 10
         input_bytes: 12000
@@ -138,16 +147,18 @@ platforms:
 `queue_recovery_poll_seconds` 只负责发现已过期 lease，不会抢占仍有效的 lease。正常主动断开时，
 未开始出站的 lease 回到 pending 且不消耗失败预算；只有过期的明确 `agent_running` lease
 才按最多 3 次的 2/4/8 秒退避恢复，达到上限进入 `failed`。出站已开始、阶段未知或租约阶段缺失进入 `uncertain`。
-LLM trigger 默认关闭，启用时必须同时配置明确的旁路 `provider`、`model` 和群 allowlist；每群最多一个判断任务，使用 5 秒 debounce 和全局并发上限。判断调用固定使用 `fallback_policy=none`、`max_attempts=1`，不支持这两个 Hermes auxiliary 参数的旧版本会安全禁用 LLM trigger，不回退主模型。缺少模型、超时或返回非法 JSON 都按“不触发”处理。
+LLM trigger 默认关闭，启用时必须同时配置明确的 `provider`、`model` 和群 allowlist；每群最多一个判断任务，使用 5 秒 debounce 和全局并发上限。判断由插件自有 Node helper 通过固定版本 `@earendil-works/pi-ai` 发起，不经过 Hermes auxiliary，不回退 Hermes 主 Agent，也不主动切换 provider。`api_key_env` 只保存环境变量名，密钥值不会进入 YAML、命令行、日志或 SQLite。Node、依赖缺失、超时、非法 JSON 或模型失败都按不触发处理，消息继续留在 pending。
 旁路模型只接受 `{"decision":"trigger|wait|ignore","wait_seconds":0}`；`wait` 时 `wait_seconds` 只能是 `5/10/30/60`，`trigger` 和 `ignore` 必须使用 `0`。非法结果保留队列消息，不创建 lease。
 `media_orphan_ttl_seconds` 到期后由下一次 adapter 启动或 turn 收尾清理遗留媒体目录。
 `processing_reaction_enabled` 默认开启；它使用 LLBot 的 `set_msg_emoji_like` 扩展，只作用于群聊真实消息 ID。添加或移除 reaction 的未知结果不会重放 Agent turn，也不会阻断队列 ack。
 
-出站图片只接受 Hermes 允许的媒体目录中的 PNG、JPEG、GIF、WebP，发送前
-编码为 `base64://` OneBot image segment，并可带 caption/reply。旧 Hermes
-缺少媒体结果合同或返回 unknown 时，插件不会把图片 URL/路径发成普通文本，
-也不会自动重发整轮 Agent。当前图片/unknown 结果合同已在本地 Hermes 组合环境
-验证；部署到真实 Agent 前还需要安装对应的 Hermes 独立 PR。
+出站图片的主要支持场景是 Agent 最终回复（best-effort）：插件只接受 Hermes 允许的媒体
+目录中的 PNG、JPEG、GIF、WebP，发送前编码为 `base64://` OneBot image
+segment，并可带 caption/reply。Hermes 是否提供媒体结果聚合不影响插件启动；
+图片返回 unknown 时，插件不会把图片 URL/路径发成普通文本，也不会自动重发整轮 Agent。
+通用 `send_message`、cron 和跨进程 standalone sender 的 plugin media
+目前不是本插件的可靠性合同；这些窄路径保持文本能力和安全降级，不影响主 Agent
+回复链路。
 
 ## 权限说明
 
@@ -169,30 +180,32 @@ LLM trigger 默认关闭，启用时必须同时配置明确的旁路 `provider`
 # 安装开发依赖
 python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
+npm ci
 
-# 测试 + lint
+# 测试 + lint + helper 语法
 pytest -q
 ruff check .
+node --check scripts/onebot11-pi-trigger.mjs
 ```
 
-需要真实 Hermes gateway 的 adapter、hooks、shared session、strict auxiliary 和同实例 reconnect 验收时，运行：
+需要真实 Hermes gateway 的 adapter、hooks、shared session、同实例 reconnect
+和插件自有 pi-ai helper 验收时，运行：
 
 ```powershell
 .\scripts\verify_hermes_integration.ps1 `
-  -HermesSource C:\path\to\hermes-agent `
-  -HermesAuxiliarySource C:\path\to\hermes-agent-auxiliary-no-fallback
+  -HermesSource C:\path\to\hermes-agent
 ```
 
 Linux/macOS 可直接运行同一个 Python 入口：
 
 ```bash
 python scripts/verify_hermes_integration.py \
-  --hermes-source /path/to/hermes-agent \
-  --hermes-auxiliary-source /path/to/hermes-agent-auxiliary-no-fallback
+  --hermes-source /path/to/hermes-agent
 ```
 
-该命令使用临时 `HERMES_HOME`，会真实收集平台、9 个工具、4 个 hooks、`onebot11_trigger` auxiliary，
-并执行 shared session、pending trigger 恢复、显式 home cron、schema recovery 和 reconnect smoke；
+该命令使用临时 `HERMES_HOME`，会真实收集平台、9 个工具、4 个 hooks，
+并执行 shared session、pending trigger 恢复、显式 home cron、schema recovery、
+reconnect、图片 base64 segment 和 pi-ai helper 合同 smoke；
 不会把测试队列、审计或 session 写入真实 Hermes home。CI 只负责插件可安装、`onebot11/`
 协议/状态机测试和 Ruff；Hermes 组合测试是本地验收证据。纯插件环境只保证
 `import onebot11`，根目录 `adapter.py` 需要 Hermes gateway 依赖。

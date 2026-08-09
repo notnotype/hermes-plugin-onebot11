@@ -2,7 +2,7 @@
 
 - 关联 Issue：[Issue #5：OneBot 11 分层触发与活跃窗口](https://github.com/notnotype/hermes-plugin-onebot11/issues/5)
 - 状态：balanced 策略已落入生产代码，并接入 TurnAnchor；spike 保留为设计依据
-- 类型：逻辑/状态机 + Hermes auxiliary 集成
+- 类型：逻辑/状态机 + 插件自有 pi-ai 集成
 
 ## 背景
 
@@ -44,7 +44,7 @@
 - 活跃窗口：成功 Agent turn 后 idle 60 秒，最长连续 300 秒，最多 3 次 LLM 仲裁；失败、取消和 uncertain 不进入 engaged。
 - 竞争处理：每群最多一个判断任务；判断期间的队列 revision 变化会重新安排一次，硬触发会使旧结果失效。
 - waiting 状态也受当前活跃窗口的仲裁上限约束；达到上限后只等待硬触发或管理员 flush，不再消耗旁路模型调用。
-- 兼容性：旁路调用只接受显式 provider/model 和群 allowlist，并固定 `fallback_policy=none`、`max_attempts=1`。Hermes strict auxiliary 改动单独交付；旧 Hermes auxiliary API 缺少参数时安全跳过。
+- 旁路调用只接受显式 provider/model 和群 allowlist，由插件自有 Node helper 调用固定版本的 `@earendil-works/pi-ai`；不经过 Hermes auxiliary，不做 provider fallback 或主 Agent fallback。Node/依赖/provider/model/模型结果异常时安全按 `ignore`。
 - 上下文：群当前 anchor batch 作为普通 user message，滚动摘要优先通过 `channel_prompt` 临时注入；旧 Hermes 明确退回有界文本模式。摘要不会作为每轮普通 user transcript 重复累积。
 
 Hermes 自优化只适合生成配置 diff/建议并由管理员审核，不允许运行时修改 Python、权限、白名单或自动启用关键词。本任务不实现自优化执行链路、RAG 或向量库。
@@ -55,4 +55,4 @@ Hermes 自优化只适合生成配置 diff/建议并由管理员审核，不允�
 
 ## 计划出入
 
-spike 没有接真实 provider；生产代码通过 Hermes auxiliary API 接入显式旁路 provider/model，并把 provider fallback 与隐式重试关掉。Hermes 侧的 strict 参数和 OneBot 插件分成两个 PR，插件在旧 API 上安全禁用 LLM trigger。没有加入 RAG、向量库、自动语义压缩或运行时自优化。活跃窗口仍是内存状态，重启后回到 idle，只恢复 SQLite 消息和显式 trigger request。
+spike 没有接真实 provider；生产代码改为由插件自有 pi-ai helper 接入显式 provider/model，并把 provider fallback 与隐式重试关掉。Hermes strict auxiliary 不再是代码路径，也不创建 Hermes PR。没有加入 RAG、向量库、自动语义压缩或运行时自优化。活跃窗口仍是内存状态，重启后回到 idle，只恢复 SQLite 消息和显式 trigger request。

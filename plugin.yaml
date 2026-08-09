@@ -1,13 +1,14 @@
 name: onebot11-platform
 label: OneBot 11 (QQ)
 kind: platform
-version: 0.5.0
+version: 0.6.0
 description: >
   OneBot 11 (QQ) gateway adapter for Hermes Agent.
   Reverse WebSocket + HTTP API. Shared group sessions, durable TurnAnchor
   context, layered triggers, active conversation windows, scoped query tools
   and confirmed group-management actions. Outbound images use bounded
   base64:// segments; unknown non-idempotent delivery is never retried.
+  Optional layered LLM trigger uses the plugin's Node/pi-ai helper, not Hermes auxiliary.
 author: notnotype
 requires_env: []
 optional_env:
@@ -70,4 +71,24 @@ optional_env:
   - name: ONEBOT11_HOME_CHANNEL_TYPE
     description: "定时任务目标类型；必须是 group 或 dm，不能根据 QQ 号形状猜测"
     prompt: "默认投递目标类型"
+    password: false
+  - name: ONEBOT11_LLM_TRIGGER_PROVIDER
+    description: "可选 pi-ai 旁路 provider；启用 LLM trigger 时必须明确配置"
+    prompt: "LLM trigger provider"
+    password: false
+  - name: ONEBOT11_LLM_TRIGGER_MODEL
+    description: "可选 pi-ai 旁路 model；启用 LLM trigger 时必须明确配置"
+    prompt: "LLM trigger model"
+    password: false
+  - name: ONEBOT11_LLM_TRIGGER_BASE_URL
+    description: "custom provider 的 OpenAI-compatible HTTP/HTTPS 地址"
+    prompt: "LLM trigger base URL"
+    password: false
+  - name: ONEBOT11_LLM_TRIGGER_API_KEY_ENV
+    description: "API key 环境变量名，不是 API key 值"
+    prompt: "LLM trigger API key 环境变量名"
+    password: false
+  - name: ONEBOT11_LLM_TRIGGER_GROUPS
+    description: "允许 selector 调用旁路模型的群号列表（逗号分隔）"
+    prompt: "LLM trigger 群白名单"
     password: false

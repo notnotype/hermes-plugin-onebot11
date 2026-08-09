@@ -15,15 +15,15 @@ Arch 上 Hermes 运行在宿主机、LLBot 运行在容器内，宿主机路径�
 host、port、重定向、Content-Type、魔数和大小检查；下载外部媒体时不携带
 OneBot Bearer token。图片发送失败不会把 URL 或本地路径回退成普通文本。
 
-Hermes 的媒体发送接口可以返回每个图片的 `SendResult`。文本块和媒体块
-全部明确成功时，image-only turn 才算成功；部分成功、缺少结果或
-`error_kind="unknown"` 都算失败。旧 adapter 返回 `None` 仍保持调用兼容，
-但不把无法确认的 image-only turn 伪装成成功。
+Agent 最终回复图片采用有意的 best-effort 合同。插件会预检图片大小、
+类型和数量，并发送受限 `base64://` segment，但不改造 Hermes 全局 delivery
+来获得更强的 image-only 完成状态。部分成功或 `unknown` 不会让插件重新执行
+整轮 Agent。
 
-任何非幂等 OneBot 出站结果为 `unknown` 时，Hermes 不自动重试、不发送
-plain-text fallback，也不从 cron live delivery 改走 standalone sender。
-这样不提供 exactly-once，但避免“第一次可能已发送、第二次又发送”的确定性
-重复。未知结果由 OneBot 队列/operation ledger 和管理员人工流程处理。
+任何非幂等 OneBot 出站结果为 `unknown` 时，本插件不自动重试、不把图片
+回退为 plain-text，也不重新执行整轮 Agent。这样不提供 exactly-once，
+但避免插件自身造成“第一次可能已发送、第二次又发送”的确定性重复。
+未知结果由 OneBot 队列/operation ledger 和管理员人工流程处理。
 
 ## 原因
 
@@ -36,7 +36,21 @@ unknown-safe 合同，才能让 lease fencing、队列 ack 和 Hermes completion
 
 - 图片消息可跨宿主机/容器边界传输，但 base64 会增加内存和请求体大小；
   现有单图、单消息图片数量和总量边界继续生效。
-- 旧 Hermes 没有媒体结果聚合能力时，插件继续支持文本；图片能力必须在
-  Hermes 媒体合同可用时启用，不能静默伪造成功。
+- 插件启动和图片发送不依赖 Hermes 媒体结果能力探测。
 - 真实部署仍需把允许的远程媒体 host 配置到 allowlist；本 ADR 不引入
   DNS rebinding 服务端或新的媒体数据库。
+
+## 范围与折中
+
+本 ADR 的主要支持场景是 Hermes Agent 最终回复中的图片。通用
+`send_message`、cron 或跨进程 standalone sender 的 plugin media
+不是本轮的交付合同；这些窄路径保持文本能力，不宣称完整图片支持。
+
+这是有意的妥协：现有微信等 adapter 也存在媒体失败聚合不完全、批量
+结果不统一或 fallback 行为不同的历史兼容方式。为了 OneBot 一个较窄
+的使用场景改造 Hermes 全部 provider，会扩大变更面、增加升级冲突，
+但不会提升原始需求的核心价值。
+
+因此本轮不新增 Hermes 媒体 PR、不引入新的媒体数据库、Docker volume、
+临时 HTTP 媒体服务器或全平台媒体能力矩阵。若未来 `send_message`
+图片成为明确产品需求，再单独设计通用的 fail-closed 媒体能力声明。

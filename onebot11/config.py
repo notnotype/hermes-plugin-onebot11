@@ -134,6 +134,12 @@ def effective_extra(
         "WS_MAX_QUEUE": "ws_max_queue",
         "WS_MAX_INFLIGHT": "ws_max_inflight",
         "HOME_CHANNEL": "home_channel",
+        "LLM_TRIGGER_PROVIDER": "llm_trigger_provider",
+        "LLM_TRIGGER_MODEL": "llm_trigger_model",
+        "LLM_TRIGGER_BASE_URL": "llm_trigger_base_url",
+        "LLM_TRIGGER_API_KEY_ENV": "llm_trigger_api_key_env",
+        "LLM_TRIGGER_ENABLED": "llm_trigger_enabled",
+        "LLM_TRIGGER_GROUPS": "llm_trigger_groups",
     }
     for suffix, field in fields.items():
         name = f"ONEBOT11_{suffix}"

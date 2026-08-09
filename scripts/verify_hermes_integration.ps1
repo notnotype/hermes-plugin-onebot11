@@ -1,6 +1,5 @@
 param(
-    [string]$HermesSource = $env:HERMES_ROOT,
-    [string]$HermesAuxiliarySource = $env:HERMES_AUXILIARY_ROOT
+    [string]$HermesSource = $env:HERMES_ROOT
 )
 
 $ErrorActionPreference = "Stop"
@@ -37,9 +36,5 @@ $hermesSitePackages = $hermesSiteCandidates |
 if ($hermesSitePackages) {
     $arguments += @("--hermes-site-packages", (Resolve-Path -LiteralPath $hermesSitePackages).Path)
 }
-if ($HermesAuxiliarySource) {
-    $arguments += @("--hermes-auxiliary-source", (Resolve-Path -LiteralPath $HermesAuxiliarySource).Path)
-}
-
 & $pluginPython @arguments
 exit $LASTEXITCODE

@@ -1,7 +1,7 @@
 # OneBot 11 可靠性与安全完善
 
 - 关联需求：OneBot 11 插件整体完善计划
-- 状态：PR #8 基线上的 TurnAnchor、schema 11 和出站图片收口已完成本地实现，将以 `fix/i9-turn-anchor-contract` 独立插件 PR 交付。Hermes strict auxiliary 与媒体合同分别在独立本地 worktree，真实 Agent 图片 pipeline、真人并发、unknown 出站和 resolve 仍待外部验收。
+- 状态：PR #8 基线上的 TurnAnchor、schema 11、Agent 最终回复出站图片和插件自有 pi-ai 触发已完成本地实现。Hermes strict auxiliary/media 合同不再是插件依赖；通用 `send_message`/cron plugin media、真实 Agent 图片 pipeline、真人并发、unknown 出站和 resolve 仍有外部边界。
 - 开始日期：2026-08-05
 
 ## 目标
@@ -15,13 +15,13 @@
 
 1. SQLite WAL 队列：schema 版本迁移、消息和 TurnAnchor 去重、条数/字节边界、摘要、lease heartbeat、tombstone、`uncertain` 和人工 retry/discard。
 2. 群级 dispatcher：每群一个活动 lease，启动恢复过期租约和持久 trigger request，支持 pause/resume。
-3. 触发器：Unicode `casefold` 关键词、@、always、问句/记忆候选、5 秒 trailing debounce、60 秒活跃窗口和显式 auxiliary LLM 三态判断；模型失败按不触发。
+3. 触发器：Unicode `casefold` 关键词、@、always、问句/记忆候选、5 秒 trailing debounce、60 秒活跃窗口和插件自有 pi-ai LLM 三态判断；模型失败按不触发。
 4. 权限：普通用户和 trusted_user 默认/配置都只能只读，超级管理员列表和角色工具并集；群管理写工具预览 + 同群同管理员短期单次确认。
 5. 协议可靠性：WS 有界接收、同 chat 顺序、inflight 限制、失败关闭连接；HTTP 查询有限重试，非幂等动作永不自动重试；媒体 SSRF/类型/大小限制；支持 LLBot reaction action。
 6. 生命周期：部分发送、连接中断、取消或 turn 在发送后失败均进入 `uncertain`；同一 adapter reconnect 会重新打开 SQLite/dispatcher，内存 active 状态回到 idle；群 turn 默认显示 👀，收尾时尽力清理；确认命令在 adapter 入站层处理。
 7. 管理动作台账：确认后先持久化 `started`；崩溃恢复为 `unknown`，同 fingerprint 阻断重复调用；管理员通过 operation id 明确 `retry_armed` 或 `discarded`。
 8. 收口修复：旧 lease 与后来 pending anchor 在事务中保持各自顺序；raw `self_id` 不匹配拒绝；completion 后续状态异常不再冒泡为第二个用户错误；reaction/authority 锚定真实触发消息；shared session 摘要优先临时注入。
-9. 出站媒体：图片使用受限 `base64://` segment；Hermes 聚合文本/媒体结果，unknown delivery 不自动重试、plain-text fallback 或 cron standalone fallback。
+9. 出站媒体：图片使用受限 `base64://` segment；最终回复图片采用 best-effort，unknown 不自动重试整轮 Agent，也不走 URL/plain-text fallback。
 
 ## 关键决策
 
@@ -37,8 +37,8 @@
 ## 验证
 
 - 本地插件门禁：`.venv\\Scripts\\python.exe -m pytest -q` 的纯插件结果见最终交付记录；纯插件环境只跳过需要 Hermes gateway 的 adapter 集成测试。
-- Hermes 集成：运行 `scripts\\verify_hermes_integration.ps1` 或跨平台 Python 入口；当前本地 Hermes 媒体 worktree 组合为 `245 passed`，覆盖真实 adapter import、注册、4 个 hooks、工具 handler、shared session key、TurnAnchor authority、lease fencing、同实例 reconnect、配置合同、operation resolve、触发竞争、上下文分段、媒体孤儿清理、raw self_id、home cron、reaction 生命周期和出站图片/unknown delivery 合同。
-- 严格 auxiliary 回归：`3 passed`，覆盖新 API 的 no-fallback/单次尝试合同和旧 Hermes API 缺少参数时的安全禁用。
+- Hermes 集成：运行 `scripts\\verify_hermes_integration.ps1` 或跨平台 Python 入口；当前脚本覆盖真实 adapter import、注册、4 个 hooks、工具 handler、shared session key、TurnAnchor authority、lease fencing、同实例 reconnect、配置合同、operation resolve、触发竞争、上下文分段、媒体孤儿清理、raw self_id、home cron、reaction 生命周期和出站图片 base64 segment。
+- pi-ai helper：在插件 Node/npm 环境单独验证 Node 缺失、helper 输出、超时和失败分类；不依赖 Hermes auxiliary。
 - 静态检查：`.venv\\Scripts\\python.exe -m ruff check .`，当前通过；临时干净环境 `pip install -e ".[dev]"` 和 `import onebot11` 也已通过。
 - Arch + LLBot 外部联调：2026-08-08 严格使用机器人 QQ `3101482118`、群白名单 `1072992996`、私聊白名单 `2056963663` 和 `home_channel_type=dm`。旧 TurnAnchor 版本的真实 WS/HTTP 连接、真实历史 message ID 的 reaction 添加/移除、TurnAnchor batch 边界、重启后 pending 保留和白名单外群拒绝通过；随后在隔离 queue 上完成了 image-only、文字+图片、多图的真实 OneBot segment/reaction smoke。入站仍为受控 WS payload，图片 smoke 也未经过生产 Agent pipeline，不等同于真人 QQ 发言；双用户并发、部分成功/unknown 出站和 resolve 仍待验收。Arch live queue schema 10 尚未切换到当前 schema 11 分支。
 
@@ -47,3 +47,4 @@
 - 已完成原计划第一、第二阶段的本地实现，并增加了 WS 处理失败主动断开、媒体总大小限制、跨重启孤儿目录清理和非 OneBot hook 隔离。
 - 语义摘要仍保持确定性摘要为主；`onebot11_summary` auxiliary、自动语义压缩和运行时自优化不在本轮实现范围内。审计、基础运维命令和持久管理动作台账已纳入当前实现，真实 QQ 上的管理写操作仍待验收。
 - 本轮联调中的测试消息只发送到用户指定的群 `1072992996` 和用户 `2056963663`；没有执行禁言、踢人、撤回或全员禁言。远端保留了配置备份，实验 queue 已移出运行配置；未把 schema 10 降级或覆盖。
+- Hermes 媒体与严格 auxiliary 的更大范围改造不纳入本轮；如果未来 `send_message`/cron 图片成为明确产品需求，再单独提出通用媒体能力合同。

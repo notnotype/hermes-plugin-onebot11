@@ -810,7 +810,6 @@ async def test_LLM候选入队不会在群触发锁上死锁(monkeypatch):
             },
         )
     )
-    adapter._llm_trigger_api_supported = True
     message = adapter_module.QueueMessage(
         chat_id="888",
         chat_type="group",
@@ -1119,32 +1118,8 @@ async def test_shared_session摘要优先使用临时channel_prompt(monkeypatch)
         await adapter.disconnect()
 
 
-async def test_旧Hermes辅助API会安全禁用LLM触发(monkeypatch):
-    """旧 Hermes 没有严格旁路参数时，插件不应偷偷改用主模型。"""
-    import agent.auxiliary_client as auxiliary_client
-
-    adapter = _make_adapter(
-        monkeypatch,
-        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
-        ONEBOT11_SELF_ID="1",
-    )
-
-    async def old_async_call_llm(*, task=None, messages):
-        del task, messages
-        raise AssertionError("旧 API 不应被真正调用")
-
-    monkeypatch.setattr(auxiliary_client, "async_call_llm", old_async_call_llm)
-    adapter._llm_trigger_api_supported = None
-    try:
-        assert adapter._llm_trigger_api_ready() is False
-        assert adapter._llm_trigger_api_ready() is False
-        assert adapter._llm_trigger_api_audited is True
-    finally:
-        await adapter.disconnect()
-
-
-async def test_旧Hermes旁路跳过仍留下真实失败审计(monkeypatch):
-    """严格参数不可用时不调用模型，pending 保留且审计说明安全降级原因。"""
+async def test_pi_ai_selector成功后创建durable_trigger(monkeypatch):
+    """旁路判断由插件自有 pi-ai client 完成，不依赖 Hermes auxiliary。"""
     adapter = OneBot11Adapter(
         PlatformConfig(
             enabled=True,
@@ -1163,11 +1138,11 @@ async def test_旧Hermes旁路跳过仍留下真实失败审计(monkeypatch):
     message = QueueMessage(
         chat_id="888",
         chat_type="group",
-        message_id="old-api-question",
+        message_id="pi-ai-question",
         user_id="123",
         user_name="小明",
         text="这个问题怎么处理？",
-        message_key="group:old-api-question",
+        message_key="group:pi-ai-question",
     )
     adapter._queue.enqueue(message)
     state = adapter._trigger_state_for("888")
@@ -1182,15 +1157,31 @@ async def test_旧Hermes旁路跳过仍留下真实失败审计(monkeypatch):
     assert action.kind == "schedule"
     action = state.on_timer(now=6)
     assert action.kind == "judge"
-    adapter._llm_trigger_api_supported = False
-    records: list[tuple[str, dict]] = []
-    monkeypatch.setattr(adapter._audit, "record", lambda name, fields: records.append((name, fields)))
+
+    class FakeClient:
+        """返回固定的严格 selector JSON。"""
+
+        async def complete(self, prompt: str, *, timeout_seconds: float) -> str:
+            """校验 helper 输入并返回 trigger 决策。"""
+            assert "这个问题怎么处理" in prompt
+            assert timeout_seconds > 0
+            return '{"decision":"trigger","wait_seconds":0}'
+
+    monkeypatch.setattr(adapter_module, "PiAiTriggerClient", lambda **_kwargs: FakeClient())
+    notified: list[str] = []
+
+    async def fake_notify(chat_id: str) -> bool:
+        notified.append(chat_id)
+        return True
+
+    monkeypatch.setattr(adapter._dispatcher, "notify", fake_notify)
     try:
         await adapter._start_llm_judgement("888", action)
-        assert adapter._queue.status("888")["pending"] == 1
-        assert adapter._queue.status("888")["pending_trigger_requests"] == 0
-        assert records[-1][0] == "llm_trigger"
-        assert records[-1][1]["failure"] == "hermes_api_unsupported"
+        await adapter._llm_trigger_tasks["888"]
+        status = adapter._queue.status("888")
+        assert status["pending"] == 1
+        assert status["pending_trigger_requests"] == 1
+        assert notified == ["888"]
     finally:
         await adapter.disconnect()
 
@@ -1359,7 +1350,6 @@ async def test_completion不覆盖期间新消息的候选状态(monkeypatch):
             },
         )
     )
-    adapter._llm_trigger_api_supported = True
     adapter._processing_reaction_enabled = False
     first = adapter_module.QueueMessage(
         chat_id="888",
@@ -1465,7 +1455,6 @@ async def test_completion后普通消息进入engaged_debounce(monkeypatch):
             },
         )
     )
-    adapter._llm_trigger_api_supported = True
     adapter._processing_reaction_enabled = False
     first = adapter_module.QueueMessage(
         chat_id="888",
@@ -1926,7 +1915,11 @@ async def test_uncertain群不会继续消耗selector模型(monkeypatch):
     def fail_if_called():
         raise AssertionError("uncertain 群不应调用 selector route")
 
-    monkeypatch.setattr(adapter, "_llm_trigger_route", fail_if_called)
+    monkeypatch.setattr(
+        adapter,
+        "_pi_ai_trigger_client",
+        fail_if_called,
+    )
     await adapter._apply_trigger_action_locked(
         "888",
         adapter_module.TriggerAction("schedule", candidate_type="question"),
@@ -1952,12 +1945,6 @@ async def test_send走HTTP并返回SendResult(monkeypatch, fake_http_server):
 
 async def test_send_image_file使用base64segment并保留reply(monkeypatch, fake_http_server):
     """图片出站不能依赖 LLBot 容器可见的宿主机路径。"""
-    monkeypatch.setattr(
-        BasePlatformAdapter,
-        "supports_media_delivery_results",
-        True,
-        raising=False,
-    )
     base, calls = fake_http_server
     adapter = _make_adapter(monkeypatch, ONEBOT11_HTTP_API=base, ONEBOT11_SELF_ID="1")
     await adapter.connect()
@@ -1984,52 +1971,8 @@ async def test_send_image_file使用base64segment并保留reply(monkeypatch, fak
         await adapter.disconnect()
 
 
-async def test_旧Hermes缺少媒体结果合同安全禁用图片(monkeypatch):
-    """旧 Hermes 不能可靠聚合媒体结果时，图片不得访问 OneBot。"""
-    monkeypatch.setattr(
-        BasePlatformAdapter,
-        "supports_media_delivery_results",
-        False,
-        raising=False,
-    )
-    adapter = _make_adapter(
-        monkeypatch,
-        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
-        ONEBOT11_SELF_ID="1",
-    )
-    called = False
-
-    async def fail_if_called(*_args, **_kwargs):
-        nonlocal called
-        called = True
-        raise AssertionError("旧 Hermes 不应访问 OneBot 图片接口")
-
-    monkeypatch.setattr(adapter._api, "send_message_segments", fail_if_called)
-    event_token = adapter_module._CURRENT_EVENT.set(
-        SimpleNamespace(metadata={"onebot11_lease_id": "legacy-image-lease"})
-    )
-    try:
-        result = await adapter.send_multiple_images(
-            "888",
-            [("https://example.invalid/image.png", "")],
-            metadata={"onebot11_lease_id": "legacy-image-lease"},
-        )
-        assert len(result) == 1
-        assert result[0].error_kind == "unsupported"
-        assert "legacy-image-lease" in adapter._outbound_known_failure
-        assert called is False
-    finally:
-        adapter_module._CURRENT_EVENT.reset(event_token)
-
-
 async def test_send_multiple_images返回部分成功结果(monkeypatch):
     """多图预检失败时不能先发送前面的图片。"""
-    monkeypatch.setattr(
-        BasePlatformAdapter,
-        "supports_media_delivery_results",
-        True,
-        raising=False,
-    )
     adapter = _make_adapter(
         monkeypatch,
         ONEBOT11_HTTP_API="http://127.0.0.1:3000",
@@ -2056,12 +1999,6 @@ async def test_send_multiple_images返回部分成功结果(monkeypatch):
 
 async def test_send_multiple_images预检总量超限不访问OneBot(monkeypatch):
     """总大小超限时，所有图片都只返回预检失败，不能发送一半。"""
-    monkeypatch.setattr(
-        BasePlatformAdapter,
-        "supports_media_delivery_results",
-        True,
-        raising=False,
-    )
     adapter = _make_adapter(
         monkeypatch,
         ONEBOT11_HTTP_API="http://127.0.0.1:3000",
@@ -2094,12 +2031,6 @@ async def test_send_multiple_images预检总量超限不访问OneBot(monkeypatch
 
 async def test_send_multiple_images数量超限不访问OneBot(monkeypatch):
     """图片数量超限时，不能下载或访问 OneBot。"""
-    monkeypatch.setattr(
-        BasePlatformAdapter,
-        "supports_media_delivery_results",
-        True,
-        raising=False,
-    )
     adapter = _make_adapter(
         monkeypatch,
         ONEBOT11_HTTP_API="http://127.0.0.1:3000",
@@ -2128,12 +2059,6 @@ async def test_send_multiple_images数量超限不访问OneBot(monkeypatch):
 
 async def test_send_multiple_images遇到unknown停止后续请求(monkeypatch):
     """图片结果未知时不再发起同一 turn 的后续非幂等请求。"""
-    monkeypatch.setattr(
-        BasePlatformAdapter,
-        "supports_media_delivery_results",
-        True,
-        raising=False,
-    )
     adapter = _make_adapter(
         monkeypatch,
         ONEBOT11_HTTP_API="http://127.0.0.1:3000",

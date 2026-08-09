@@ -83,6 +83,8 @@ READ_TOOL_NAMES = _proto.tools.READ_TOOL_NAMES
 TOOL_SCHEMAS = _proto.tools.TOOL_SCHEMAS
 WRITE_TOOL_NAMES = _proto.tools.WRITE_TOOL_NAMES
 build_llm_trigger_input = _proto.triggers.build_llm_trigger_input
+PiAiTriggerClient = _proto.pi_ai.PiAiTriggerClient
+PiAiTriggerError = _proto.pi_ai.PiAiTriggerError
 LayeredTriggerState = _proto.triggers.LayeredTriggerState
 TriggerAction = _proto.triggers.TriggerAction
 parse_llm_decision = _proto.triggers.parse_llm_decision
@@ -263,17 +265,10 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._trigger_timer_tasks: dict[str, asyncio.Task[None]] = {}
         self._trigger_state_locks: dict[str, asyncio.Lock] = {}
         self._trigger_states: dict[str, LayeredTriggerState] = {}
-        self._llm_trigger_api_supported: bool | None = None
-        self._llm_trigger_api_audited = False
         self._llm_trigger_semaphore: asyncio.Semaphore | None = None
         self._llm_trigger_loop: asyncio.AbstractEventLoop | None = None
-        self._llm_trigger_route_logged = False
         self._channel_prompt_supported: bool | None = None
         self._summary_fallback_audited = False
-        self._media_result_contract_supported = bool(
-            getattr(BasePlatformAdapter, "supports_media_delivery_results", False)
-        )
-        self._media_result_contract_audited = False
 
         self._api = OneBotHttpApi(
             base_url=http_api,
@@ -424,11 +419,8 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._last_trigger_at.clear()
         self._trigger_states.clear()
         self._trigger_state_locks.clear()
-        self._llm_trigger_api_supported = None
-        self._llm_trigger_api_audited = False
         self._llm_trigger_semaphore = None
         self._llm_trigger_loop = None
-        self._llm_trigger_route_logged = False
         self._channel_prompt_supported = None
         self._summary_fallback_audited = False
         self._fenced_leases.clear()
@@ -947,28 +939,18 @@ class OneBot11Adapter(BasePlatformAdapter):
             user_name=str(source.user_name or caller.user_id),
         )
 
-    def _llm_trigger_route(self) -> tuple[str, str] | None:
-        """读取显式旁路 provider/model；缺失时绝不回退主模型。"""
+    def _pi_ai_trigger_client(self) -> PiAiTriggerClient | None:
+        """按 typed 触发配置创建插件自有 pi-ai 客户端。"""
         provider = self.trigger_config.llm_provider.strip()
         model = self.trigger_config.llm_model.strip()
-        if not provider or provider.casefold() == "auto" or not model:
-            try:
-                from hermes_cli.config import load_config
-
-                config = load_config() or {}
-                auxiliary = config.get("auxiliary") if isinstance(config, dict) else None
-                route = auxiliary.get("onebot11_trigger") if isinstance(auxiliary, Mapping) else None
-                if isinstance(route, Mapping):
-                    provider = str(route.get("provider") or provider).strip()
-                    model = str(route.get("model") or model).strip()
-            except Exception:
-                pass
-        if not provider or provider.casefold() == "auto" or not model:
-            if not self._llm_trigger_route_logged:
-                logger.info("OneBot11 LLM trigger 已启用但未配置明确 provider/model，旁路已跳过")
-                self._llm_trigger_route_logged = True
+        if not provider or not model:
             return None
-        return provider, model
+        return PiAiTriggerClient(
+            provider=provider,
+            model=model,
+            base_url=self.trigger_config.llm_base_url,
+            api_key_env=self.trigger_config.llm_api_key_env,
+        )
 
     def _schedule_llm_trigger(self, chat_id: str) -> None:
         """兼容旧调用点：只调度现有状态机的 due timer。"""
@@ -1007,28 +989,6 @@ class OneBot11Adapter(BasePlatformAdapter):
         if int(status.get("pending_trigger_requests", 0) or 0) > 0:
             return "hard_trigger_already_pending"
         return None
-
-    def _llm_trigger_api_ready(self) -> bool:
-        """检查 Hermes 是否支持旁路严格参数；旧 API 直接安全降级。"""
-        if self._llm_trigger_api_supported is not None:
-            return self._llm_trigger_api_supported
-        try:
-            from agent.auxiliary_client import async_call_llm
-
-            parameters = inspect.signature(async_call_llm).parameters
-            self._llm_trigger_api_supported = {
-                "fallback_policy",
-                "max_attempts",
-            }.issubset(parameters)
-        except (ImportError, TypeError, ValueError):
-            self._llm_trigger_api_supported = False
-        if not self._llm_trigger_api_supported and not self._llm_trigger_api_audited:
-            self._audit.record(
-                "llm_trigger_disabled",
-                {"reason": "Hermes auxiliary API 不支持 fallback_policy/max_attempts"},
-            )
-            self._llm_trigger_api_audited = True
-        return self._llm_trigger_api_supported
 
     def _schedule_trigger_timer(self, chat_id: str) -> None:
         """为一个群保留唯一 timer，负责 debounce、wait 和 engaged 到期。"""
@@ -1117,9 +1077,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         if action.kind == "wait":
             self._schedule_trigger_timer(normalized)
             return
-        route = self._llm_trigger_route()
-        api_ready = self._llm_trigger_api_ready() if route else False
-        if not route or not api_ready:
+        if self._pi_ai_trigger_client() is None:
             state.on_llm_failure(
                 now=time.monotonic(),
                 current_revision=int(status.get("revision", 0)),
@@ -1132,12 +1090,13 @@ class OneBot11Adapter(BasePlatformAdapter):
                 {
                     "chat_id": normalized,
                     "candidate_type": action.candidate_type or "candidate",
-                    "reason": "provider_missing" if not route else "hermes_api_unsupported",
+                    "reason": "provider_missing",
                     "pending": int(status.get("pending", 0)),
                     "input_bytes": 0,
                     "duration_ms": 0,
                     "decision": "ignore",
                     "wait_seconds": 0,
+                    "failure": "provider_missing",
                     "concurrency_waited": False,
                 },
             )
@@ -1145,12 +1104,8 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._schedule_trigger_timer(normalized)
 
     def _llm_trigger_ready(self) -> bool:
-        """判断旁路 provider/model 与 Hermes 严格 API 是否同时可用。"""
-        return bool(
-            self._llm_trigger_route()
-            and self._llm_trigger_api_ready()
-            and self.trigger_config.llm_enabled
-        )
+        """判断插件自有 pi-ai 旁路配置是否完整。"""
+        return bool(self.trigger_config.llm_enabled and self._pi_ai_trigger_client())
 
     async def _start_llm_judgement(self, chat_id: str, action: TriggerAction) -> None:
         """为每群启动至多一个旁路判断 task。"""
@@ -1172,8 +1127,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                     state.pause() if block_reason == "paused" else state.invalidate_judgement()
                 return
             if not self._llm_trigger_ready():
-                route = self._llm_trigger_route()
-                failure = "provider_missing" if not route else "hermes_api_unsupported"
+                failure = "provider_missing"
                 state.on_llm_failure(
                     now=time.monotonic(),
                     current_revision=int(status.get("revision", 0)),
@@ -1586,30 +1540,17 @@ class OneBot11Adapter(BasePlatformAdapter):
                                 candidate_type=candidate_type,
                             )
                             input_bytes = len(prompt.encode("utf-8"))
-                            provider_model = self._llm_trigger_route()
-                            if not provider_model or not self._llm_trigger_api_ready():
-                                failure = (
-                                    "provider_missing"
-                                    if not provider_model
-                                    else "hermes_api_unsupported"
-                                )
+                            client = self._pi_ai_trigger_client()
+                            if client is None:
+                                failure = "provider_missing"
                             else:
-                                provider, model = provider_model
-                                from agent.auxiliary_client import async_call_llm
-
                                 semaphore = self._llm_trigger_semaphore_for_loop()
                                 # 释放群锁后再等待模型，允许新消息入队并推进
                                 # dirty_revision；这里仅把调用参数复制出来。
-                                request = (
-                                    async_call_llm,
-                                    provider,
-                                    model,
-                                    prompt,
-                                    semaphore,
-                                )
+                                request = (client, prompt, semaphore)
             if failure:
                 return
-            async_call_llm, provider, model, prompt, semaphore = request
+            client, prompt, semaphore = request
             semaphore_wait_started = time.monotonic()
             timeout_seconds = self.trigger_config.llm_timeout_seconds
             remaining = timeout_seconds - (time.monotonic() - started_at)
@@ -1629,31 +1570,12 @@ class OneBot11Adapter(BasePlatformAdapter):
                 if state is not None and state.generation_matches(action.generation):
                     state.model_calls += 1
                 response = await asyncio.wait_for(
-                    async_call_llm(
-                        task="onebot11_trigger",
-                        provider=provider,
-                        model=model,
-                        messages=[
-                            {
-                                "role": "system",
-                                "content": (
-                                    "你是严格的 OneBot11 消息触发判断器。"
-                                    "只能返回 JSON，不要输出 Markdown。"
-                                ),
-                            },
-                            {"role": "user", "content": prompt},
-                        ],
-                        temperature=0,
-                        max_tokens=32,
-                        timeout=remaining,
-                        fallback_policy="none",
-                        max_attempts=1,
-                    ),
+                    client.complete(prompt, timeout_seconds=remaining),
                     timeout=remaining,
                 )
             finally:
                 semaphore.release()
-            content = response.choices[0].message.content
+            content = response
             if isinstance(content, Mapping):
                 parsed_value: Any = content
             elif isinstance(content, str):
@@ -1696,8 +1618,8 @@ class OneBot11Adapter(BasePlatformAdapter):
             if not self._closed:
                 failure = "cancelled"
             raise
-        except ImportError:
-            failure = "provider_missing"
+        except PiAiTriggerError as exc:
+            failure = exc.kind
         except TimeoutError:
             failure = "timeout"
         except json.JSONDecodeError:
@@ -2551,42 +2473,6 @@ class OneBot11Adapter(BasePlatformAdapter):
             raw_response={"sent_chunks": len(sent), "total_chunks": len(pieces)},
         )
 
-    def _media_contract_unavailable(
-        self,
-        metadata: Mapping[str, Any] | None,
-    ) -> SendResult:
-        """在旧 Hermes 上禁用图片，并让 managed turn 不能误 ack。"""
-        if not self._media_result_contract_audited:
-            self._audit.record(
-                "outbound_image_disabled",
-                {
-                    "reason": "Hermes 不支持媒体 SendResult 聚合合同",
-                    "capability": "supports_media_delivery_results",
-                },
-            )
-            self._media_result_contract_audited = True
-
-        lease_id = ""
-        sources = [metadata]
-        current_event = _CURRENT_EVENT.get()
-        sources.append(getattr(current_event, "metadata", None))
-        for source in sources:
-            if isinstance(source, Mapping):
-                lease_id = str(source.get("onebot11_lease_id") or "").strip()
-                if lease_id:
-                    break
-        if not lease_id:
-            binding = self._binding_from_context()
-            if binding is not None:
-                lease_id = str(binding.lease_id or "").strip()
-        if lease_id:
-            self._outbound_known_failure.add(lease_id)
-        return SendResult(
-            False,
-            error="当前 Hermes 不支持可靠图片出站合同",
-            error_kind="unsupported",
-        )
-
     async def send_image_file(
         self,
         chat_id: str,
@@ -2598,8 +2484,6 @@ class OneBot11Adapter(BasePlatformAdapter):
     ) -> SendResult:
         """把受信任的本地图片编码为 OneBot ``base64://`` image segment。"""
         del kwargs
-        if not self._media_result_contract_supported:
-            return self._media_contract_unavailable(metadata)
         binding = self._binding_from_context()
         current_event = _CURRENT_EVENT.get()
         current_event_metadata = getattr(current_event, "metadata", None) or {}
@@ -2777,8 +2661,6 @@ class OneBot11Adapter(BasePlatformAdapter):
         metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         """安全下载远程图片后，以 base64 segment 发送，不回退为 URL 文本。"""
-        if not self._media_result_contract_supported:
-            return self._media_contract_unavailable(metadata)
         media_dir = self._new_media_dir()
         path = await self._api.download_to_temp(str(image_url), media_dir)
         if not path:
@@ -2803,12 +2685,6 @@ class OneBot11Adapter(BasePlatformAdapter):
         human_delay: float = 0.0,
     ) -> list[SendResult]:
         """先完成全部图片预检，再逐张发送，避免发送一半才发现总量超限。"""
-        if not self._media_result_contract_supported:
-            unavailable = self._media_contract_unavailable(metadata)
-            return [
-                unavailable
-                for _image_url, _caption in images
-            ]
         if not images:
             return []
         if len(images) > self._max_images_per_message:
@@ -3768,6 +3644,9 @@ def _env_enablement() -> dict[str, Any] | None:
         "ONEBOT11_ACCESS_TOKEN", "ONEBOT11_WS_PORT", "ONEBOT11_WS_HOST", "ONEBOT11_DM_POLICY",
         "ONEBOT11_ALLOWED_USERS", "ONEBOT11_ALLOWED_GROUPS", "ONEBOT11_REQUIRE_MENTION",
         "ONEBOT11_SUPER_ADMINS", "ONEBOT11_ADMINS", "ONEBOT11_QUEUE_DB",
+        "ONEBOT11_LLM_TRIGGER_ENABLED", "ONEBOT11_LLM_TRIGGER_PROVIDER",
+        "ONEBOT11_LLM_TRIGGER_MODEL", "ONEBOT11_LLM_TRIGGER_BASE_URL",
+        "ONEBOT11_LLM_TRIGGER_API_KEY_ENV", "ONEBOT11_LLM_TRIGGER_GROUPS",
     ):
         value = os.getenv(key, "").strip()
         if value:
@@ -3823,7 +3702,7 @@ async def _standalone_send(pconfig: Any, chat_id: str, message: str, **kwargs: A
 
 
 def register(ctx: Any) -> None:
-    """注册平台、全角色工具、权限 hooks 和旁路 trigger auxiliary。"""
+    """注册平台、全角色工具和权限 hooks。"""
     ctx.register_platform(
         name="onebot11",
         label="OneBot 11 (QQ)",
@@ -3831,7 +3710,7 @@ def register(ctx: Any) -> None:
         check_fn=check_requirements,
         validate_config=validate_config,
         required_env=[],
-        install_hint="已随 hermes plugins install 安装；运行时依赖 aiohttp",
+        install_hint="已随 hermes plugins install 安装；运行时依赖 aiohttp、Node.js >=22.19 和 npm pi-ai 依赖",
         env_enablement_fn=_env_enablement,
         apply_yaml_config_fn=_apply_yaml_config,
         cron_deliver_env_var="ONEBOT11_HOME_CHANNEL",
@@ -3861,16 +3740,6 @@ def register(ctx: Any) -> None:
         register_hook("pre_llm_call", _pre_llm_call_hook)
         register_hook("pre_tool_call", _pre_tool_call_hook)
         register_hook("post_llm_call", _post_llm_call_hook)
-    register_auxiliary = getattr(ctx, "register_auxiliary_task", None)
-    if callable(register_auxiliary):
-        register_auxiliary(
-            key="onebot11_trigger",
-            display_name="OneBot11 trigger judge",
-            description="Judge whether a queued group message explicitly requests a response",
-            defaults={"provider": "", "model": "", "timeout": 10},
-        )
-
-
 def _tool_dispatch(name: str):
     """注册全局 handler，运行时解析当前 OneBot adapter。"""
 

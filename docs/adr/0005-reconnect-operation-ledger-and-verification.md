@@ -37,7 +37,7 @@ retry_armed --新的预览+确认--> started
 
 CI 只保证插件自身可以在干净环境安装、`onebot11/` 纯协议和状态机测试通过、Ruff 无错误。CI 不嵌入完整 Hermes 源码、真实 session store 或 provider。
 
-adapter 注册、hooks、工具并集、shared session key、strict auxiliary、reconnect 和临时 `HERMES_HOME` 由 `scripts/verify_hermes_integration.ps1` 在本地可复现运行；真实 LLBot/NapCat 联调另行记录实际行为，不把 WS 重放升级为 OneBot 11 协议保证。
+adapter 注册、hooks、工具并集、shared session key、pi-ai helper、reconnect 和临时 `HERMES_HOME` 由 `scripts/verify_hermes_integration.ps1` 在本地可复现运行；真实 LLBot/NapCat 联调另行记录实际行为，不把 WS 重放升级为 OneBot 11 协议保证。
 
 ## 原因
 
