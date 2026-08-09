@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- **阶段**：`fix/i13-onebot11-closeout` 基于已合并的 `master`/PR #12，完成 Issue #13 的恢复、权限、连接生命周期和媒体输入收口，代码待提交并创建插件 PR。Hermes strict auxiliary 与媒体/unknown 合同在独立 worktree，Arch 仍运行旧插件/旧 Hermes，未切换生产队列。
+- **阶段**：`fix/i13-onebot11-closeout` 基于已合并的 `master`/PR #12，完成 Issue #13 的恢复、权限、连接生命周期和媒体输入收口，已创建插件 PR #14 且 CI 通过。Hermes strict auxiliary 与媒体/unknown 合同在独立 worktree，Arch 仍运行旧插件/旧 Hermes，未切换生产队列。
 - **核心合同**：群固定一个共享 session；群消息持久入队；每个真实 TurnAnchor 固定 batch 和 authority，同群按序单 lease follow-up；非幂等出站结果未知时进入 `uncertain`，不自动重放。
 - **本地验证**：纯协议/状态机测试和 Hermes 组合测试均通过；独立 Hermes worktree 的 strict/media 合同只作为组合验收依赖，不代表远端 Hermes 已发布。
 

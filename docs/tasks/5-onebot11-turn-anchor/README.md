@@ -1,7 +1,7 @@
 # Task 5：OneBot 11 TurnAnchor 与 shared session 收口
 
 - 关联需求：OneBot 11 原始需求中的“群一个 shared session + 队列上下文”
-- 状态：PR #12 已合并；Issue #13 的 `fix/i13-onebot11-closeout` 在 PR #12 基础上补齐恢复顺序、authority shrink、旧 task/epoch fencing、畸形 WS 隔离、`get_image` 和图片发送前置检查，待创建插件 PR。真实 Agent 图片 pipeline、真人并发、unknown resolve 和 Hermes 独立 PR 仍未完成。
+- 状态：PR #12 已合并；Issue #13 的 `fix/i13-onebot11-closeout` 在 PR #12 基础上补齐恢复顺序、authority shrink、旧 task/epoch fencing、畸形 WS 隔离、`get_image` 和图片发送前置检查，已创建插件 PR #14 且 CI 通过。真实 Agent 图片 pipeline、真人并发、unknown resolve 和 Hermes 独立 PR 仍未完成。
 - 分支：`fix/i13-onebot11-closeout`
 
 ## 目标
