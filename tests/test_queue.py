@@ -150,6 +150,28 @@ def test_退避期间恢复不会反复唤醒触发请求(tmp_path, monkeypatch)
     store.close()
 
 
+def test_一个群退避不会阻塞其他群恢复(tmp_path, monkeypatch):
+    """同群按顺序等待退避，但不能用全局 break 卡住其他群。"""
+    now = [1000.0]
+    monkeypatch.setattr("onebot11.queue.time.time", lambda: now[0])
+    store = QueueStore(tmp_path / "multi-chat-recovery.sqlite3")
+
+    blocked = _message("blocked", chat_id="888")
+    store.enqueue(blocked, _trigger(blocked))
+    lease = store.claim("888")
+    assert lease is not None
+    assert store.release(lease, reason="暂时失败")
+
+    now[0] = 1000.1
+    ready = _message("ready", chat_id="889")
+    store.enqueue(ready, _trigger(ready))
+
+    recovered = store.recover_trigger_requests()
+
+    assert [trigger.chat_id for trigger in recovered] == ["889"]
+    store.close()
+
+
 def test_成功出站可以确认并删除消息(tmp_path):
     """出站阶段已开始不等于结果未知；明确成功仍可 ack。"""
     store = QueueStore(tmp_path / "queue.sqlite3")
@@ -753,6 +775,113 @@ def test_abandon与已有pending_trigger合并(tmp_path):
     store.close()
 
 
+def test_abandon缺失旧trigger不吸收后续anchor(tmp_path):
+    """断线时旧 trigger 丢失也必须优先恢复原 lease 的最早消息。"""
+    store = QueueStore(tmp_path / "queue-abandon-missing-trigger.sqlite3")
+    first = _message("abandon-missing")
+    store.enqueue(first, _trigger(first))
+    assert store.claim("888") is not None
+    store._conn.execute(
+        "DELETE FROM onebot_queue_trigger WHERE message_key=?",
+        (first.message_key,),
+    )
+    store._conn.commit()
+    later = _message("abandon-missing-later")
+    store.enqueue(later, _trigger(later))
+
+    assert store.abandon_owner_leases() == {"pending": 1, "uncertain": 0}
+    recovered = store.claim("888")
+    assert recovered is not None
+    assert recovered.trigger.message_key == first.message_key
+    assert [message.message_key for message in recovered.messages] == [first.message_key]
+    store.close()
+
+
+def test_release缺失旧trigger不吸收后续anchor(tmp_path):
+    """明确失败时旧 trigger 丢失也必须按最早消息创建恢复 anchor。"""
+    store = QueueStore(tmp_path / "queue-release-missing-trigger.sqlite3")
+    first = _message("release-missing")
+    store.enqueue(first, _trigger(first))
+    lease = store.claim("888")
+    assert lease is not None
+    store._conn.execute(
+        "DELETE FROM onebot_queue_trigger WHERE message_key=?",
+        (first.message_key,),
+    )
+    store._conn.commit()
+    later = _message("release-missing-later")
+    store.enqueue(later, _trigger(later))
+
+    assert store.release(lease, reason="Agent failed")
+    recovered = store.claim("888")
+    assert recovered is not None
+    assert recovered.trigger.message_key == first.message_key
+    assert [message.message_key for message in recovered.messages] == [first.message_key]
+    store.close()
+
+
+def test_recover缺失旧trigger不吸收后续anchor(tmp_path, monkeypatch):
+    """过期 lease 的恢复也不能因旧 trigger 丢失而跳到后续 anchor。"""
+    now = [1000.0]
+    monkeypatch.setattr("onebot11.queue.time.time", lambda: now[0])
+    store = QueueStore(tmp_path / "queue-recover-missing-trigger.sqlite3")
+    first = _message("recover-missing")
+    store.enqueue(first, _trigger(first))
+    lease = store.claim("888", lease_seconds=5)
+    assert lease is not None
+    store._conn.execute(
+        "DELETE FROM onebot_queue_trigger WHERE message_key=?",
+        (first.message_key,),
+    )
+    store._conn.commit()
+    later = _message("recover-missing-later")
+    store.enqueue(later, _trigger(later))
+
+    now[0] = 1006.0
+    recovered_requests = store.recover_trigger_requests()
+    assert recovered_requests
+    assert recovered_requests[0].message_key == first.message_key
+    recovered = store.claim("888")
+    assert recovered is not None
+    assert recovered.trigger.message_key == first.message_key
+    assert [message.message_key for message in recovered.messages] == [first.message_key]
+    store.close()
+
+
+def test_缺失旧trigger时整批消息不会永久悬挂(tmp_path):
+    """旧 batch 的上下文和 anchor 都要能在恢复后继续按序处理。"""
+    store = QueueStore(tmp_path / "queue-missing-trigger-batch.sqlite3")
+    context = _message("missing-context")
+    anchor = _message("missing-anchor")
+    store.enqueue(context)
+    store.enqueue(anchor, _trigger(anchor))
+    lease = store.claim("888")
+    assert lease is not None
+    assert [message.message_key for message in lease.messages] == [
+        context.message_key,
+        anchor.message_key,
+    ]
+    store._conn.execute(
+        "DELETE FROM onebot_queue_trigger WHERE message_key=?",
+        (anchor.message_key,),
+    )
+    store._conn.commit()
+
+    assert store.abandon_owner_leases() == {"pending": 1, "uncertain": 0}
+    first_recovery = store.claim("888")
+    assert first_recovery is not None
+    assert [message.message_key for message in first_recovery.messages] == [
+        context.message_key
+    ]
+    assert store.ack(first_recovery)
+    second_recovery = store.claim("888")
+    assert second_recovery is not None
+    assert [message.message_key for message in second_recovery.messages] == [
+        anchor.message_key
+    ]
+    store.close()
+
+
 def test_resolve_retry与已有pending_trigger合并(tmp_path):
     """管理员 retry uncertain 消息时，旧 trigger 与新 trigger 必须合并。"""
     store = QueueStore(tmp_path / "queue.sqlite3")
@@ -932,8 +1061,34 @@ def test_resolve_retry只清理被阻塞anchor(tmp_path):
         "SELECT anchor_id FROM onebot_queue_message WHERE message_key=?",
         (later.message_key,),
     ).fetchone()[0]
-    assert blocked_anchor is None
+    assert blocked_anchor is not None
     assert later_anchor is not None
+    assert blocked_anchor != later_anchor
+    store.close()
+
+
+def test_缺失旧trigger时恢复anchor不能吸收后续消息(tmp_path):
+    """旧 trigger 丢失后，恢复入口必须保留原来的 batch 边界。"""
+    store = QueueStore(tmp_path / "queue-resolve-order.sqlite3")
+    blocked = _message("blocked-order")
+    later = _message("later-order")
+    store.enqueue(blocked, _trigger(blocked))
+    lease = store.claim("888")
+    assert lease is not None
+    assert store.mark_uncertain(lease, "unknown")
+    store._conn.execute(
+        "DELETE FROM onebot_queue_trigger WHERE message_key=?",
+        (blocked.message_key,),
+    )
+    store._conn.commit()
+    store.enqueue(later, _trigger(later))
+
+    assert store.resolve_uncertain("888", "retry") == 1
+    recovered = store.claim("888")
+
+    assert recovered is not None
+    assert recovered.trigger.reason == "queue_recovery"
+    assert [message.message_key for message in recovered.messages] == [blocked.message_key]
     store.close()
 
 

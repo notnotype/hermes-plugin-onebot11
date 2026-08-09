@@ -211,6 +211,33 @@ def test_缺HTTP配置时connect失败(monkeypatch):
     assert not asyncio.run(adapter.connect())
 
 
+async def test_connect部分失败后完整回滚并可重连(monkeypatch, tmp_path):
+    """WS 启动或恢复失败不能留下半开启 runtime。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_QUEUE_DB=str(tmp_path / "queue.sqlite3"),
+    )
+    original_start = adapter_module.ReverseWsServer.start
+
+    async def broken_start(_server):
+        raise RuntimeError("ws start failed")
+
+    monkeypatch.setattr(adapter_module.ReverseWsServer, "start", broken_start)
+    with pytest.raises(RuntimeError, match="ws start failed"):
+        await adapter.connect()
+
+    assert adapter._closed is True
+    assert adapter._ws is None
+    assert adapter._queue.closed is True
+    assert adapter._dispatcher._closed is True
+
+    monkeypatch.setattr(adapter_module.ReverseWsServer, "start", original_start)
+    assert await adapter.connect()
+    await adapter.disconnect()
+
+
 async def test_群聊事件转MessageEvent带前缀(monkeypatch):
     adapter = _make_adapter(monkeypatch, ONEBOT11_HTTP_API="http://127.0.0.1:3000", ONEBOT11_SELF_ID="1")
     event = await adapter._build_message_event(
@@ -232,6 +259,29 @@ async def test_群聊事件转MessageEvent带前缀(monkeypatch):
     assert event.source.role_authorized is True
 
 
+async def test_畸形消息在adapter边界丢弃不关闭事件处理(monkeypatch):
+    """单个 malformed message 不能冒泡成 WS 连接级失败。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+
+    await adapter._on_ws_event(
+        {
+            "post_type": "message",
+            "message_type": "group",
+            "message_id": 2007,
+            "group_id": 888,
+            "user_id": 123,
+            "message": {"not": "an array or CQ string"},
+        }
+    )
+
+    assert adapter._queue.status("888")["pending"] == 0
+    adapter._queue.close()
+
+
 async def test_私聊事件不加前缀(monkeypatch):
     adapter = _make_adapter(monkeypatch, ONEBOT11_HTTP_API="http://127.0.0.1:3000", ONEBOT11_SELF_ID="1")
     event = await adapter._build_message_event(
@@ -239,6 +289,36 @@ async def test_私聊事件不加前缀(monkeypatch):
     )
     assert event.text == "在吗"
     assert event.source.chat_type == "dm"
+
+
+async def test_file图片引用先通过get_image解析再下载(monkeypatch):
+    """OneBot 只给 file 标识时不猜本地路径，先调用 get_image。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    calls: list[tuple[str, str]] = []
+
+    async def fake_get_image(file_id: str) -> str:
+        calls.append(("get_image", file_id))
+        return "https://media.example/image.png"
+
+    async def fake_download(url: str, dest_dir: str) -> str:
+        calls.append(("download", url))
+        return str(Path(dest_dir) / "image.png")
+
+    monkeypatch.setattr(adapter._api, "get_image", fake_get_image)
+    monkeypatch.setattr(adapter._api, "download_to_temp", fake_download)
+
+    path = await adapter._download_image("cache-id", str(adapter._media_root))
+
+    assert path.endswith("image.png")
+    assert calls == [
+        ("get_image", "cache-id"),
+        ("download", "https://media.example/image.png"),
+    ]
+    await adapter.disconnect()
 
 
 async def test_真实工具handler可从当前binding补齐缺失turn_id(monkeypatch):
@@ -487,6 +567,7 @@ async def test_DM完成按事件中的精确binding清理(monkeypatch):
                 "session_id": "dm-session",
                 "turn_id": "dm-turn",
             },
+            "onebot11_binding_snapshot": binding.snapshot(),
         },
         media_urls=[],
     )
@@ -495,6 +576,89 @@ async def test_DM完成按事件中的精确binding清理(monkeypatch):
     try:
         await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
         assert adapter._bindings.get("dm-session", "dm-turn") is None
+    finally:
+        adapter_module._CURRENT_CALLER.set(None)
+        adapter_module._CURRENT_BINDING.set(None)
+        await adapter.disconnect()
+
+
+async def test_旧super_admin_anchor在权限撤销后只能使用普通只读工具(monkeypatch):
+    """恢复旧 anchor 时，实时角色收紧不能让旧写权限继续生效。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_SUPER_ADMINS="123",
+    )
+    caller = adapter_module.CallerContext(
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+        role="super_admin",
+        allowed_tools=adapter.role_tools["super_admin"],
+        self_id="1",
+        adapter_epoch=adapter._adapter_epoch,
+    )
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    adapter.super_admins.clear()
+    try:
+        restored = adapter_module._caller_from_metadata(
+            adapter_module._serializable_caller(caller)
+        )
+        assert restored is not None
+        assert restored.role == "user"
+        assert "qq_get_group_info" in restored.allowed_tools
+        assert "qq_set_group_ban" not in restored.allowed_tools
+    finally:
+        await adapter.disconnect()
+
+
+async def test_旧binding快照不能清理重连后同键的新binding(monkeypatch):
+    """旧 task 的 completion 不能按复用的 session/turn 键删除新 binding。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    old_caller = adapter_module.CallerContext(
+        user_id="123",
+        chat_type="dm",
+        chat_id="123",
+        role="user",
+        allowed_tools=adapter_module.READ_ONLY_TOOLS,
+        lease_id="old-lease",
+        self_id="1",
+        adapter_epoch=adapter._adapter_epoch,
+    )
+    old_binding = adapter_module.TurnBinding(
+        "reused-session",
+        "reused-turn",
+        old_caller,
+        lease_id="old-lease",
+        task_id="old-task",
+        adapter_epoch=adapter._adapter_epoch,
+    )
+    new_caller = replace(old_caller, lease_id="new-lease")
+    new_binding = replace(
+        old_binding,
+        caller=new_caller,
+        lease_id="new-lease",
+        task_id="new-task",
+    )
+    adapter._bindings.bind(old_binding)
+    adapter._bindings.discard_if_matches(old_binding)
+    adapter._bindings.bind(new_binding)
+    event = SimpleNamespace(
+        metadata={
+            "onebot11_binding_snapshot": old_binding.snapshot(),
+        },
+        media_urls=[],
+    )
+    adapter_module._CURRENT_CALLER.set(old_caller)
+    adapter_module._CURRENT_BINDING.set(old_binding)
+    try:
+        await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+        assert adapter._bindings.get("reused-session", "reused-turn") == new_binding
     finally:
         adapter_module._CURRENT_CALLER.set(None)
         adapter_module._CURRENT_BINDING.set(None)
@@ -2054,6 +2218,35 @@ async def test_send_multiple_images返回部分成功结果(monkeypatch):
     assert all(result.error_kind == "failed" for result in results)
 
 
+async def test_send_image在出站预检前不下载远程媒体(monkeypatch):
+    """未连接时先拒绝目标，不能先向外部媒体 URL 发请求。"""
+    monkeypatch.setattr(
+        BasePlatformAdapter,
+        "supports_media_delivery_results",
+        True,
+        raising=False,
+    )
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    adapter._chat_types["888"] = "group"
+    called = False
+
+    async def fail_if_downloaded(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("预检失败时不能下载图片")
+
+    monkeypatch.setattr(adapter._api, "download_to_temp", fail_if_downloaded)
+    result = await adapter.send_image("888", "https://media.example/image.png")
+
+    assert called is False
+    assert result.error_kind == "not_found"
+    await adapter.disconnect()
+
+
 async def test_send_multiple_images预检总量超限不访问OneBot(monkeypatch):
     """总大小超限时，所有图片都只返回预检失败，不能发送一半。"""
     monkeypatch.setattr(
@@ -2368,6 +2561,35 @@ async def test_出站marker后明确失败也进入uncertain(monkeypatch):
     event = SimpleNamespace(metadata={"onebot11_lease_id": "lease-2"}, media_urls=[])
     await adapter.on_processing_complete(event, ProcessingOutcome.FAILURE)
     assert completed == [("lease-2", "failure", True)]
+    await adapter.disconnect()
+
+
+async def test_文本已有成功块后异常按unknown(monkeypatch):
+    """第一块已发送时，后续本地异常也不能被当成可安全重试。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    adapter._ws = object()
+    adapter._chat_types["888"] = "group"
+    monkeypatch.setattr(adapter, "max_message_length_for_chat", lambda _chat_id: 3)
+    calls = 0
+
+    async def send_piece(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return "message-1"
+        raise ValueError("second block failed before request")
+
+    monkeypatch.setattr(adapter._api, "send_message", send_piece)
+    result = await adapter.send("888", "abcdef")
+
+    assert calls == 2
+    assert result.success is False
+    assert result.error_kind == "unknown"
+    assert result.raw_response["sent_chunks"] == 1
     await adapter.disconnect()
 
 

@@ -978,6 +978,7 @@ class QueueStore:
         now: float,
         *,
         anchor_seq: int | None = None,
+        force_new_anchor: bool = False,
     ) -> str | None:
         """插入或更新单条消息对应的 durable anchor。"""
         if trigger is None:
@@ -1041,6 +1042,7 @@ class QueueStore:
 
         if (
             str(trigger.reason) in {"queue_recovery", "completion_recovery", "restore"}
+            and not force_new_anchor
             and self._conn.execute(
                 """
                 SELECT request_id FROM onebot_queue_trigger
@@ -1155,29 +1157,66 @@ class QueueStore:
         now: float,
         *,
         include_unattempted: bool = False,
+        target_message_key: str | None = None,
     ) -> str | None:
         """为没有 durable trigger 的 pending 消息补触发请求。"""
-        existing = self._conn.execute(
-            """
-            SELECT request_id FROM onebot_queue_trigger
-            WHERE chat_id=? AND status='pending'
-            ORDER BY created_at, rowid LIMIT 1
-            """,
-            (str(chat_id),),
-        ).fetchone()
+        if target_message_key is None:
+            existing = self._conn.execute(
+                """
+                SELECT request_id FROM onebot_queue_trigger
+                WHERE chat_id=? AND status='pending'
+                ORDER BY created_at, rowid LIMIT 1
+                """,
+                (str(chat_id),),
+            ).fetchone()
+        else:
+            existing = self._conn.execute(
+                """
+                SELECT request_id FROM onebot_queue_trigger
+                WHERE chat_id=? AND message_key=? AND status='pending'
+                """,
+                (str(chat_id), str(target_message_key)),
+            ).fetchone()
         if existing is not None:
             return str(existing[0])
         attempts_clause = "" if include_unattempted else " AND attempts>0"
+        target_clause = ""
+        target_params: tuple[Any, ...] = ()
+        if target_message_key is not None:
+            target_clause = " AND message_key=?"
+            target_params = (str(target_message_key),)
+        anchor_clause = "" if target_message_key is not None else " AND anchor_id IS NULL"
         row = self._conn.execute(
             f"""
             SELECT * FROM onebot_queue_message
-            WHERE chat_id=? AND state='pending' AND anchor_id IS NULL{attempts_clause}
+            WHERE chat_id=? AND state='pending'{anchor_clause}{attempts_clause}
+              {target_clause}
             ORDER BY seq LIMIT 1
             """,
-            (str(chat_id),),
+            (str(chat_id), *target_params),
         ).fetchone()
         if row is None:
             return None
+        if target_message_key is not None:
+            stale_anchor_id = row["anchor_id"]
+            if stale_anchor_id is not None:
+                self._conn.execute(
+                    """
+                    UPDATE onebot_queue_message
+                    SET anchor_id=NULL, updated_at=?
+                    WHERE chat_id=? AND anchor_id=? AND state='pending'
+                    """,
+                    (now, str(chat_id), str(stale_anchor_id)),
+                )
+            else:
+                self._conn.execute(
+                    """
+                    UPDATE onebot_queue_message
+                    SET anchor_id=NULL, updated_at=?
+                    WHERE chat_id=? AND message_key=? AND state='pending'
+                    """,
+                    (now, str(chat_id), str(target_message_key)),
+                )
         authority_role, authority_tools, authority_self_id = self._authority_from_message_row(row)
         trigger = TriggerRequest.create(
             str(chat_id),
@@ -1195,6 +1234,7 @@ class QueueStore:
             str(row["message_key"]),
             now,
             anchor_seq=int(row["seq"]),
+            force_new_anchor=target_message_key is not None,
         )
 
     def _authority_from_message_row(
@@ -1336,7 +1376,11 @@ class QueueStore:
                     now,
                 )
                 if not trigger_rows:
-                    self._ensure_retriable_trigger(normalized_chat_id, now)
+                    self._ensure_retriable_trigger(
+                        normalized_chat_id,
+                        now,
+                        target_message_key=str(message_rows[0]["message_key"]),
+                    )
                 continue
 
             reason = "lease 过期时出站阶段未知，需管理员确认"
@@ -2137,7 +2181,11 @@ class QueueStore:
                     reason=failure_reason,
                 )
                 if final_trigger_state == "pending":
-                    self._ensure_retriable_trigger(str(rows[0]["chat_id"]), now)
+                    self._ensure_retriable_trigger(
+                        str(rows[0]["chat_id"]),
+                        now,
+                        target_message_key=str(rows[0]["message_key"]),
+                    )
                 self._conn.commit()
                 return cursor.rowcount > 0
             except Exception:
@@ -2153,7 +2201,12 @@ class QueueStore:
                 self._transaction()
                 now = self._now()
                 rows = self._conn.execute(
-                    "SELECT row_id FROM onebot_queue_message WHERE chat_id=? AND state IN ('uncertain','failed')",
+                    """
+                    SELECT row_id, message_key, seq
+                    FROM onebot_queue_message
+                    WHERE chat_id=? AND state IN ('uncertain','failed')
+                    ORDER BY seq
+                    """,
                     (str(chat_id),),
                 ).fetchall()
                 trigger_rows = self._conn.execute(
@@ -2190,6 +2243,7 @@ class QueueStore:
                             str(chat_id),
                             now,
                             include_unattempted=True,
+                            target_message_key=str(rows[0]["message_key"]),
                         )
                 else:
                     self._conn.execute(
@@ -2468,12 +2522,17 @@ class QueueStore:
                     candidate_scope_params,
                 ).fetchall()
                 ready_rows: list[sqlite3.Row] = []
+                blocked_chats: set[str] = set()
                 for row in candidate_rows:
+                    chat_id = str(row["chat_id"])
+                    if chat_id in blocked_chats:
+                        continue
                     if (
                         row["next_attempt_at"] is not None
                         and float(row["next_attempt_at"]) > now
                     ):
-                        break
+                        blocked_chats.add(chat_id)
+                        continue
                     message = self._conn.execute(
                         """
                         SELECT MIN(next_attempt_at) AS next_attempt_at
@@ -2493,7 +2552,8 @@ class QueueStore:
                         or message["next_attempt_at"] is not None
                         and float(message["next_attempt_at"]) > now
                     ):
-                        break
+                        blocked_chats.add(chat_id)
+                        continue
                     ready_rows.append(row)
                 return tuple(self._row_to_trigger(row) for row in ready_rows)
             except Exception:
@@ -2715,6 +2775,16 @@ class QueueStore:
                     lease_id = str(row["lease_id"])
                     chat_id = str(row["chat_id"])
                     is_uncertain = bool(row["uncertain"])
+                    first_message = self._conn.execute(
+                        """
+                        SELECT message_key
+                        FROM onebot_queue_message
+                        WHERE lease_id=? AND lease_owner=? AND state='leased'
+                        ORDER BY seq
+                        LIMIT 1
+                        """,
+                        (lease_id, self._owner_id),
+                    ).fetchone()
                     trigger_rows = self._conn.execute(
                         """
                         SELECT * FROM onebot_queue_trigger
@@ -2757,7 +2827,12 @@ class QueueStore:
                             "pending",
                             now,
                         )
-                        self._ensure_retriable_trigger(chat_id, now)
+                        if not trigger_rows and first_message is not None:
+                            self._ensure_retriable_trigger(
+                                chat_id,
+                                now,
+                                target_message_key=str(first_message["message_key"]),
+                            )
                         pending += 1
                 self._conn.commit()
                 return {"pending": pending, "uncertain": uncertain}

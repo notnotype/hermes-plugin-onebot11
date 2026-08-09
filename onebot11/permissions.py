@@ -170,6 +170,32 @@ class TurnBinding:
     turn_id: str
     caller: CallerContext
     lease_id: str | None = None
+    task_id: str | None = None
+    adapter_epoch: int | None = None
+
+    def snapshot(self) -> dict[str, Any]:
+        """返回可写入事件 metadata 的完整 binding 快照。"""
+        return {
+            "session_id": self.session_id,
+            "turn_id": self.turn_id,
+            "lease_id": self.lease_id,
+            "task_id": self.task_id,
+            "adapter_epoch": self.adapter_epoch,
+            "caller": {
+                "user_id": self.caller.user_id,
+                "chat_type": self.caller.chat_type,
+                "chat_id": self.caller.chat_id,
+                "role": self.caller.role,
+                "allowed_tools": sorted(self.caller.allowed_tools),
+                "lease_id": self.caller.lease_id,
+                "self_id": self.caller.self_id,
+                "adapter_epoch": self.caller.adapter_epoch,
+            },
+        }
+
+    def matches_snapshot(self, snapshot: Mapping[str, Any]) -> bool:
+        """只接受与当前 binding 完全一致的清理快照。"""
+        return self.snapshot() == dict(snapshot)
 
 
 class TurnBindingStore:
@@ -380,6 +406,16 @@ def role_for_user(
     if normalized in trusted_users:
         return "trusted_user"
     return "user"
+
+
+def shrink_role(snapshot_role: str, current_role: str) -> str | None:
+    """把持久 authority 限制在当前实时角色之内，禁止旧权限扩大。"""
+    rank = {"user": 0, "trusted_user": 1, "super_admin": 2}
+    snapshot = str(snapshot_role).strip()
+    current = str(current_role).strip()
+    if snapshot not in rank or current not in rank:
+        return None
+    return snapshot if rank[snapshot] <= rank[current] else current
 
 
 def role_prompt(context: CallerContext) -> str:

@@ -414,6 +414,22 @@ def test_完成时保留新消息建立的debounce状态():
     assert state.debounce_due == due_at
 
 
+def test_失败turn即使保留pending也退出engaged():
+    """失败、取消或未知结果不能把群留在成功后的连续对话窗口。"""
+    state = LayeredTriggerState(TriggerConfig(debounce_seconds=5))
+    state.on_turn_complete(success=True, now=0)
+    assert state.mode == "engaged"
+    state.on_turn_complete(
+        success=False,
+        now=1,
+        preserve_pending=True,
+        has_hard_trigger=False,
+    )
+    assert state.mode == "idle"
+    assert state.engaged_until is None
+    assert state.engaged_max_until is None
+
+
 def test_llm决策严格限制字段和等待秒数():
     """非法 JSON 结构不能被宽松转换成触发。"""
     assert parse_llm_decision({"decision": "trigger", "wait_seconds": 0}) == ("trigger", 0)

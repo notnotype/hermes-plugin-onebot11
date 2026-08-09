@@ -67,6 +67,8 @@ async def fake_server():
             data = {"messages": [{"message_id": 1, "message": [{"type": "text", "data": {"text": "历史1"}}]}]}
         elif action == "get_friend_msg_history":
             data = {"messages": [{"message_id": 2, "message": [{"type": "text", "data": {"text": "私聊历史"}}]}]}
+        elif action == "get_image":
+            data = {"file": body.get("file"), "url": "https://media.invalid/from-onebot.png"}
         else:
             data = {"message_id": 42}
         return web.json_response({"status": "ok", "retcode": 0, "data": data})
@@ -280,6 +282,17 @@ async def test_查询私聊历史(fake_server):
     assert messages[0]["message_id"] == 2
     assert calls[0]["path"] == "/get_friend_msg_history"
     assert calls[0]["params"]["user_id"] == 123456789
+    await api.close()
+
+
+async def test_通过get_image解析OneBot文件引用(fake_server):
+    """非 HTTP 图片 file 标识先交给 OneBot 解析，不猜宿主机路径。"""
+    base, calls, _ = fake_server
+    api = OneBotHttpApi(base_url=base)
+    url = await api.get_image("cache-id-1")
+    assert url == "https://media.invalid/from-onebot.png"
+    assert calls[0]["path"] == "/get_image"
+    assert calls[0]["params"] == {"file": "cache-id-1"}
     await api.close()
 
 

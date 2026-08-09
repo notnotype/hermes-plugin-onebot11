@@ -13,6 +13,7 @@ from onebot11.permissions import (
     build_trusted_users,
     parse_admin_list,
     role_for_user,
+    shrink_role,
     validate_message_scope,
     validate_tool_call,
 )
@@ -43,6 +44,16 @@ def test_trusted_user优先级和只读边界():
         allowed_tools=frozenset({"qq_get_message", "qq_set_group_ban"}),
     )
     assert validate_tool_call("qq_set_group_ban", {}, ctx, set()) is not None
+
+
+def test_旧authority只能随当前角色收紧不能扩大():
+    """权限撤销立即生效，旧快照不能因为当前配置变宽而恢复权限。"""
+    assert shrink_role("super_admin", "user") == "user"
+    assert shrink_role("super_admin", "trusted_user") == "trusted_user"
+    assert shrink_role("trusted_user", "user") == "user"
+    assert shrink_role("user", "super_admin") == "user"
+    assert shrink_role("trusted_user", "super_admin") == "trusted_user"
+    assert shrink_role("unknown", "super_admin") is None
 
 
 def test_trusted_user工具和用户列表只能来自明确配置():
@@ -131,6 +142,39 @@ def test_同一turn不可换绑调用者():
     store.bind(TurnBinding("session", "turn", first))
     with pytest.raises(ValueError):
         store.bind(TurnBinding("session", "turn", second))
+
+
+def test_旧task快照不能清理同key的新binding():
+    """重连后复用 session/turn key 时，旧 task 不能删除新 binding。"""
+    store = TurnBindingStore()
+    caller = CallerContext(
+        user_id="1",
+        chat_type="group",
+        chat_id="888",
+        adapter_epoch=2,
+    )
+    old = TurnBinding(
+        "session",
+        "turn",
+        caller,
+        lease_id="lease-old",
+        task_id="task-old",
+        adapter_epoch=1,
+    )
+    new = TurnBinding(
+        "session",
+        "turn",
+        caller,
+        lease_id="lease-new",
+        task_id="task-new",
+        adapter_epoch=2,
+    )
+    store.bind(old)
+    store.discard_if_matches(old)
+    store.bind(new)
+
+    assert store.discard_if_matches(old) is False
+    assert store.get("session", "turn") == new
 
 
 def test_私聊历史作用域要求同时包含用户和机器人():
