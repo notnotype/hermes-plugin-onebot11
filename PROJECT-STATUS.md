@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- **阶段**：`fix/i13-onebot11-closeout` 基于已合并的 `master`/PR #12，完成 Issue #13 的恢复、权限、连接生命周期和媒体输入收口，已创建插件 PR #14 且 CI 通过。Hermes strict auxiliary 与媒体/unknown 合同在独立 worktree，Arch 仍运行旧插件/旧 Hermes，未切换生产队列。
+- **阶段**：`fix/i13-onebot11-closeout` 基于已合并的 `master`/PR #12，完成 Issue #13 的恢复、权限、连接生命周期和媒体输入收口，已创建插件 PR #14 且 CI 通过。Arch 已通过源码 checkout + symlink 部署该分支的 `fc81edf`；Hermes strict auxiliary 与媒体/unknown 合同仍在独立 worktree，尚未部署。
 - **核心合同**：群固定一个共享 session；群消息持久入队；每个真实 TurnAnchor 固定 batch 和 authority，同群按序单 lease follow-up；非幂等出站结果未知时进入 `uncertain`，不自动重放。
 - **本地验证**：纯协议/状态机测试和 Hermes 组合测试均通过；独立 Hermes worktree 的 strict/media 合同只作为组合验收依赖，不代表远端 Hermes 已发布。
 
@@ -37,6 +37,24 @@
 
 2026-08-08 在 Arch `ssh arch` 上做过受控联调，严格固定机器人 QQ `3101482118`、唯一允许群 `1072992996` 和唯一允许私聊用户 `2056963663`；原始配置、`.env`、SQLite、session 和 LLBot 配置已备份到 `/home/notnotype/.hermes/onebot11-backup-20260808-turn-anchor-contract/`。联调结束后 Hermes 已恢复到原主分支 `91937a6`，没有把本次 PR 的代码留在生产运行路径。
 
+2026-08-09 已切换为源码 checkout 部署，新增备份位于
+`/home/notnotype/.hermes/onebot11-backup-20260809-git-pull-i13/`：
+
+- `/home/notnotype/CodeRepository/hermes-plugin-onebot11` 当前为
+  `fix/i13-onebot11-closeout` 的 `fc81edf`，工作树干净。
+- `/home/notnotype/.hermes/plugins/onebot11-platform` symlink 指向上述 checkout；
+  后续更新使用 `git pull --ff-only`，不再复制插件目录。
+- `hermes-gateway.service` 为 active，OneBot WS 监听 `0.0.0.0:18880`，并已观察到
+  LLBot 的已建立连接。
+- OneBot queue 已从 schema 10 迁移到 schema 11；旧 schema 10 中指定群的 2 条
+  stale pending 消息已清理，Hermes session 未删除。
+- 当前白名单仍为群 `1072992996`、私聊用户 `2056963663`、机器人 `3101482118`；
+  部署过程没有发送测试消息。
+
+Arch Hermes 仍是旧版本 `91937a6`，不支持 strict auxiliary 和媒体结果合同；因此当前
+部署会安全禁用 LLM trigger，并拒绝 OneBot 出站图片能力，文本、队列、权限、hard
+trigger 和 `👀` best-effort 继续可用。
+
 此前部署的 PR #8/TurnAnchor 版本已确认：
 
 - OneBot `get_login_info` 返回 `retcode=0`、机器人 QQ `3101482118`；当前 WS 在 `0.0.0.0:18880` 监听。
@@ -44,15 +62,15 @@
 - LLBot 日志确认对真实消息 `2076873675` 先发送 `emoji_id=128064,set=true`，Hermes 回复到指定群后再发送 `set=false`；回复消息 ID 为 `438359985`。这是真实消息 ID 的受控重放，不等同于真人刚发消息。
 - 重启 Hermes gateway 前后指定群均为 `schema=9、pending=9、无 trigger`，WS 恢复监听，pending 保留；这是旧生产版本的历史证据，不代表当前 schema 11 分支已部署。
 - 白名单外群 `999999999` 的事件被拒绝，SQLite 中该群为 0 行，指定群队列未变化，没有产生出站。
-- 2026-08-09 只读检查确认 Arch 当前 `.env` 白名单仍为群 `1072992996`、用户 `2056963663`、机器人 `3101482118`，但 `config.yaml` 的 `roles.super_admin.tools` 仍残留 `image_generate`、`onebot_get_permissions`、`onebot_set_role_tools`、`onebot_set_trusted_users` 这 4 个本插件不存在的工具；部署 `0.5.0` 前必须清理，当前未修改远端配置。
+- 2026-08-09 部署前已从 Arch `config.yaml` 的 `roles.super_admin.tools` 清理本插件不存在的
+  `image_generate`、`onebot_get_permissions`、`onebot_set_role_tools`、
+  `onebot_set_trusted_users` 这 4 个工具；原配置已包含在当天部署备份中。
 
-本次 `0.5.0` 图片/unknown 变更尚未在 Arch 生产部署。通过隔离 queue 和真实 OneBot HTTP/WS adapter smoke 验证了 image-only、文字+图片、多图的 `base64://` segment，以及正负 message id 的 `👀` 添加/移除；这些消息没有经过生产 Agent pipeline，因此真实 QQ Agent 的图片-only、文字+图片、多图、部分成功/unknown 和真人并发仍是待验收项。
-
-Arch 当前生产 live queue 仍为 schema 10，来自 detached Task 5 实现；当前分支已支持真实 v7/v8/v9/v10 表结构迁移并升级到 schema 11，但尚未切换生产 queue。此前没有修改 `PRAGMA user_version`，也没有删除或覆盖生产 queue。
+本次 `0.5.0` 图片/unknown 代码已随插件分支部署，但 Arch 旧 Hermes 不具备媒体结果合同，因此图片出站仍按插件合同安全禁用；真实 Agent pipeline 的图片-only、文字+图片、多图、部分成功/unknown 和真人并发仍是待验收项。Arch live queue 已为 schema 11，旧 pending 清理前已完成完整备份。
 
 ## Issue #13 交付状态
 
-- 当前分支代码尚未部署；以上入站仍是历史版本的受控反向 WS payload，不等同于 QQ 客户端真人发言。两名真人群成员同时 @、当前版本重启恢复和当前版本的 unknown/resolve 仍需外部验收。
+- 当前分支已部署到 Arch，但以上入站仍是历史版本的受控反向 WS payload，不等同于 QQ 客户端真人发言。两名真人群成员同时 @、当前版本重启恢复和当前版本的 unknown/resolve 仍需外部验收。
 - 本分支的非幂等出站 `unknown` 和 `resolve action retry|discard` 尚未在真实 QQ 上制造；联调不执行禁言、踢人、撤回或全员禁言。
 - LLBot 当前请求日志会打印 Bearer header；插件不会把 token 发送到外部媒体地址，但部署侧应在生产前关闭该日志或轮换 token。未在本轮擅自修改 LLBot 凭据。
 - 未在本轮使用 NapCat，也未把 WS 重连重放行为提升为协议保证。

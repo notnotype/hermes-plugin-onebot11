@@ -13,7 +13,32 @@
 - **工具与管理**：提供当前群/私聊范围内的查询工具，以及撤回、禁言、踢人、全员禁言工具。写操作只生成预览，必须由同一超级管理员在同一目标群发送短期确认命令。
 - **可靠性**：队列支持崩溃恢复、去重、lease heartbeat 和人工处理 `uncertain` 出站结果。OneBot 非幂等请求不自动重试、unknown 不走 plain-text 或 cron standalone fallback，不承诺 exactly-once。
 
-当前 `0.5.0` 收口代码在 Issue #13 分支上开发，尚未部署到 Arch。Arch 仍运行旧插件和旧 Hermes；旧 Hermes 会安全禁用严格旁路 LLM trigger 与 OneBot 出站图片，不会偷偷回退主模型或把图片 URL 当文本发送。插件本地测试、Hermes 独立 worktree 组合测试和真实 Arch/LLBot 验收是三种不同证据，不能互相替代。
+当前 `0.5.0` 收口代码在 Issue #13 分支上开发，并已按该分支部署到 Arch。Arch 使用
+`/home/notnotype/CodeRepository/hermes-plugin-onebot11` 作为唯一源码 checkout，
+`/home/notnotype/.hermes/plugins/onebot11-platform` 通过 symlink 指向该 checkout；
+Hermes 由 `systemctl --user hermes-gateway.service` 管理。当前部署 commit 为
+`fc81edf`，queue 已迁移到 schema 11。Arch Hermes 仍是旧版本，因此会安全禁用严格旁路
+LLM trigger 与 OneBot 出站图片，不会偷偷回退主模型或把图片 URL 当文本发送。插件本地测试、
+Hermes 独立 worktree 组合测试和真实 Arch/LLBot 验收是三种不同证据，不能互相替代。
+
+## Arch 部署约定
+
+Arch 不再使用手工复制的插件目录。日常更新流程是：
+
+```bash
+# 本机：完成代码、测试并推送目标分支
+git push origin <branch>
+
+# Arch：只快进更新源码 checkout
+cd /home/notnotype/CodeRepository/hermes-plugin-onebot11
+git pull --ff-only
+systemctl --user restart hermes-gateway.service
+```
+
+部署前后检查 `git log -1`、`systemctl --user is-active hermes-gateway.service`、
+`ss -ltnp | grep 18880` 和当前 OneBot 白名单。当前受控部署只允许群
+`1072992996`、私聊用户 `2056963663` 和机器人 `3101482118`。如需回滚，在 Arch
+checkout 中切换到已验证 commit 后重启服务，不直接改写 Hermes 插件目录。
 
 ## 环境要求
 
@@ -201,7 +226,8 @@ python scripts/verify_hermes_integration.py \
 `import onebot11`，根目录 `adapter.py` 需要 Hermes gateway 依赖。
 
 当前本地证据为：纯插件 `171 passed, 1 skipped`，Hermes 组合 `263 passed`；
-Arch/LLBot 的当前版本真人并发、重启恢复和 unknown 管理动作仍需单独验收。
+Arch/LLBot 已完成源码 checkout、schema 迁移、服务启动、WS 建连和旧 pending 清理；
+当前版本真人并发、重启恢复和 unknown 管理动作仍需单独验收。
 
 ## License
 

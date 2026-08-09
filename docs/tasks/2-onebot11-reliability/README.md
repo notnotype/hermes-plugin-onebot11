@@ -1,7 +1,7 @@
 # OneBot 11 可靠性与安全完善
 
 - 关联需求：OneBot 11 插件整体完善计划
-- 状态：PR #12 已合并；Issue #13 的 `fix/i13-onebot11-closeout` 完成恢复顺序、authority 收紧、旧 task fencing、畸形 WS 隔离、`get_image` 输入解析和图片 preflight，已创建插件 PR #14 且 CI 通过。Hermes strict auxiliary 与媒体合同分别保留在独立 worktree，Arch 仍未部署本轮代码。
+- 状态：PR #12 已合并；Issue #13 的 `fix/i13-onebot11-closeout` 完成恢复顺序、authority 收紧、旧 task fencing、畸形 WS 隔离、`get_image` 输入解析和图片 preflight，已创建插件 PR #14 且 CI 通过。插件分支已通过源码 checkout + symlink 部署到 Arch，并完成 schema 11 迁移、服务启动和 WS 建连；Hermes strict auxiliary 与媒体合同仍保留在独立 worktree，尚未部署。
 - 开始日期：2026-08-05
 
 ## 目标
