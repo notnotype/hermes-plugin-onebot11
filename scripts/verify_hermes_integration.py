@@ -5,8 +5,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
-import importlib.util
-import inspect
 import os
 import subprocess
 import sys
@@ -58,57 +56,10 @@ def _run_tests(
     *,
     plugin_root: Path,
     env: dict[str, str],
-    auxiliary_source: Path | None,
 ) -> None:
-    """运行插件全套测试和可选的 Hermes strict auxiliary 测试。"""
-    if auxiliary_source is None:
-        command = [sys.executable, "-m", "pytest", "-q"]
-    else:
-        injection = """
-import importlib.util
-import sys
-from pathlib import Path
-import agent
-source = Path(sys.argv[1]) / "agent" / "auxiliary_client.py"
-spec = importlib.util.spec_from_file_location("agent.auxiliary_client", source)
-module = importlib.util.module_from_spec(spec)
-assert spec.loader is not None
-spec.loader.exec_module(module)
-sys.modules["agent.auxiliary_client"] = module
-agent.auxiliary_client = module
-import pytest
-raise SystemExit(pytest.main(["-q"]))
-"""
-        command = [sys.executable, "-c", injection, str(auxiliary_source)]
+    """在 Hermes 组合环境中运行插件测试。"""
+    command = [sys.executable, "-m", "pytest", "-q"]
     result = subprocess.run(command, cwd=plugin_root, env=env, check=False)
-    if result.returncode:
-        raise SystemExit(result.returncode)
-    if auxiliary_source is None:
-        return
-    test_file = auxiliary_source / "tests" / "agent" / "test_auxiliary_no_fallback.py"
-    if not test_file.is_file():
-        raise FileNotFoundError(f"找不到 strict auxiliary 测试: {test_file}")
-    injection = """
-import importlib.util
-import sys
-from pathlib import Path
-import agent
-source = Path(sys.argv[1]) / "agent" / "auxiliary_client.py"
-spec = importlib.util.spec_from_file_location("agent.auxiliary_client", source)
-module = importlib.util.module_from_spec(spec)
-assert spec.loader is not None
-spec.loader.exec_module(module)
-sys.modules["agent.auxiliary_client"] = module
-agent.auxiliary_client = module
-import pytest
-raise SystemExit(pytest.main(["-q", sys.argv[2]]))
-"""
-    result = subprocess.run(
-        [sys.executable, "-c", injection, str(auxiliary_source), str(test_file)],
-        cwd=plugin_root,
-        env=env,
-        check=False,
-    )
     if result.returncode:
         raise SystemExit(result.returncode)
 
@@ -140,7 +91,6 @@ class _RegistrationContext:
         self.platforms: list[dict] = []
         self.tools: list[dict] = []
         self.hooks: list[tuple[str, object]] = []
-        self.auxiliary: list[dict] = []
 
     def register_platform(self, **kwargs: object) -> None:
         """记录平台注册参数。"""
@@ -154,51 +104,30 @@ class _RegistrationContext:
         """记录 hook 注册参数。"""
         self.hooks.append((name, callback))
 
-    def register_auxiliary_task(self, **kwargs: object) -> None:
-        """记录 auxiliary 注册参数。"""
-        self.auxiliary.append(kwargs)
-
-
-def _strict_auxiliary_supported() -> bool:
-    """检查当前 Hermes auxiliary API 是否有严格旁路参数。"""
-    from agent.auxiliary_client import async_call_llm
-
-    parameters = inspect.signature(async_call_llm).parameters
-    return {"fallback_policy", "max_attempts"}.issubset(parameters)
-
-
-def _inject_auxiliary_source(auxiliary_source: Path | None) -> None:
-    """把独立 Hermes worktree 的 auxiliary_client 注入当前进程。"""
-    if auxiliary_source is None:
-        return
-    source = auxiliary_source / "agent" / "auxiliary_client.py"
-    if not source.is_file():
-        raise FileNotFoundError(f"找不到 auxiliary_client.py: {source}")
-    import agent
-
-    spec = importlib.util.spec_from_file_location("agent.auxiliary_client", source)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"无法加载 auxiliary_client.py: {source}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    sys.modules["agent.auxiliary_client"] = module
-    agent.auxiliary_client = module
-
 
 async def _smoke(
     plugin_root: Path,
     hermes_home: Path,
-    auxiliary_source: Path | None,
-    require_strict: bool,
 ) -> None:
-    """执行平台、工具、hooks、shared session 和 reconnect smoke。"""
+    """执行平台、工具、hooks、shared session、reconnect 和图片 smoke。"""
     del plugin_root
-    _inject_auxiliary_source(auxiliary_source)
     _register_platform_if_needed()
     from gateway.config import PlatformConfig
-    from gateway.platforms.base import BasePlatformAdapter
 
     import adapter
+
+    # 使用不存在的 provider 做离线 helper smoke：验证 Node、npm 依赖、
+    # stdin/stdout 合同已经接通，但不向任何真实模型发送请求。
+    try:
+        await adapter.PiAiTriggerClient(
+            provider="onebot11-test-provider",
+            model="onebot11-test-model",
+        ).complete("只做离线 helper smoke", timeout_seconds=5)
+    except adapter.PiAiTriggerError as error:
+        if error.kind != "provider_missing":
+            raise AssertionError(f"pi-ai helper 失败分类错误: {error.kind}") from error
+    else:
+        raise AssertionError("不存在的 pi-ai provider 不应返回成功")
 
     context = _RegistrationContext()
     adapter.register(context)
@@ -208,13 +137,6 @@ async def _smoke(
         raise AssertionError(f"工具注册数量错误: {len(context.tools)}")
     if len(context.hooks) != 4:
         raise AssertionError(f"hook 注册数量错误: {len(context.hooks)}")
-    if not any(item.get("key") == "onebot11_trigger" for item in context.auxiliary):
-        raise AssertionError("onebot11_trigger auxiliary 未注册")
-
-    strict = _strict_auxiliary_supported()
-    if require_strict and not strict:
-        raise AssertionError("当前 Hermes auxiliary API 不支持 fallback_policy/max_attempts")
-
     queue_db = hermes_home / "onebot11" / "integration.sqlite3"
     config = PlatformConfig(
         enabled=True,
@@ -306,26 +228,18 @@ async def _smoke(
             )
         finally:
             instance._api.send_message_segments = original_send_segments
-        media_contract = bool(
-            getattr(BasePlatformAdapter, "supports_media_delivery_results", False)
+        if not image_result.success or not captured_segments:
+            raise AssertionError(f"图片出站 smoke 失败: {image_result!r}")
+        image_segment = next(
+            segment
+            for segment in captured_segments[0]
+            if segment.get("type") == "image"
         )
-        if media_contract:
-            if not image_result.success or not captured_segments:
-                raise AssertionError(f"图片出站 smoke 失败: {image_result!r}")
-            image_segment = next(
-                segment
-                for segment in captured_segments[0]
-                if segment.get("type") == "image"
-            )
-            encoded_image = str(image_segment["data"]["file"])
-            if not encoded_image.startswith("base64://") or base64.b64decode(
-                encoded_image.removeprefix("base64://")
-            ) != b"\x89PNG\r\n\x1a\nintegration":
-                raise AssertionError("图片 smoke 没有生成正确 base64 segment")
-        elif image_result.success or image_result.error_kind != "unsupported" or captured_segments:
-            raise AssertionError(
-                "旧 Hermes 图片能力降级合同失败：应返回 unsupported 且不访问 OneBot"
-            )
+        encoded_image = str(image_segment["data"]["file"])
+        if not encoded_image.startswith("base64://") or base64.b64decode(
+            encoded_image.removeprefix("base64://")
+        ) != b"\x89PNG\r\n\x1a\nintegration":
+            raise AssertionError("图片 smoke 没有生成正确 base64 segment")
 
         # standalone cron 不依赖当前 session 或入站历史；用本地 monkeypatch
         # 验证目标类型和允许群合同，不访问真实 OneBot endpoint。
@@ -373,7 +287,7 @@ async def _smoke(
     print(
         "Hermes integration smoke passed: "
         f"tools={len(context.tools)} hooks={len(context.hooks)} "
-        f"strict_auxiliary={strict} reconnect=True"
+        "pi_ai_trigger=True reconnect=True"
     )
 
 
@@ -383,18 +297,11 @@ def main() -> int:
     parser.add_argument("--plugin-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--hermes-source", type=Path, required=True)
     parser.add_argument("--hermes-site-packages", type=Path)
-    parser.add_argument("--hermes-auxiliary-source", type=Path)
     parser.add_argument("--skip-tests", action="store_true")
-    parser.add_argument("--require-strict", action="store_true")
     args = parser.parse_args()
 
     plugin_root = args.plugin_root.resolve()
     hermes_source = args.hermes_source.resolve()
-    auxiliary_source = (
-        args.hermes_auxiliary_source.resolve()
-        if args.hermes_auxiliary_source
-        else None
-    )
     site_packages = _site_packages(
         hermes_source,
         args.hermes_site_packages.resolve() if args.hermes_site_packages else None,
@@ -411,7 +318,6 @@ def main() -> int:
             _run_tests(
                 plugin_root=plugin_root,
                 env=env,
-                auxiliary_source=auxiliary_source,
             )
         old_python_path = os.environ.get("PYTHONPATH")
         old_hermes_home = os.environ.get("HERMES_HOME")
@@ -429,8 +335,6 @@ def main() -> int:
                 _smoke(
                     plugin_root,
                     hermes_home,
-                    auxiliary_source,
-                    args.require_strict or auxiliary_source is not None,
                 )
             )
         finally:

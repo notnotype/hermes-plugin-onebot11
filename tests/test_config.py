@@ -166,6 +166,76 @@ def test_llm_trigger结构和旁路路由必须严格():
                 }
             )
         )
+    with pytest.raises(ValueError):
+        parse_runtime_config(
+            _extra(
+                llm_trigger={
+                    "enabled": True,
+                    "provider": "custom",
+                    "model": "small",
+                    "base_url": "https://example.invalid/v1",
+                    "api_key": "must-not-be-here",
+                    "api_key_env": "ONEBOT11_TRIGGER_KEY",
+                    "groups": ["888"],
+                }
+            )
+        )
+
+
+def test_custom_llm_trigger必须使用安全endpoint和环境变量():
+    """自定义 provider 不能把密钥或任意协议带进运行时配置。"""
+    runtime = parse_runtime_config(
+        _extra(
+            llm_trigger={
+                "enabled": True,
+                "provider": "custom",
+                "model": "small",
+                "base_url": "https://example.invalid/v1",
+                "api_key_env": "ONEBOT11_TRIGGER_KEY",
+                "groups": ["888"],
+            }
+        )
+    )
+    assert runtime.trigger_config.llm_base_url == "https://example.invalid/v1"
+    assert runtime.trigger_config.llm_api_key_env == "ONEBOT11_TRIGGER_KEY"
+    with pytest.raises(ValueError):
+        parse_runtime_config(
+            _extra(
+                llm_trigger={
+                    "enabled": True,
+                    "provider": "custom",
+                    "model": "small",
+                    "api_key_env": "ONEBOT11_TRIGGER_KEY",
+                    "groups": ["888"],
+                }
+            )
+        )
+    with pytest.raises(ValueError):
+        parse_runtime_config(
+            _extra(
+                llm_trigger={
+                    "enabled": True,
+                    "provider": "custom",
+                    "model": "small",
+                    "base_url": "file:///tmp/secret",
+                    "api_key_env": "ONEBOT11_TRIGGER_KEY",
+                    "groups": ["888"],
+                }
+            )
+        )
+    with pytest.raises(ValueError):
+        parse_runtime_config(
+            _extra(
+                llm_trigger={
+                    "enabled": True,
+                    "provider": "custom",
+                    "model": "small",
+                    "base_url": "https://example.invalid/v1",
+                    "api_key_env": "ONEBOT11-KEY",
+                    "groups": ["888"],
+                }
+            )
+        )
 
 
 def test_home_channel必须显式声明目标类型():

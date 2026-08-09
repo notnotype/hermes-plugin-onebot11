@@ -28,6 +28,8 @@ class TriggerConfig:
     llm_enabled: bool = False
     llm_provider: str = ""
     llm_model: str = ""
+    llm_base_url: str = ""
+    llm_api_key_env: str = ""
     llm_timeout_seconds: float = 10.0
     llm_input_bytes: int = 12_000
     llm_concurrency: int = 2
@@ -552,6 +554,44 @@ def build_trigger_config(extra: dict[str, Any]) -> TriggerConfig:
     model = raw_model.strip()
     if llm_enabled and (not provider or not model):
         raise ValueError("启用 LLM trigger 时必须配置 provider 和 model")
+    raw_base_url = _setting(extra, raw_llm, "llm_trigger_base_url", raw_llm.get("base_url", ""))
+    if "api_key" in raw_llm or "llm_trigger_api_key" in extra:
+        raise ValueError("llm_trigger 不允许直接配置 api_key，只能配置 api_key_env")
+    if raw_base_url is None:
+        raw_base_url = ""
+    if not isinstance(raw_base_url, str):
+        raise ValueError("llm_trigger base_url 必须是字符串")
+    base_url = raw_base_url.strip()
+    if base_url:
+        from urllib.parse import urlparse
+
+        parsed_url = urlparse(base_url)
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+            raise ValueError("llm_trigger base_url 必须是 http/https URL")
+        if parsed_url.username or parsed_url.password:
+            raise ValueError("llm_trigger base_url 不能包含用户名或密码")
+        if parsed_url.query or parsed_url.fragment:
+            raise ValueError("llm_trigger base_url 不能包含 query 或 fragment")
+    raw_api_key_env = _setting(
+        extra,
+        raw_llm,
+        "llm_trigger_api_key_env",
+        raw_llm.get("api_key_env", ""),
+    )
+    if raw_api_key_env is None:
+        raw_api_key_env = ""
+    if not isinstance(raw_api_key_env, str):
+        raise ValueError("llm_trigger api_key_env 必须是字符串")
+    api_key_env = raw_api_key_env.strip()
+    if api_key_env and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", api_key_env):
+        raise ValueError("llm_trigger api_key_env 不是合法环境变量名")
+    if llm_enabled and provider.casefold() == "custom":
+        if not base_url:
+            raise ValueError("custom llm_trigger 必须配置 base_url")
+        if not api_key_env:
+            raise ValueError("custom llm_trigger 必须配置 api_key_env")
+    if base_url and provider.casefold() != "custom":
+        raise ValueError("llm_trigger base_url 只允许与 provider=custom 一起使用")
     allowed_groups = _parse_group_ids(
         _setting(extra, raw_llm, "llm_trigger_groups", raw_llm.get("groups"))
     )
@@ -623,6 +663,8 @@ def build_trigger_config(extra: dict[str, Any]) -> TriggerConfig:
         llm_enabled=llm_enabled,
         llm_provider=provider,
         llm_model=model,
+        llm_base_url=base_url,
+        llm_api_key_env=api_key_env,
         llm_timeout_seconds=timeout,
         llm_input_bytes=input_bytes,
         llm_concurrency=concurrency,
