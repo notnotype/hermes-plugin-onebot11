@@ -44,7 +44,7 @@
 - LLBot 日志确认对真实消息 `2076873675` 先发送 `emoji_id=128064,set=true`，Hermes 回复到指定群后再发送 `set=false`；回复消息 ID 为 `438359985`。这是真实消息 ID 的受控重放，不等同于真人刚发消息。
 - 重启 Hermes gateway 前后指定群均为 `schema=9、pending=9、无 trigger`，WS 恢复监听，pending 保留；这是旧生产版本的历史证据，不代表当前 schema 11 分支已部署。
 - 白名单外群 `999999999` 的事件被拒绝，SQLite 中该群为 0 行，指定群队列未变化，没有产生出站。
-- Arch 配置原有 `roles.super_admin.tools: image_generate`（非 OneBot 工具），在备份后按 fail-closed 合同移除；白名单、token、机器人 QQ 和 LLBot 配置未放宽。
+- 2026-08-09 只读检查确认 Arch 当前 `.env` 白名单仍为群 `1072992996`、用户 `2056963663`、机器人 `3101482118`，但 `config.yaml` 的 `roles.super_admin.tools` 仍残留 `image_generate`、`onebot_get_permissions`、`onebot_set_role_tools`、`onebot_set_trusted_users` 这 4 个本插件不存在的工具；部署 `0.5.0` 前必须清理，当前未修改远端配置。
 
 本次 `0.5.0` 图片/unknown 变更尚未在 Arch 生产部署。通过隔离 queue 和真实 OneBot HTTP/WS adapter smoke 验证了 image-only、文字+图片、多图的 `base64://` segment，以及正负 message id 的 `👀` 添加/移除；这些消息没有经过生产 Agent pipeline，因此真实 QQ Agent 的图片-only、文字+图片、多图、部分成功/unknown 和真人并发仍是待验收项。
 
