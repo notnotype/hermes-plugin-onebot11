@@ -79,6 +79,11 @@ class ConfirmationStore:
                 return None
             return item
 
+    def clear(self) -> None:
+        """清空 reload 前签发的所有确认令牌。"""
+        with self._lock:
+            self._items.clear()
+
     def _purge(self, now: float) -> None:
         """删除过期令牌。"""
         for token, item in list(self._items.items()):

@@ -120,6 +120,100 @@ async def test_同一adapter断开后可以重连并继续使用队列(monkeypat
     await adapter.disconnect()
 
 
+async def test_policy_reload原子替换权限并清理旧确认令牌(monkeypatch):
+    """reload 只替换热策略，旧确认令牌不能跨配置继续执行。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_ALLOWED_GROUPS="888",
+    )
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    old_caller = adapter._caller_for_event(
+        SimpleNamespace(user_id="123", chat_type="group", chat_id="888")
+    )
+    old_metadata = adapter_module._serializable_caller(old_caller)
+    confirmation = adapter._confirmations.issue(
+        "qq_set_group_whole_ban",
+        {"enable": True},
+        user_id="1",
+        chat_type="group",
+        chat_id="888",
+    )
+    candidate = dict(adapter._runtime_config.extra)
+    candidate.update(
+        {
+            "allowed_groups": ["999"],
+            "roles": {
+                "user": {"tools": []},
+                "trusted_user": {"tools": []},
+                "super_admin": {"tools": ["qq_get_message"]},
+            },
+        }
+    )
+    # 环境变量是 YAML 的覆盖层；这里清掉构造 adapter 时注入的部署值，
+    # 才能单独验证 Hermes 配置 reload 的热更新结果。
+    monkeypatch.delenv("ONEBOT11_ALLOWED_GROUPS", raising=False)
+    monkeypatch.setattr(adapter, "_load_reload_extra", lambda: candidate)
+
+    success, message = await adapter.reload_policy()
+
+    assert success is True
+    assert "version=2" in message
+    assert adapter.policy_snapshot.version == 2
+    assert adapter.allowed_groups == {"999"}
+    assert adapter.role_tools["user"] == frozenset()
+    assert adapter._confirmations.consume_any(confirmation.token) is None
+    # 已创建的 turn 继续使用创建时的工具快照，但目标白名单仍由当前策略校验。
+    assert adapter_module._caller_from_metadata(old_metadata) is None
+
+    candidate["allowed_groups"] = ["888"]
+    monkeypatch.setattr(adapter, "_load_reload_extra", lambda: candidate)
+    success, _message = await adapter.reload_policy()
+    assert success is True
+    restored = adapter_module._caller_from_metadata(old_metadata)
+    assert restored is not None
+    assert restored.allowed_tools == old_caller.allowed_tools
+    await adapter.disconnect()
+
+
+async def test_policy_reload拒绝静态连接配置变化(monkeypatch):
+    """HTTP/队列等静态字段变化必须明确要求重启。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    candidate = dict(adapter._runtime_config.extra)
+    candidate["http_api"] = "http://127.0.0.1:4000"
+    # 静态字段变化测试应来自配置文件，而不是被环境覆盖层遮蔽。
+    monkeypatch.delenv("ONEBOT11_HTTP_API", raising=False)
+    monkeypatch.setattr(adapter, "_load_reload_extra", lambda: candidate)
+
+    success, message = await adapter.reload_policy()
+
+    assert success is False
+    assert "需要重启" in message
+    assert adapter.policy_snapshot.version == 1
+    assert adapter._policy_reload_error is not None
+    await adapter.disconnect()
+
+
+def test_reload支持Hermes_gateway的PlatformConfig结果():
+    """运行时 reload 读取 Hermes 合并后的 GatewayConfig，而非猜 YAML 结构。"""
+    gateway_config = SimpleNamespace(
+        platforms={
+            "onebot11": SimpleNamespace(
+                extra={"allowed_groups": ["1072992996"], "plain_text_enabled": True}
+            )
+        }
+    )
+    assert adapter_module._extract_onebot_extra(gateway_config) == {
+        "allowed_groups": ["1072992996"],
+        "plain_text_enabled": True,
+    }
+
+
 async def test_reconnect使旧DM身份快照失效(monkeypatch, tmp_path):
     """同一 adapter 重连后，旧 DM task 不能重新建立权限绑定。"""
     adapter = _make_adapter(
@@ -511,7 +605,7 @@ async def test文本图片和多图片出站复用同一metadata_binding(monkeyp
             },
         }
     )
-    image_payload = b"\x89PNG\r\n\x1a\nimage"
+    image_payload = b"\x89PNG\r\n\x1a\nremote-image"
     calls: list[dict] = []
 
     async def fake_segments(
@@ -538,8 +632,8 @@ async def test文本图片和多图片出站复用同一metadata_binding(monkeyp
     monkeypatch.setattr(adapter._api, "download_to_temp", fake_download)
     first = Path(adapter._media_root) / "binding-first.png"
     second = Path(adapter._media_root) / "binding-second.png"
-    first.write_bytes(image_payload)
-    second.write_bytes(image_payload)
+    first.write_bytes(b"\x89PNG\r\n\x1a\nfirst-image")
+    second.write_bytes(b"\x89PNG\r\n\x1a\nsecond-image")
     event_token = adapter_module._CURRENT_EVENT.set(event)
     caller_token = adapter_module._CURRENT_CALLER.set(caller)
     binding_token = adapter_module._CURRENT_BINDING.set(None)
@@ -2631,6 +2725,158 @@ async def test_send_image_file使用base64segment并保留reply(monkeypatch, fak
         await adapter.disconnect()
 
 
+async def test_send默认转换为纯文本并记录marker不可用(monkeypatch, fake_http_server):
+    """OneBot 出站不应把 Markdown 语法或图片 marker 原样发送。"""
+    base, calls = fake_http_server
+    adapter = _make_adapter(monkeypatch, ONEBOT11_HTTP_API=base, ONEBOT11_SELF_ID="1")
+    await adapter.connect()
+    audit_events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        adapter._audit,
+        "record",
+        lambda event, data: audit_events.append((event, data)),
+    )
+    try:
+        adapter._chat_types["888"] = "group"
+        result = await adapter.send(
+            "888",
+            "# 标题\n**重点**\n[[onebot11:markdown-image]]![图](https://example.invalid/a.png)[[/onebot11:markdown-image]]",
+        )
+        assert result.success
+        sent_text = calls[0]["params"]["message"][0]["data"]["text"]
+        assert sent_text == "标题\n重点\n图 (https://example.invalid/a.png)"
+        assert "onebot11:markdown-image" not in sent_text
+        assert any(event == "markdown_image_requested_unavailable" for event, _data in audit_events)
+    finally:
+        await adapter.disconnect()
+
+
+async def test_明确控制面metadata不污染业务出站状态(monkeypatch, fake_http_server):
+    """未来 Hermes heartbeat 只能凭显式 metadata 走控制面路径。"""
+    base, calls = fake_http_server
+    adapter = _make_adapter(monkeypatch, ONEBOT11_HTTP_API=base, ONEBOT11_SELF_ID="1")
+    await adapter.connect()
+    try:
+        adapter._chat_types["888"] = "group"
+        result = await adapter.send(
+            "888",
+            "仍在处理",
+            metadata={
+                "hermes_control_plane": True,
+                "hermes_control_kind": "long_running",
+            },
+        )
+        assert result.success
+        assert result.raw_response["control_plane"] is True
+        assert adapter._outbound_started == set()
+        assert calls[0]["path"] == "/send_group_msg"
+    finally:
+        await adapter.disconnect()
+
+
+async def test_控制面通知同一turn只发送一次并兼容系统错误metadata(
+    monkeypatch, fake_http_server
+):
+    """重复 heartbeat 不刷屏，未来系统错误标记也不污染业务出站状态。"""
+    base, calls = fake_http_server
+    adapter = _make_adapter(monkeypatch, ONEBOT11_HTTP_API=base, ONEBOT11_SELF_ID="1")
+    await adapter.connect()
+    caller = adapter._caller_for_event(
+        SimpleNamespace(user_id="123", chat_type="group", chat_id="888")
+    )
+    binding = adapter_module.TurnBinding("session-control", "turn-control", caller)
+    adapter._bindings.bind(binding)
+    try:
+        metadata = {
+            "hermes_system_error_notice": True,
+            "onebot11_binding_key": {
+                "session_id": "session-control",
+                "turn_id": "turn-control",
+            },
+        }
+        first = await adapter.send("888", "系统提示", metadata=metadata)
+        second = await adapter.send("888", "系统提示", metadata=metadata)
+        assert first.success
+        assert second.success
+        assert second.raw_response["deduplicated"] is True
+        assert len(calls) == 1
+        assert adapter._outbound_started == set()
+    finally:
+        adapter._bindings.clear()
+        await adapter.disconnect()
+
+
+async def test_权限hook审计失败仍然fail_closed(monkeypatch):
+    """审计旁路异常不能让 pre_tool_call 失去阻断能力。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    caller = adapter._caller_for_event(
+        SimpleNamespace(user_id="123", chat_type="group", chat_id="888")
+    )
+    adapter._bindings.bind(
+        adapter_module.TurnBinding("session-audit", "turn-audit", caller, "lease-audit")
+    )
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    monkeypatch.setattr(
+        adapter._audit,
+        "record",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("audit down")),
+    )
+    monkeypatch.setattr(adapter, "_lease_is_current", lambda _lease_id: False)
+    try:
+        result = adapter_module._pre_tool_call_hook(
+            tool_name="qq_get_message",
+            session_id="session-audit",
+            turn_id="turn-audit",
+            args={},
+        )
+        assert result is not None
+        assert result["action"] == "block"
+    finally:
+        await adapter.disconnect()
+
+
+async def test_send_multiple_images同一turn相同路径只访问一次(monkeypatch):
+    """Hermes 同轮重复提取同一文件时 OneBot 只收到一次图片请求。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    adapter._ws = object()
+    adapter._chat_types["888"] = "group"
+    image_path = Path(adapter._media_root) / "duplicate-image.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\nsame-image")
+    calls: list[list[dict]] = []
+
+    async def send_segments(
+        _target_id: str,
+        segments: list[dict],
+        *,
+        chat_type: str,
+    ) -> str:
+        calls.append(segments)
+        assert chat_type == "group"
+        return str(len(calls))
+
+    monkeypatch.setattr(adapter._api, "send_message_segments", send_segments)
+    try:
+        results = await adapter.send_multiple_images(
+            "888",
+            [(str(image_path), "第一次"), (f"file://{image_path}", "第二次")],
+            metadata={"onebot11_message_id": "turn-message"},
+        )
+        assert len(calls) == 1
+        assert [result.success for result in results] == [True, True]
+        assert results[1].raw_response["deduplicated"] is True
+    finally:
+        image_path.unlink(missing_ok=True)
+        await adapter.disconnect()
+
+
 async def test_send_image失效lease不会先下载媒体(monkeypatch):
     """远程图片入口必须在媒体请求前完成 lease fencing。"""
     adapter = _make_adapter(
@@ -2715,9 +2961,8 @@ async def test_send_multiple_images预检总量超限不访问OneBot(monkeypatch
     adapter._chat_types["888"] = "group"
     first = Path(adapter._media_root) / "total-first.png"
     second = Path(adapter._media_root) / "total-second.png"
-    payload = b"\x89PNG\r\n\x1a\n" + b"x" * 800
-    first.write_bytes(payload)
-    second.write_bytes(payload)
+    first.write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 800)
+    second.write_bytes(b"\x89PNG\r\n\x1a\n" + b"y" * 800)
     called = False
 
     async def fail_if_called(*_args, **_kwargs):
@@ -2775,9 +3020,9 @@ async def test_send_multiple_images遇到unknown停止后续请求(monkeypatch):
     first = Path(adapter._media_root) / "unknown-first.png"
     second = Path(adapter._media_root) / "unknown-second.png"
     third = Path(adapter._media_root) / "unknown-third.png"
-    payload = b"\x89PNG\r\n\x1a\nimage"
-    for path in (first, second, third):
-        path.write_bytes(payload)
+    first.write_bytes(b"\x89PNG\r\n\x1a\nfirst")
+    second.write_bytes(b"\x89PNG\r\n\x1a\nsecond")
+    third.write_bytes(b"\x89PNG\r\n\x1a\nthird")
     calls = 0
 
     async def return_unknown(*_args, **_kwargs):
@@ -3697,12 +3942,16 @@ def test_register注册平台与工具():
         def __init__(self):
             self.platform_kwargs = None
             self.tools: list[dict] = []
+            self.hooks: dict[str, object] = {}
 
         def register_platform(self, **kwargs):
             self.platform_kwargs = kwargs
 
         def register_tool(self, **kwargs):
             self.tools.append(kwargs)
+
+        def register_hook(self, name, callback):
+            self.hooks[name] = callback
 
     ctx = FakeCtx()
     register(ctx)
@@ -3728,3 +3977,21 @@ def test_register注册平台与工具():
     for t in ctx.tools:
         assert t["toolset"] == "onebot11"
         assert t["is_async"] is True
+    assert {
+        "pre_gateway_dispatch",
+        "pre_llm_call",
+        "pre_tool_call",
+    } <= set(ctx.hooks)
+
+
+def test_register缺少安全hook时拒绝启用():
+    """没有 Hermes hook 能力时不能静默注册一个可能 fail-open 的平台。"""
+    class MissingHookCtx:
+        def register_platform(self, **_kwargs):
+            raise AssertionError("安全 hook 检查应先于平台注册")
+
+        def register_tool(self, **_kwargs):
+            raise AssertionError("安全 hook 检查应先于工具注册")
+
+    with pytest.raises(RuntimeError, match="register_hook"):
+        register(MissingHookCtx())

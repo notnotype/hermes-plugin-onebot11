@@ -20,7 +20,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -48,12 +48,14 @@ QueueBusy = _proto.queue.QueueBusy
 QueueLease = _proto.QueueLease
 QueueMessage = _proto.QueueMessage
 QueueStore = _proto.QueueStore
+MediaDeliveryScope = _proto.media.MediaDeliveryScope
 TriggerRequest = _proto.TriggerRequest
 TurnBinding = _proto.TurnBinding
 TurnBindingStore = _proto.TurnBindingStore
 WRITE_TOOLS = _proto.permissions.WRITE_TOOLS
 READ_ONLY_TOOLS = _proto.permissions.READ_ONLY_TOOLS
 ALL_TOOLS = _proto.permissions.ALL_TOOLS
+ROLE_NAMES = _proto.permissions.ROLE_NAMES
 build_inbound_event = _proto.events.build_inbound_event
 normalize_auxiliary_event = _proto.events.normalize_auxiliary_event
 OneBotApiError = _proto.http_api.OneBotApiError
@@ -94,13 +96,23 @@ TriggerAction = _proto.triggers.TriggerAction
 parse_llm_decision = _proto.triggers.parse_llm_decision
 build_agent_context = _proto.context.build_agent_context
 build_agent_context_parts = _proto.context.build_agent_context_parts
+format_onebot_text = _proto.formatting.format_onebot_text
+unwrap_markdown_image_markers = _proto.formatting.unwrap_markdown_image_markers
 should_trigger = _proto.triggers.should_trigger
 ReverseWsServer = _proto.ws_server.ReverseWsServer
 parse_runtime_config = _proto.config.parse_runtime_config
+RuntimePolicySnapshot = _proto.config.RuntimePolicySnapshot
+build_policy_snapshot = _proto.config.build_policy_snapshot
+runtime_static_fingerprint = _proto.config.runtime_static_fingerprint
+FormattedText = _proto.formatting.FormattedText
 
 logger = logging.getLogger(__name__)
 _PLATFORM_NAME = "onebot11"
 _PROCESSING_REACTION_EMOJI_ID = "128064"  # LLBot 的 QQ Emoji「👀」ID
+_REQUIRED_HERMES_HOOKS = frozenset(
+    {"pre_gateway_dispatch", "pre_llm_call", "pre_tool_call"}
+)
+_CONTROL_PLANE_KINDS = frozenset({"long_running", "system_error_notice"})
 _CURRENT_CALLER: contextvars.ContextVar[CallerContext | None] = contextvars.ContextVar(
     "onebot11_current_caller", default=None
 )
@@ -146,6 +158,19 @@ def _platform_value(value: Any) -> str:
     return str(getattr(value, "value", value) or "").casefold()
 
 
+def _is_control_plane_metadata(value: Any) -> bool:
+    """只接受 Hermes 明确标记的控制面通知 metadata。"""
+    if not isinstance(value, Mapping):
+        return False
+    if value.get("hermes_system_error_notice") is True:
+        return True
+    return (
+        value.get("hermes_control_plane") is True
+        and str(value.get("hermes_control_kind") or "").casefold()
+        in _CONTROL_PLANE_KINDS
+    )
+
+
 def _is_loopback_url(url: str) -> bool:
     """判断 HTTP API 是否只连接本机回环。"""
     return is_loopback_http_url(url)
@@ -171,6 +196,55 @@ def _resolve_hermes_home() -> Path:
 def _effective_extra(extra: Mapping[str, Any]) -> dict[str, Any]:
     """合并 OneBot 部署环境覆盖，保留显式空值的 fail-closed 语义。"""
     return _proto.config.effective_extra(extra, os.environ)
+
+
+def _extract_onebot_extra(config: Any) -> dict[str, Any] | None:
+    """从 Hermes 当前配置结果提取 OneBot extra，不复制 YAML 合并规则。"""
+
+    def extract_block(block: Any) -> dict[str, Any] | None:
+        """读取 mapping 或 Hermes PlatformConfig 的 extra。"""
+        if isinstance(block, Mapping):
+            result: dict[str, Any] = {}
+            raw_extra = block.get("extra")
+            if isinstance(raw_extra, Mapping):
+                result.update(raw_extra)
+            for key, value in block.items():
+                if key != "extra" and key not in {"enabled", "token", "api_key"}:
+                    result.setdefault(str(key), value)
+            return result
+        raw_extra = getattr(block, "extra", None)
+        if isinstance(raw_extra, Mapping):
+            return dict(raw_extra)
+        return None
+
+    if isinstance(config, Mapping):
+        platforms = config.get("platforms")
+        candidates: list[Any] = [
+            platforms.get("onebot11") if isinstance(platforms, Mapping) else None,
+            config.get("onebot11"),
+            config.get("gateway", {}).get("platforms", {}).get("onebot11")
+            if isinstance(config.get("gateway"), Mapping)
+            and isinstance(config.get("gateway", {}).get("platforms"), Mapping)
+            else None,
+        ]
+        for block in candidates:
+            result = extract_block(block)
+            if result is not None:
+                return result
+
+    # ``gateway.config.load_gateway_config()`` returns a GatewayConfig
+    # dataclass whose platform map is keyed by Hermes' Platform enum, not a
+    # plain YAML mapping.  Reading its already-merged PlatformConfig keeps
+    # this adapter from reimplementing Hermes' YAML precedence rules.
+    platforms = getattr(config, "platforms", None)
+    if isinstance(platforms, Mapping):
+        for platform, block in platforms.items():
+            platform_name = str(getattr(platform, "value", platform)).casefold()
+            if platform_name == _PLATFORM_NAME:
+                result = extract_block(block)
+                if result is not None:
+                    return result
+    return None
 
 
 def _serializable_caller(context: CallerContext) -> dict[str, Any]:
@@ -237,13 +311,13 @@ def _caller_from_metadata(value: Any) -> CallerContext | None:
         return None
     role = value.get("role")
     raw_tools = value.get("allowed_tools")
-    if not isinstance(role, str) or role not in adapter.role_tools:
+    if not isinstance(role, str) or role not in ROLE_NAMES:
         return None
     if not isinstance(raw_tools, (list, tuple, set, frozenset)) or any(
         not isinstance(tool, str) for tool in raw_tools
     ):
         return None
-    allowed_tools = frozenset(raw_tools) & adapter.role_tools[role]
+    allowed_tools = frozenset(raw_tools) & ALL_TOOLS
     return CallerContext(
         user_id=user_id,
         chat_type=chat_type,
@@ -263,11 +337,21 @@ class OneBot11Adapter(BasePlatformAdapter):
 
     def __init__(self, config: PlatformConfig) -> None:
         """读取并校验配置，初始化协议客户端和群级状态机。"""
+        raw_extra = {} if config.extra is None else dict(config.extra)
         runtime = parse_runtime_config(
-            {} if config.extra is None else config.extra,
+            raw_extra,
             os.environ,
         )
-        extra = runtime.extra
+        self._config_extra_source = dict(raw_extra)
+        self._runtime_config = runtime
+        self._policy_snapshot: RuntimePolicySnapshot = build_policy_snapshot(
+            runtime,
+            version=1,
+            loaded_at=time.time(),
+        )
+        self._policy_reload_error: str | None = None
+        self._policy_reload_lock = asyncio.Lock()
+        extra = dict(runtime.extra)
         extra["session_mode"] = "shared"
         extra["group_sessions_per_user"] = False
         config.extra = extra
@@ -282,18 +366,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._http_api = http_api
         self.self_id = runtime.self_id
 
-        self._access_policy = runtime.access_policy
-        self.dm_policy = self._access_policy.dm_policy
-        self.allowed_users = set(self._access_policy.allowed_users)
-        self.allowed_groups = set(self._access_policy.allowed_groups)
-        self._allow_all_users = self._access_policy.allow_all_users
         self.require_mention = runtime.trigger_config.require_mention
-        self.super_admins = set(runtime.super_admins)
-        self.trusted_users = set(runtime.trusted_users)
-        self.role_tools = runtime.role_tools
-        self._processing_reaction_enabled = runtime.processing_reaction_enabled
-        self._processing_reaction_emoji_id = runtime.processing_reaction_emoji_id
-        self.trigger_config = runtime.trigger_config
         self._last_trigger_at: dict[str, float] = {}
         self._llm_trigger_tasks: dict[str, asyncio.Task[None]] = {}
         self._trigger_timer_tasks: dict[str, asyncio.Task[None]] = {}
@@ -319,6 +392,8 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._max_images_per_message = runtime.max_images_per_message
 
         self._hermes_home = _resolve_hermes_home()
+        self._policy_source_signature = self._policy_config_signature()
+        self._policy_failed_signature: tuple[str, int, int] | None = None
         queue_path = runtime.queue_db_path
         if not queue_path:
             queue_path = str(self._hermes_home / "onebot11" / "queue.sqlite3")
@@ -385,6 +460,8 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._session_reset_tasks: set[asyncio.Task[None]] = set()
         self._resetting_groups: set[str] = set()
         self._conversation_reset_generations: dict[str, int] = {}
+        self._media_delivery_scopes: dict[str, MediaDeliveryScope] = {}
+        self._control_plane_sent_scopes: set[str] = set()
         self._aux_event_count = 0
         self._adapter_epoch = 0
         self._closed = False
@@ -401,6 +478,155 @@ class OneBot11Adapter(BasePlatformAdapter):
     def enforces_own_access_policy(self) -> bool:
         """声明 adapter 在进入 Hermes 前执行自己的 allow/deny。"""
         return True
+
+    @property
+    def policy_snapshot(self) -> RuntimePolicySnapshot:
+        """返回当前不可变 policy snapshot。"""
+        return self._policy_snapshot
+
+    def _replace_policy(self, **changes: Any) -> None:
+        """以单次指针替换更新兼容字段，避免读到半套权限配置。"""
+        self._policy_snapshot = replace(self._policy_snapshot, **changes)
+
+    @property
+    def _access_policy(self) -> Any:
+        """兼容旧代码读取当前访问策略。"""
+        return self._policy_snapshot.access_policy
+
+    @_access_policy.setter
+    def _access_policy(self, value: Any) -> None:
+        """兼容旧代码替换访问策略。"""
+        self._replace_policy(access_policy=value)
+
+    @property
+    def allowed_groups(self) -> frozenset[str]:
+        """读取当前群白名单。"""
+        return self._policy_snapshot.access_policy.allowed_groups
+
+    @allowed_groups.setter
+    def allowed_groups(self, value: Any) -> None:
+        """兼容测试和旧调用方更新群白名单。"""
+        self._replace_policy(
+            access_policy=replace(
+                self._policy_snapshot.access_policy,
+                allowed_groups=frozenset(str(item) for item in value),
+            )
+        )
+
+    @property
+    def allowed_users(self) -> frozenset[str]:
+        """读取当前私聊白名单。"""
+        return self._policy_snapshot.access_policy.allowed_users
+
+    @allowed_users.setter
+    def allowed_users(self, value: Any) -> None:
+        """兼容测试和旧调用方更新私聊白名单。"""
+        self._replace_policy(
+            access_policy=replace(
+                self._policy_snapshot.access_policy,
+                allowed_users=frozenset(str(item) for item in value),
+            )
+        )
+
+    @property
+    def dm_policy(self) -> str:
+        """读取当前私聊策略。"""
+        return self._policy_snapshot.access_policy.dm_policy
+
+    @dm_policy.setter
+    def dm_policy(self, value: str) -> None:
+        """兼容旧调用方更新私聊策略。"""
+        self._replace_policy(
+            access_policy=replace(
+                self._policy_snapshot.access_policy,
+                dm_policy=str(value).casefold(),
+            )
+        )
+
+    @property
+    def _allow_all_users(self) -> bool:
+        """读取当前显式 allow-all 开关。"""
+        return self._policy_snapshot.access_policy.allow_all_users
+
+    @_allow_all_users.setter
+    def _allow_all_users(self, value: bool) -> None:
+        """兼容旧调用方更新显式 allow-all 开关。"""
+        self._replace_policy(
+            access_policy=replace(
+                self._policy_snapshot.access_policy,
+                allow_all_users=bool(value),
+            )
+        )
+
+    @property
+    def super_admins(self) -> frozenset[str]:
+        """读取当前超级管理员集合。"""
+        return self._policy_snapshot.super_admins
+
+    @super_admins.setter
+    def super_admins(self, value: Any) -> None:
+        """兼容旧调用方更新超级管理员集合。"""
+        self._replace_policy(super_admins=frozenset(str(item) for item in value))
+
+    @property
+    def trusted_users(self) -> frozenset[str]:
+        """读取当前可信用户集合。"""
+        return self._policy_snapshot.trusted_users
+
+    @trusted_users.setter
+    def trusted_users(self, value: Any) -> None:
+        """兼容旧调用方更新可信用户集合。"""
+        self._replace_policy(trusted_users=frozenset(str(item) for item in value))
+
+    @property
+    def role_tools(self) -> Mapping[str, frozenset[str]]:
+        """读取当前角色工具 catalog。"""
+        return self._policy_snapshot.role_tools
+
+    @role_tools.setter
+    def role_tools(self, value: Mapping[str, Any]) -> None:
+        """兼容旧调用方替换角色工具 catalog。"""
+        self._replace_policy(
+            role_tools={
+                str(role): frozenset(str(tool) for tool in tools)
+                for role, tools in value.items()
+            }
+        )
+
+    @property
+    def trigger_config(self) -> Any:
+        """读取当前触发配置。"""
+        return self._policy_snapshot.trigger_config
+
+    @trigger_config.setter
+    def trigger_config(self, value: Any) -> None:
+        """兼容旧调用方替换触发配置。"""
+        self._replace_policy(trigger_config=value)
+
+    @property
+    def _processing_reaction_enabled(self) -> bool:
+        """读取当前 reaction 开关。"""
+        return self._policy_snapshot.processing_reaction_enabled
+
+    @_processing_reaction_enabled.setter
+    def _processing_reaction_enabled(self, value: bool) -> None:
+        """兼容旧调用方更新 reaction 开关。"""
+        self._replace_policy(processing_reaction_enabled=bool(value))
+
+    @property
+    def _processing_reaction_emoji_id(self) -> str:
+        """读取当前 reaction emoji ID。"""
+        return self._policy_snapshot.processing_reaction_emoji_id
+
+    @_processing_reaction_emoji_id.setter
+    def _processing_reaction_emoji_id(self, value: str) -> None:
+        """兼容旧调用方更新 reaction emoji ID。"""
+        self._replace_policy(processing_reaction_emoji_id=str(value))
+
+    @property
+    def plain_text_enabled(self) -> bool:
+        """读取当前纯文本显示开关。"""
+        return self._policy_snapshot.plain_text_enabled
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """启动反向 WS，并恢复 SQLite 中未完成的群 turn。"""
@@ -483,7 +709,159 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._pending_session_resets.clear()
         self._resetting_groups.clear()
         self._conversation_reset_generations.clear()
+        self._media_delivery_scopes.clear()
+        self._control_plane_sent_scopes.clear()
         self._bindings.clear()
+
+    def _policy_config_signature(self) -> tuple[str, int, int] | None:
+        """读取 Hermes config.yaml 的轻量签名，供入站前自动检查。"""
+        path = self._hermes_home / "config.yaml"
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return str(path), int(stat.st_mtime_ns), int(stat.st_size)
+
+    def _load_reload_extra(self) -> dict[str, Any]:
+        """通过 Hermes loader 读取当前配置，失败时回退到初始 extra。"""
+        loaded: dict[str, Any] | None = None
+        try:
+            from gateway.config import load_gateway_config
+
+            loaded = _extract_onebot_extra(load_gateway_config())
+        except ImportError:
+            # 兼容没有 gateway.config 的旧 Hermes；正常 Hermes 运行时
+            # 应优先走上面的 gateway loader。
+            pass
+        if loaded is None:
+            try:
+                from hermes_cli.config import load_config
+
+                loaded = _extract_onebot_extra(load_config())
+            except ImportError:
+                loaded = None
+        if loaded is None:
+            return dict(self._config_extra_source)
+
+        hot_names = {
+            "allowed_groups",
+            "allowed_users",
+            "dm_policy",
+            "super_admins",
+            "admins",
+            "roles",
+            "trusted_users",
+            "trigger_keywords",
+            "keywords",
+            "always_trigger",
+            "trigger_always",
+            "trigger_cooldown_seconds",
+            "trigger_cooldown",
+            "require_mention",
+            "question_trigger_enabled",
+            "memory_trigger_enabled",
+            "memory_trigger_words",
+            "trigger_debounce_seconds",
+            "engaged_idle_seconds",
+            "engaged_max_seconds",
+            "engaged_max_arbitrations",
+            "llm_trigger",
+            "trigger_llm",
+            "llm_trigger_enabled",
+            "llm_trigger_provider",
+            "llm_trigger_model",
+            "llm_trigger_base_url",
+            "llm_trigger_api_key_env",
+            "llm_trigger_groups",
+            "processing_reaction_enabled",
+            "processing_reaction_emoji_id",
+            "plain_text_enabled",
+        }
+        candidate = {
+            key: value
+            for key, value in self._runtime_config.extra.items()
+            if key not in hot_names
+        }
+        candidate.update(loaded)
+        return candidate
+
+    async def reload_policy(self, *, force: bool = True) -> tuple[bool, str]:
+        """原子替换运行时策略；静态连接和队列配置变化必须重启。"""
+        if self._closed:
+            return False, "OneBot11 adapter 已关闭"
+        async with self._policy_reload_lock:
+            signature = self._policy_config_signature()
+            if (
+                not force
+                and signature is not None
+                and signature == self._policy_source_signature
+            ):
+                return True, "配置未变化"
+            try:
+                candidate_extra = await asyncio.to_thread(self._load_reload_extra)
+                candidate_runtime = parse_runtime_config(
+                    candidate_extra,
+                    os.environ,
+                )
+                if runtime_static_fingerprint(candidate_runtime) != runtime_static_fingerprint(
+                    self._runtime_config
+                ):
+                    raise ValueError("连接、队列或协议配置已变化；这些字段需要重启生效")
+
+                await self._cancel_trigger_tasks()
+                for state in self._trigger_states.values():
+                    state.invalidate_judgement()
+                    state.config = candidate_runtime.trigger_config
+
+                next_version = self._policy_snapshot.version + 1
+                snapshot = build_policy_snapshot(
+                    candidate_runtime,
+                    version=next_version,
+                    loaded_at=time.time(),
+                )
+                self._runtime_config = candidate_runtime
+                self._config_extra_source = dict(candidate_extra)
+                self._policy_snapshot = snapshot
+                self.require_mention = candidate_runtime.trigger_config.require_mention
+                self._policy_reload_error = None
+                self._policy_source_signature = signature
+                self._policy_failed_signature = None
+                self._llm_trigger_semaphore = None
+                self._llm_trigger_loop = None
+                self._confirmations.clear()
+                _safe_audit(
+                    self,
+                    "policy_reload",
+                    {
+                        "version": snapshot.version,
+                        "loaded_at": snapshot.loaded_at,
+                    },
+                )
+
+                pending_chats = await asyncio.to_thread(self._queue.pending_chat_ids)
+                for chat_id in pending_chats:
+                    if not self._closed:
+                        await self._restore_trigger_state(chat_id)
+                return True, f"策略已生效，version={snapshot.version}"
+            except (ImportError, OSError, TypeError, ValueError, RuntimeError) as exc:
+                message = f"{type(exc).__name__}: {str(exc)[:240]}"
+                self._policy_reload_error = message
+                self._policy_failed_signature = signature
+                _safe_audit(
+                    self,
+                    "policy_reload_failed",
+                    {"error": message},
+                )
+                return False, message
+
+    async def _maybe_reload_policy(self) -> None:
+        """在配置文件变化后自动尝试一次策略 reload。"""
+        signature = self._policy_config_signature()
+        if signature is None or signature == self._policy_source_signature:
+            return
+        if signature == self._policy_failed_signature:
+            return
+        await self.reload_policy(force=True)
 
     async def _stop_runtime(self, *, mark_disconnected: bool) -> None:
         """按停止、结算、fence、清理顺序关闭当前 runtime。"""
@@ -541,6 +919,7 @@ class OneBot11Adapter(BasePlatformAdapter):
 
     async def _on_ws_event(self, raw: dict) -> None:
         """归一化事件、执行入队前授权并路由到 DM/群 dispatch。"""
+        await self._maybe_reload_policy()
         raw_self_id = raw.get("self_id") if isinstance(raw, Mapping) else None
         if (
             raw_self_id is not None
@@ -1171,6 +1550,7 @@ class OneBot11Adapter(BasePlatformAdapter):
             "onebot11_raw": ev.raw_metadata,
             "onebot11_markers": ev.markers[:32],
             "mentioned_self": ev.mentioned_self,
+            "onebot11_message_id": ev.message_id,
             "onebot11_media_paths": media_urls,
             "onebot11_media_dir": media_dir if ev.images else None,
             "onebot11_media_limited": media_limited,
@@ -1197,6 +1577,104 @@ class OneBot11Adapter(BasePlatformAdapter):
     def _new_media_dir(self) -> str:
         """为一个 turn 创建受控媒体目录，便于完成后精确回收。"""
         return tempfile.mkdtemp(prefix=self._media_prefix, dir=str(self._media_root))
+
+    def _media_scope_key(self, metadata: Mapping[str, Any] | None = None) -> str | None:
+        """按 lease 或精确 session/turn 计算同轮媒体 scope。"""
+        sources: list[Mapping[str, Any]] = []
+        if isinstance(metadata, Mapping):
+            sources.append(metadata)
+        current_event = _CURRENT_EVENT.get()
+        current_metadata = getattr(current_event, "metadata", None) or {}
+        if isinstance(current_metadata, Mapping) and current_metadata is not metadata:
+            sources.append(current_metadata)
+
+        binding = self._binding_from_context(metadata)
+        if binding is not None:
+            if binding.lease_id:
+                return f"lease:{binding.lease_id}"
+            return f"turn:{binding.session_id}:{binding.turn_id}"
+
+        for source in sources:
+            lease_id = str(source.get("onebot11_lease_id") or "").strip()
+            if lease_id:
+                return f"lease:{lease_id}"
+        for source in sources:
+            raw_key = source.get("onebot11_binding_key")
+            if isinstance(raw_key, Mapping):
+                session_id = str(raw_key.get("session_id") or "").strip()
+                turn_id = str(raw_key.get("turn_id") or "").strip()
+                if session_id and turn_id:
+                    return f"turn:{session_id}:{turn_id}"
+        for source in sources:
+            message_id = str(
+                source.get("onebot11_message_id")
+                or source.get("message_id")
+                or ""
+            ).strip()
+            if message_id:
+                return f"message:{message_id}"
+        event_message_id = str(getattr(current_event, "message_id", "") or "").strip()
+        return f"message:{event_message_id}" if event_message_id else None
+
+    def _media_scope_for(
+        self,
+        metadata: Mapping[str, Any] | None = None,
+        *,
+        create: bool = True,
+    ) -> MediaDeliveryScope | None:
+        """读取或创建一个短生命周期的媒体去重 scope。"""
+        key = self._media_scope_key(metadata)
+        if key is None:
+            return None
+        scope = self._media_delivery_scopes.get(key)
+        if scope is None and create:
+            scope = MediaDeliveryScope(key)
+            self._media_delivery_scopes[key] = scope
+        return scope
+
+    def _clear_media_scope(
+        self,
+        metadata: Mapping[str, Any] | None = None,
+        *,
+        lease_id: str | None = None,
+    ) -> None:
+        """在 turn 完成或断开时回收内存媒体去重状态。"""
+        key = f"lease:{lease_id}" if lease_id else self._media_scope_key(metadata)
+        if key is None:
+            return
+        scope = self._media_delivery_scopes.pop(key, None)
+        if scope is not None:
+            scope.clear()
+        stale_control_scopes = {
+            entry
+            for entry in self._control_plane_sent_scopes
+            if entry.startswith(f"{key}:control:")
+        }
+        self._control_plane_sent_scopes.difference_update(stale_control_scopes)
+
+    def _control_plane_scope_key(
+        self,
+        metadata: Mapping[str, Any],
+    ) -> str | None:
+        """按当前 turn 生成控制面通知的有限去重键。"""
+        scope = self._media_scope_key(metadata)
+        if scope is None:
+            return None
+        if metadata.get("hermes_system_error_notice") is True:
+            kind = "system_error_notice"
+        else:
+            kind = str(metadata.get("hermes_control_kind") or "").casefold()
+        if kind not in _CONTROL_PLANE_KINDS:
+            return None
+        return f"{scope}:control:{kind}"
+
+    @staticmethod
+    def _deduplicated_media_result(fingerprint: str) -> SendResult:
+        """构造不访问 OneBot 的重复媒体成功结果。"""
+        return SendResult(
+            True,
+            raw_response={"deduplicated": True, "fingerprint": str(fingerprint)[:32]},
+        )
 
     def validate_media_delivery_path(self, image_path: str) -> str | None:
         """校验图片路径属于受控媒体根，阻止路径穿越和 symlink 越界。"""
@@ -2201,7 +2679,7 @@ class OneBot11Adapter(BasePlatformAdapter):
             self_id = raw.get("self_id")
             if (
                 isinstance(role, str)
-                and role in self.role_tools
+                and role in ROLE_NAMES
                 and isinstance(tools, (list, tuple, set, frozenset))
                 and all(isinstance(item, str) for item in tools)
                 and isinstance(self_id, str)
@@ -2212,7 +2690,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                     chat_type=message.chat_type,
                     chat_id=message.chat_id,
                     role=role,
-                    allowed_tools=frozenset(tools) & self.role_tools[role],
+                    allowed_tools=frozenset(tools) & ALL_TOOLS,
                     self_id=str(self_id or self.self_id),
                     adapter_epoch=self._adapter_epoch,
                 )
@@ -2234,7 +2712,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         if anchor_message is None:
             raise PermissionError("OneBot11 durable anchor 找不到对应的待处理消息")
         trigger = lease.trigger
-        if trigger.authority_role not in self.role_tools:
+        if trigger.authority_role not in ROLE_NAMES:
             await asyncio.to_thread(
                 self._queue.mark_uncertain,
                 lease,
@@ -2263,7 +2741,7 @@ class OneBot11Adapter(BasePlatformAdapter):
             chat_type="group",
             chat_id=lease.chat_id,
             role=role,
-            allowed_tools=frozenset(trigger.authority_tools) & self.role_tools[role],
+            allowed_tools=frozenset(trigger.authority_tools) & ALL_TOOLS,
             lease_id=lease.lease_id,
             self_id=self.self_id,
             adapter_epoch=self._adapter_epoch,
@@ -2771,6 +3249,7 @@ class OneBot11Adapter(BasePlatformAdapter):
             self._outbound_successful.discard(lease_id)
             self._outbound_known_failure.discard(lease_id)
             self._lease_session_keys.pop(lease_id, None)
+            self._clear_media_scope(metadata, lease_id=lease_id)
             for binding_key, binding in self._bindings.snapshot().items():
                 if binding.lease_id == lease_id:
                     self._bindings.discard(*binding_key)
@@ -2886,6 +3365,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                 binding = _CURRENT_BINDING.get()
                 if binding is not None and not lease_id:
                     self._bindings.discard_if_matches(binding)
+                self._clear_media_scope(metadata)
             if not managed_context:
                 _CURRENT_BINDING.set(None)
                 _CURRENT_CALLER.set(None)
@@ -2896,6 +3376,167 @@ class OneBot11Adapter(BasePlatformAdapter):
                     media_dir=metadata.get("onebot11_media_dir"),
                 )
 
+    def format_message(self, content: str) -> str:
+        """把 Hermes 回复转换为 OneBot 默认纯文本。"""
+        if self.plain_text_enabled:
+            formatted = format_onebot_text(str(content or ""))
+        else:
+            unwrapped, requested = unwrap_markdown_image_markers(str(content or ""))
+            formatted = FormattedText(
+                text=unwrapped.strip(),
+                markdown_image_requested=requested,
+            )
+        if formatted.markdown_image_requested:
+            _safe_audit(
+                self,
+                "markdown_image_requested_unavailable",
+                {
+                    "renderer": "unavailable",
+                    "external_urls_fetched": False,
+                },
+            )
+        return formatted.text
+
+    async def _send_control_plane(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        reply_to: str | None,
+        metadata: Mapping[str, Any],
+    ) -> SendResult:
+        """发送 Hermes 明确标记的控制面消息，不污染业务 lease 状态。"""
+        binding = self._binding_from_context(metadata)
+        if self._closed:
+            return SendResult(False, error="OneBot11 adapter is closed", error_kind="not_found")
+        managed_context = bool(
+            metadata.get("onebot11_managed_context")
+            or metadata.get("onebot11_lease_id")
+            or metadata.get("onebot11_binding_key")
+        )
+        if managed_context and binding is None:
+            self._log_binding_diagnostic(
+                metadata,
+                reason="control_plane_binding_missing_or_invalid",
+            )
+            return SendResult(
+                False,
+                error="OneBot11 managed control-plane binding unavailable",
+                error_kind="fenced",
+            )
+        if binding is not None and binding.lease_id and not self._lease_is_current(
+            binding.lease_id
+        ):
+            return SendResult(False, error="OneBot11 lease 已失效，拒绝控制面出站", error_kind="fenced")
+        target = self._resolve_target(str(chat_id), metadata, binding=binding)
+        if target is None:
+            return SendResult(False, error="OneBot11 target unknown or ambiguous", error_kind="unknown")
+        caller_user_id = (
+            binding.caller.user_id
+            if binding is not None
+            else target.chat_id
+            if target.chat_type == "dm"
+            else None
+        )
+        if not self._chat_access_allowed(target.chat_type, target.chat_id, caller_user_id):
+            return SendResult(False, error="OneBot11 target 不再满足访问策略", error_kind="permission")
+        if self._ws is None:
+            return SendResult(False, error="Not connected", error_kind="not_found")
+        control_scope = self._control_plane_scope_key(metadata)
+        if (
+            control_scope is not None
+            and control_scope in self._control_plane_sent_scopes
+        ):
+            return SendResult(
+                True,
+                raw_response={
+                    "control_plane": True,
+                    "deduplicated": True,
+                },
+            )
+        if control_scope is not None:
+            # 控制面通知没有可靠编辑/撤回合同；第一次尝试后即不在同一
+            # turn 内再次发送，避免 Hermes heartbeat 重复刷屏。
+            self._control_plane_sent_scopes.add(control_scope)
+
+        pieces = chunk_text(
+            self.format_message(content),
+            self.max_message_length_for_chat(target.chat_id),
+        )
+        sent: list[str] = []
+        for piece in pieces:
+            if self._closed:
+                return SendResult(
+                    False,
+                    message_id=sent[-1] if sent else None,
+                    error="OneBot11 adapter is closed",
+                    error_kind="fenced" if not sent else "unknown",
+                    raw_response={"control_plane": True, "sent_chunks": len(sent)},
+                )
+            if binding is not None and binding.lease_id and not self._lease_is_current(
+                binding.lease_id
+            ):
+                return SendResult(
+                    False,
+                    message_id=sent[-1] if sent else None,
+                    error="OneBot11 lease 已失效，拒绝控制面出站",
+                    error_kind="fenced" if not sent else "unknown",
+                    raw_response={"control_plane": True, "sent_chunks": len(sent)},
+                )
+            if not self._chat_access_allowed(
+                target.chat_type,
+                target.chat_id,
+                binding.caller.user_id
+                if binding is not None
+                else target.chat_id
+                if target.chat_type == "dm"
+                else None,
+            ):
+                return SendResult(
+                    False,
+                    message_id=sent[-1] if sent else None,
+                    error="OneBot11 target 不再满足访问策略",
+                    error_kind="permission" if not sent else "unknown",
+                    raw_response={"control_plane": True, "sent_chunks": len(sent)},
+                )
+            try:
+                message_id = await self._api.send_message(
+                    target.chat_id,
+                    piece,
+                    chat_type=target.chat_type,
+                    reply_to=reply_to,
+                )
+            except OneBotApiError as exc:
+                return SendResult(
+                    False,
+                    message_id=sent[-1] if sent else None,
+                    error=str(exc),
+                    error_kind="unknown" if exc.unknown_outcome else exc.error_kind,
+                    raw_response={"control_plane": True, "sent_chunks": len(sent)},
+                )
+            except (OSError, ValueError) as exc:
+                return SendResult(
+                    False,
+                    message_id=sent[-1] if sent else None,
+                    error=str(exc),
+                    error_kind="unknown" if isinstance(exc, OSError) or sent else "failed",
+                    raw_response={"control_plane": True, "sent_chunks": len(sent)},
+                )
+            if not message_id:
+                return SendResult(
+                    False,
+                    message_id=sent[-1] if sent else None,
+                    error="控制面消息响应缺少 message_id",
+                    error_kind="unknown",
+                    raw_response={"control_plane": True, "sent_chunks": len(sent)},
+                )
+            sent.append(message_id)
+        return SendResult(
+            True,
+            message_id=sent[-1] if sent else None,
+            raw_response={"control_plane": True, "sent_chunks": len(sent)},
+        )
+
     async def send(
         self,
         chat_id: str,
@@ -2904,6 +3545,13 @@ class OneBot11Adapter(BasePlatformAdapter):
         metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         """显式解析 ChatTarget 后发送，并记录部分/未知出站结果。"""
+        if _is_control_plane_metadata(metadata):
+            return await self._send_control_plane(
+                chat_id,
+                content,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
         binding = self._binding_from_context(
             metadata if isinstance(metadata, Mapping) else None
         )
@@ -2977,9 +3625,13 @@ class OneBot11Adapter(BasePlatformAdapter):
             if lease_id:
                 self._outbound_known_failure.add(lease_id)
             return SendResult(False, error="Not connected", error_kind="not_found")
-        pieces = chunk_text(content, self.max_message_length_for_chat(target.chat_id))
-        if not pieces and content:
-            pieces = [content]
+        formatted_content = self.format_message(content)
+        pieces = chunk_text(
+            formatted_content,
+            self.max_message_length_for_chat(target.chat_id),
+        )
+        if not pieces and formatted_content:
+            pieces = [formatted_content]
         sent: list[str] = []
         for piece in pieces:
             if lease_id:
@@ -3054,7 +3706,8 @@ class OneBot11Adapter(BasePlatformAdapter):
         **kwargs: Any,
     ) -> SendResult:
         """把受信任的本地图片编码为 OneBot ``base64://`` image segment。"""
-        del kwargs
+        media_scope = kwargs.pop("_onebot11_media_scope", None)
+        media_source = kwargs.pop("_onebot11_media_source", None) or image_path
         preflight = self._preflight_image_delivery(chat_id, metadata)
         if preflight is not None:
             return preflight
@@ -3105,6 +3758,13 @@ class OneBot11Adapter(BasePlatformAdapter):
                 self._outbound_known_failure.add(lease_id)
             return SendResult(False, error="图片魔数与文件类型不匹配", error_kind="failed")
 
+        if media_scope is None:
+            media_scope = self._media_scope_for(metadata)
+        if media_scope is not None:
+            is_new, fingerprint = media_scope.claim(str(media_source), data)
+            if not is_new:
+                return self._deduplicated_media_result(fingerprint)
+
         reply_id = str(reply_to or "").strip()
         if not reply_id and current_event is not None:
             reply_id = str(getattr(current_event, "message_id", "") or "").strip()
@@ -3120,7 +3780,9 @@ class OneBot11Adapter(BasePlatformAdapter):
             }
         )
         if caption:
-            segments.append({"type": "text", "data": {"text": str(caption)}})
+            segments.append(
+                {"type": "text", "data": {"text": self.format_message(str(caption))}}
+            )
 
         if lease_id:
             marked = await asyncio.to_thread(self._queue.mark_outbound_started, lease_id)
@@ -3178,6 +3840,11 @@ class OneBot11Adapter(BasePlatformAdapter):
         preflight = self._preflight_image_delivery(chat_id, metadata)
         if preflight is not None:
             return preflight
+        media_scope = self._media_scope_for(metadata)
+        if media_scope is not None and media_scope.would_duplicate(str(image_url)):
+            return self._deduplicated_media_result(
+                media_scope.source_fingerprint(str(image_url))
+            )
         media_dir = self._new_media_dir()
         path = await self._api.download_to_temp(str(image_url), media_dir)
         if not path:
@@ -3190,6 +3857,8 @@ class OneBot11Adapter(BasePlatformAdapter):
                 caption=caption,
                 reply_to=reply_to,
                 metadata=metadata,
+                _onebot11_media_scope=media_scope,
+                _onebot11_media_source=str(image_url),
             )
         finally:
             self._cleanup_media([path], media_dir=media_dir)
@@ -3333,7 +4002,13 @@ class OneBot11Adapter(BasePlatformAdapter):
 
         media_dir = self._new_media_dir()
         downloaded_paths: list[str] = []
-        prepared: list[tuple[str, str]] = []
+        prepared: list[tuple[int, str, str, str]] = []
+        results_by_index: list[SendResult | None] = [None] * len(images)
+        persistent_scope = self._media_scope_for(
+            metadata if isinstance(metadata, Mapping) else None
+        )
+        batch_scope = MediaDeliveryScope(f"batch:{id(images)}")
+        delivery_scope = persistent_scope or MediaDeliveryScope(f"delivery:{id(images)}")
         total_bytes = 0
 
         def preflight_failure(error: str, error_kind: str) -> list[SendResult]:
@@ -3344,15 +4019,34 @@ class OneBot11Adapter(BasePlatformAdapter):
             ]
 
         try:
-            for image_url, caption in images:
-                raw_url = str(image_url)
-                if raw_url.startswith("file://"):
-                    path = unquote(raw_url[7:])
-                else:
-                    path = await self._api.download_to_temp(raw_url, media_dir)
+            for index, (image_url, caption) in enumerate(images):
+                raw_source = str(image_url)
+                if persistent_scope and persistent_scope.would_duplicate(raw_source):
+                    results_by_index[index] = self._deduplicated_media_result(
+                        persistent_scope.source_fingerprint(raw_source)
+                    )
+                    continue
+                if batch_scope.would_duplicate(raw_source):
+                    results_by_index[index] = self._deduplicated_media_result(
+                        batch_scope.source_fingerprint(raw_source)
+                    )
+                    continue
+                if raw_source.casefold().startswith("file://"):
+                    path = unquote(raw_source[7:])
+                    if (
+                        os.name == "nt"
+                        and len(path) >= 3
+                        and path[0] == "/"
+                        and path[2] == ":"
+                    ):
+                        path = path[1:]
+                elif raw_source.casefold().startswith(("http://", "https://")):
+                    path = await self._api.download_to_temp(raw_source, media_dir)
                     if not path:
                         return preflight_failure("图片下载失败或未通过安全校验", "failed")
                     downloaded_paths.append(path)
+                else:
+                    path = raw_source
                 safe_path = self.validate_media_delivery_path(path)
                 if not safe_path:
                     return preflight_failure(
@@ -3377,16 +4071,27 @@ class OneBot11Adapter(BasePlatformAdapter):
                         "图片魔数与文件类型不匹配",
                         "failed",
                     )
+                if batch_scope.would_duplicate(raw_source, data) or (
+                    persistent_scope is not None
+                    and persistent_scope.would_duplicate(raw_source, data)
+                ):
+                    if path in downloaded_paths:
+                        Path(path).unlink(missing_ok=True)
+                        downloaded_paths.remove(path)
+                    results_by_index[index] = self._deduplicated_media_result(
+                        batch_scope.content_fingerprint(data)
+                    )
+                    continue
                 if total_bytes + len(data) > self._max_media_total_bytes:
                     return preflight_failure(
                         "图片总大小超过 OneBot11 单条消息限制",
                         "too_large",
                     )
+                batch_scope.remember(raw_source, data)
                 total_bytes += len(data)
-                prepared.append((str(local_path), caption))
+                prepared.append((index, str(local_path), caption, raw_source))
 
-            results: list[SendResult] = []
-            for index, (path, caption) in enumerate(prepared):
+            for prepared_index, (index, path, caption, raw_source) in enumerate(prepared):
                 if human_delay > 0:
                     await asyncio.sleep(human_delay)
                 result = await self.send_image_file(
@@ -3394,19 +4099,30 @@ class OneBot11Adapter(BasePlatformAdapter):
                     path,
                     caption=caption or None,
                     metadata=metadata,
+                    _onebot11_media_scope=delivery_scope,
+                    _onebot11_media_source=raw_source,
                 )
-                results.append(result)
+                results_by_index[index] = result
                 if result.error_kind in {"unknown", "fenced"}:
-                    results.extend(
-                        SendResult(
+                    for original_index, _path, _caption, _source in prepared[
+                        prepared_index + 1 :
+                    ]:
+                        results_by_index[original_index] = SendResult(
                             False,
                             error="前一张图片出站结果未知，已跳过后续图片",
                             error_kind="unknown",
                         )
-                        for _ in prepared[index + 1 :]
-                    )
                     break
-            return results
+            return [
+                result
+                if result is not None
+                else SendResult(
+                    False,
+                    error="图片未完成出站",
+                    error_kind="failed",
+                )
+                for result in results_by_index
+            ]
         finally:
             self._cleanup_media(downloaded_paths, media_dir=media_dir)
 
@@ -3974,6 +4690,12 @@ class OneBot11Adapter(BasePlatformAdapter):
                     await self._send_direct(event, "确认令牌无效、已过期或目标不匹配")
                     return
                 await self._send_direct(event, json.dumps(await self._execute_confirmed(confirmation), ensure_ascii=False))
+            elif command == "reload":
+                success, message = await self.reload_policy(force=True)
+                await self._send_direct(
+                    event,
+                    f"OneBot11 policy reload {'成功' if success else '失败'}: {message}",
+                )
             elif command in {"status", "queue"}:
                 if event.chat_type != "group":
                     await self._send_direct(event, "status/queue 只能作用于当前群队列")
@@ -4005,6 +4727,12 @@ class OneBot11Adapter(BasePlatformAdapter):
                     self._queue.unknown_operation_count,
                     chat_id,
                 )
+                status["policy"] = {
+                    "version": self._policy_snapshot.version,
+                    "loaded_at": self._policy_snapshot.loaded_at,
+                    "reload_error": self._policy_reload_error,
+                    "plain_text_enabled": self.plain_text_enabled,
+                }
                 status["auxiliary_events"] = self._aux_event_count
                 await self._send_direct(event, json.dumps(status, ensure_ascii=False))
             elif command == "flush":
@@ -4134,7 +4862,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                 await self._send_direct(
                     event,
                     "用法: /onebot status|queue|flush|clear|pause|resume|"
-                    "resolve retry|resolve discard|resolve action retry|discard OPERATION_ID|confirm TOKEN",
+                    "reload|resolve retry|resolve discard|resolve action retry|discard OPERATION_ID|confirm TOKEN",
                 )
         except Exception as exc:
             logger.warning("OneBot11 管理命令失败", exc_info=True)
@@ -4293,7 +5021,18 @@ def _pre_llm_call_hook(session_id: str = "", turn_id: str = "", platform: Any = 
             "turn_id": normalized_turn_id,
         }
         current_event.metadata = metadata
-    return {"context": role_prompt(caller)}
+    return {"context": role_prompt(caller, adapter.role_tools)}
+
+
+def _safe_audit(adapter: Any, action: str, fields: Mapping[str, Any]) -> None:
+    """审计失败时只写日志，绝不改变权限 hook 的 fail-closed 结果。"""
+    try:
+        audit = getattr(adapter, "_audit", None)
+        record = getattr(audit, "record", None)
+        if callable(record):
+            record(action, fields)
+    except Exception:
+        logger.warning("OneBot11 audit hook failed: action=%s", action, exc_info=True)
 
 
 def _pre_tool_call_hook(tool_name: str = "", session_id: str = "", turn_id: str = "", args: dict | None = None, **kwargs: Any) -> dict[str, str] | None:
@@ -4308,45 +5047,85 @@ def _pre_tool_call_hook(tool_name: str = "", session_id: str = "", turn_id: str 
         return {"action": "block", "message": "OneBot11 adapter 已关闭"}
     if tool_name not in ALL_TOOLS:
         return {"action": "block", "message": "权限错误: 未知 OneBot11 工具"}
-    binding = adapter._resolve_binding(session_id, turn_id)
-    if binding is None:
-        return {"action": "block", "message": "OneBot11 current turn binding unavailable"}
-    if (
-        binding.caller.adapter_epoch is not None
-        and binding.caller.adapter_epoch != adapter._adapter_epoch
-    ):
-        return {"action": "block", "message": "权限错误: 当前 adapter epoch 已失效"}
-    if binding.lease_id and not adapter._lease_is_current(binding.lease_id):
-        adapter._audit.record(
+    try:
+        binding = adapter._resolve_binding(session_id, turn_id)
+        if binding is None:
+            return {"action": "block", "message": "OneBot11 current turn binding unavailable"}
+        context_binding = _CURRENT_BINDING.get()
+        current_caller = _CURRENT_CALLER.get()
+        if context_binding is not None and context_binding != binding:
+            return {
+                "action": "block",
+                "message": "OneBot11 ContextVar 与显式 turn binding 冲突",
+            }
+        if current_caller is not None and current_caller != binding.caller:
+            return {
+                "action": "block",
+                "message": "OneBot11 ContextVar caller 与显式 turn binding 冲突",
+            }
+        if (
+            binding.caller.adapter_epoch is not None
+            and binding.caller.adapter_epoch != adapter._adapter_epoch
+        ):
+            return {"action": "block", "message": "权限错误: 当前 adapter epoch 已失效"}
+        if binding.lease_id and not adapter._lease_is_current(binding.lease_id):
+            _safe_audit(
+                adapter,
+                "permission_denied",
+                {
+                    "tool": tool_name,
+                    "user_id": binding.caller.user_id,
+                    "chat_type": binding.caller.chat_type,
+                    "chat_id": binding.caller.chat_id,
+                    "reason": "lease 已失效",
+                },
+            )
+            return {"action": "block", "message": "权限错误: 当前 turn lease 已失效"}
+        if not adapter._chat_access_allowed(
+            binding.caller.chat_type, binding.caller.chat_id, binding.caller.user_id
+        ):
+            _safe_audit(
+                adapter,
+                "permission_denied",
+                {
+                    "tool": tool_name,
+                    "user_id": binding.caller.user_id,
+                    "chat_type": binding.caller.chat_type,
+                    "chat_id": binding.caller.chat_id,
+                    "reason": "当前目标不再满足访问策略",
+                },
+            )
+            return {"action": "block", "message": "权限错误: 当前目标不再满足访问策略"}
+        error = validate_tool_call(tool_name, args or {}, binding.caller, adapter.super_admins)
+        if error:
+            _safe_audit(
+                adapter,
+                "permission_denied",
+                {
+                    "tool": tool_name,
+                    "user_id": binding.caller.user_id,
+                    "chat_type": binding.caller.chat_type,
+                    "chat_id": binding.caller.chat_id,
+                    "reason": error,
+                },
+            )
+            return {"action": "block", "message": f"权限错误: {error}"}
+        return None
+    except Exception as exc:
+        _safe_audit(
+            adapter,
             "permission_denied",
             {
-                "tool": tool_name,
-                "user_id": binding.caller.user_id,
-                "chat_type": binding.caller.chat_type,
-                "chat_id": binding.caller.chat_id,
-                "reason": "lease 已失效",
+                "tool": str(tool_name)[:128],
+                "session_id": str(session_id)[:128],
+                "turn_id": str(turn_id)[:128],
+                "reason": f"权限 hook 内部异常: {type(exc).__name__}",
             },
         )
-        return {"action": "block", "message": "权限错误: 当前 turn lease 已失效"}
-    if not adapter._chat_access_allowed(
-        binding.caller.chat_type, binding.caller.chat_id, binding.caller.user_id
-    ):
-        adapter._audit.record(
-            "permission_denied",
-            {
-                "tool": tool_name,
-                "user_id": binding.caller.user_id,
-                "chat_type": binding.caller.chat_type,
-                "chat_id": binding.caller.chat_id,
-                "reason": "当前目标不再满足访问策略",
-            },
-        )
-        return {"action": "block", "message": "权限错误: 当前目标不再满足访问策略"}
-    error = validate_tool_call(tool_name, args or {}, binding.caller, adapter.super_admins)
-    if error:
-        adapter._audit.record("permission_denied", {"tool": tool_name, "user_id": binding.caller.user_id, "chat_type": binding.caller.chat_type, "chat_id": binding.caller.chat_id, "reason": error})
-        return {"action": "block", "message": f"权限错误: {error}"}
-    return None
+        return {
+            "action": "block",
+            "message": "OneBot11 permission hook failed closed",
+        }
 
 
 def _post_llm_call_hook(**kwargs: Any) -> None:
@@ -4463,8 +5242,32 @@ async def _standalone_send(pconfig: Any, chat_id: str, message: str, **kwargs: A
         return {"error": str(exc), "status": "unknown" if isinstance(exc, OneBotApiError) and exc.unknown_outcome else "error"}
 
 
+def _require_hermes_hook_capabilities(ctx: Any) -> Any:
+    """确认安全门禁所需的 Hermes hooks 存在，否则拒绝注册平台。"""
+    register_hook = getattr(ctx, "register_hook", None)
+    if not callable(register_hook):
+        raise RuntimeError(
+            "OneBot11 需要 Hermes pre_gateway_dispatch、pre_llm_call 和 "
+            "pre_tool_call hooks；当前插件上下文没有 register_hook"
+        )
+    try:
+        from hermes_cli.plugins import VALID_HOOKS
+    except (ImportError, AttributeError) as exc:
+        raise RuntimeError(
+            "OneBot11 无法验证 Hermes 安全 hooks，拒绝启用以避免 fail-open"
+        ) from exc
+    missing = _REQUIRED_HERMES_HOOKS - set(VALID_HOOKS)
+    if missing:
+        raise RuntimeError(
+            "OneBot11 所需 Hermes hooks 不可用，拒绝启用: "
+            + ", ".join(sorted(missing))
+        )
+    return register_hook
+
+
 def register(ctx: Any) -> None:
     """注册平台、全角色工具和权限 hooks。"""
+    register_hook = _require_hermes_hook_capabilities(ctx)
     ctx.register_platform(
         name="onebot11",
         label="OneBot 11 (QQ)",
@@ -4479,7 +5282,13 @@ def register(ctx: Any) -> None:
         standalone_sender_fn=_standalone_send,
         max_message_length=4000,
         emoji="🐧",
-        platform_hint="You are chatting via OneBot 11 (QQ). Group messages share one session and are prefixed with the sender nickname.",
+        platform_hint=(
+            "You are chatting via OneBot 11 (QQ). Group messages share one session "
+            "and are prefixed with the sender nickname. Use plain text by default; "
+            "do not emit Markdown tables, code fences, or Markdown images. "
+            "Long-running notices are control-plane messages only when Hermes "
+            "supplies explicit metadata."
+        ),
     )
     # Hermes 注册的是两个角色默认许可的并集；当前 turn 再由 hooks 和
     # handler 按实际角色做双重 fail-closed 校验。
@@ -4496,13 +5305,11 @@ def register(ctx: Any) -> None:
             description=_TOOL_DESCRIPTIONS.get(name, name),
             emoji="🔍" if name in READ_TOOL_NAMES else "🛡️",
         )
-    register_hook = getattr(ctx, "register_hook", None)
-    if callable(register_hook):
-        register_hook("pre_gateway_dispatch", _pre_gateway_dispatch_hook)
-        register_hook("pre_llm_call", _pre_llm_call_hook)
-        register_hook("pre_tool_call", _pre_tool_call_hook)
-        register_hook("post_llm_call", _post_llm_call_hook)
-        register_hook("on_session_reset", _on_session_reset_hook)
+    register_hook("pre_gateway_dispatch", _pre_gateway_dispatch_hook)
+    register_hook("pre_llm_call", _pre_llm_call_hook)
+    register_hook("pre_tool_call", _pre_tool_call_hook)
+    register_hook("post_llm_call", _post_llm_call_hook)
+    register_hook("on_session_reset", _on_session_reset_hook)
 def _tool_dispatch(name: str):
     """注册全局 handler，运行时解析当前 OneBot adapter。"""
 

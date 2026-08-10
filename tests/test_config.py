@@ -260,3 +260,9 @@ def test_home_channel必须显式声明目标类型():
     )
     assert runtime.home_channel == "1072992996"
     assert runtime.home_channel_type == "group"
+
+
+def test纯文本开关属于可热更新策略():
+    """纯文本显示策略由 RuntimeConfig 严格解析。"""
+    runtime = parse_runtime_config(_extra(plain_text_enabled=False))
+    assert runtime.plain_text_enabled is False

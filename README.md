@@ -9,6 +9,8 @@
 - **连续对话**：成功回复后进入最多 60 秒的活跃窗口；窗口内普通消息经过 5 秒 trailing debounce，再交给低成本旁路模型判断是否回复，单窗口最多仲裁 3 次。
 - **群级会话命令**：超级管理员可以发送 `/new [title]`、`/reset` 或 `/clear` 重置当前群的 shared session；命令在入队前处理，不会作为普通群消息交给 Agent。重置通过 Hermes 公共命令入口完成，成功后才清理该群的队列和摘要。
 - **处理指示器**：群 turn 认领后给触发消息添加 👀，Hermes turn 收尾时自动移除；没有真实消息 ID 或 QQ 框架不支持该扩展时按 best-effort 跳过，不影响回复。
+- **回复格式**：默认把 Markdown 转成 OneBot 可读的纯文本；同一 turn 内重复的本地图片/URL/相同内容只投递一次。Markdown 图片逃生口 `[[onebot11:markdown-image]]...[[/onebot11:markdown-image]]` 目前只去掉 marker 并按纯文本发送，不访问其中的外部 URL。
+- **运行时配置**：超级管理员可以发送 `/onebot reload` 热更新白名单、角色工具、trigger、reaction 和显示策略；HTTP/WS 地址、token、机器人 QQ 号、队列路径和 session 模式仍需重启。reload 后 active turn 保留创建时的权限快照，并清理旧确认令牌。
 - **上下文**：队列有条数、字节数和单条消息上限，确认后形成滚动摘要，并保留最近消息原文；当前批次作为普通 user message，摘要优先通过 Hermes `channel_prompt` 临时注入，不重复写入 shared session transcript。旧 Hermes 不支持时退回有界文本模式并记录审计。
 - **图片与消息段**：兼容 array/CQ 字符串，支持图片、reply、文件、语音、视频、转发和未知段标记；入站图片下载有 host、端口、类型、魔数和大小限制，出站图片使用受限 `base64://` segment，适配 Hermes 宿主机与 LLBot 容器路径隔离。
 - **工具与管理**：提供当前群/私聊范围内的查询工具，以及撤回、禁言、踢人、全员禁言工具。写操作只生成预览，必须由同一超级管理员在同一目标群发送短期确认命令。
@@ -72,6 +74,7 @@ hermes plugins install notnotype/hermes-plugin-onebot11
 | `ONEBOT11_ALLOWED_USERS` | 空 | 私聊白名单（逗号分隔的 QQ 号） |
 | `ONEBOT11_ALLOWED_GROUPS` | 空 | 群白名单（逗号分隔的群号;空 = 所有群可用） |
 | `ONEBOT11_REQUIRE_MENTION` | true | 群聊是否必须 @ 机器人 才创建 trigger；未触发消息仍入队 |
+| `ONEBOT11_PLAIN_TEXT_ENABLED` | true | 默认将 Markdown 回复转换为纯文本；也可写入 `extra.plain_text_enabled` |
 | `ONEBOT11_SUPER_ADMINS` | 空 | 超级管理员 QQ 列表；为空时写工具和管理命令全部 fail-closed |
 | `ONEBOT11_ADMINS` | 空 | `ONEBOT11_SUPER_ADMINS` 的兼容旧名 |
 | `ONEBOT11_ALLOW_ALL_USERS` | 空 | 明确允许 `dm_policy=open` 的私聊；也可使用 `GATEWAY_ALLOW_ALL_USERS=true` |
@@ -152,6 +155,12 @@ LLM trigger 默认关闭，启用时必须同时配置明确的 `provider`、`mo
 旁路模型只接受 `{"decision":"trigger|wait|ignore","wait_seconds":0}`；`wait` 时 `wait_seconds` 只能是 `5/10/30/60`，`trigger` 和 `ignore` 必须使用 `0`。非法结果保留队列消息，不创建 lease。
 `media_orphan_ttl_seconds` 到期后由下一次 adapter 启动或 turn 收尾清理遗留媒体目录。
 `processing_reaction_enabled` 默认开启；它使用 LLBot 的 `set_msg_emoji_like` 扩展，只作用于群聊真实消息 ID。添加或移除 reaction 的未知结果不会重放 Agent turn，也不会阻断队列 ack。
+
+长时间运行提示不通过匹配 `⏳ Working` 等文本识别。只有 Hermes 提供
+`hermes_control_plane=true` 且 `hermes_control_kind=long_running`，或未来的
+`hermes_system_error_notice=true` 时，OneBot 才把它作为控制面消息发送；
+控制面消息不写业务 `outbound_started`，同一 turn 只发送一次。当前 Hermes
+若没有这些 metadata，不承诺发送 heartbeat，避免把系统通知误判为业务回复。
 
 出站图片的主要支持场景是 Agent 最终回复（best-effort）：插件只接受 Hermes 允许的媒体
 目录中的 PNG、JPEG、GIF、WebP，发送前编码为 `base64://` OneBot image

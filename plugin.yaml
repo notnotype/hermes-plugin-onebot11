@@ -8,7 +8,9 @@ description: >
   context, layered triggers, active conversation windows, scoped query tools
   confirmed group-management actions and administrator-only /new, /reset, /clear
   session commands. Outbound images use bounded
-  base64:// segments; unknown non-idempotent delivery is never retried.
+  base64:// segments with same-turn defensive deduplication; unknown
+  non-idempotent delivery is never retried. Text replies default to plain text,
+  and policy/trigger permissions support runtime reload through /onebot reload.
   Optional layered LLM trigger uses the plugin's Node.js >=22.19/pi-ai helper,
   not Hermes auxiliary; install runtime dependencies with npm ci --omit=dev.
 author: notnotype
@@ -49,6 +51,10 @@ optional_env:
   - name: ONEBOT11_REQUIRE_MENTION
     description: "群聊是否必须 @ 机器人 才创建 trigger；未触发消息仍进入队列（默认 true）"
     prompt: "群聊 @ 触发"
+    password: false
+  - name: ONEBOT11_PLAIN_TEXT_ENABLED
+    description: "默认把 Markdown 回复转换为 OneBot 纯文本；也可写入 extra.plain_text_enabled"
+    prompt: "OneBot 纯文本回复"
     password: false
   - name: ONEBOT11_SUPER_ADMINS
     description: "超级管理员 QQ 列表（逗号分隔；空 = 写操作 fail-closed）"

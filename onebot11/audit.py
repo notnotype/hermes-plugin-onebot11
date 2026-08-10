@@ -51,7 +51,7 @@ class AuditLog:
                     self.path.replace(rotated)
                 with self.path.open("a", encoding="utf-8") as handle:
                     handle.write(line)
-        except (OSError, ValueError, TypeError):
+        except Exception:
             logger.warning("OneBot11 audit write failed; continuing without audit record", exc_info=True)
 
     def _redact(self, value: Any, key: str = "") -> Any:

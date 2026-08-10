@@ -44,6 +44,19 @@ platforms:
 
 `ONEBOT11_SUPER_ADMINS` 优先，`ONEBOT11_ADMINS` 仅作为兼容旧名。超级管理员为空时没有任何写权限；普通用户默认只有只读工具。`roles.trusted_user.users` 只定义 trusted_user 身份，`roles.trusted_user.tools` 只能是只读工具；它不能修改权限、白名单或角色配置。可配置的角色工具集合会取所有角色许可工具的并集注册到 Hermes，再由当前 turn 的角色门禁限制实际执行。
 
+`pre_llm_call` 会把 `user`、`trusted_user`、`super_admin` 的当前工具目录写进
+提示词，帮助模型理解角色差异；这只是 role catalog，不是授权来源。真正授权仍来自
+当前锚点的不可变 authority 快照、`(session_id, turn_id)` binding、lease、adapter
+状态和工具 handler 硬校验。`delegate_task` 当前不属于 OneBot 可配置工具，也不会把
+OneBot 权限传给 Hermes 子代理；Hermes 的 tool-search/子代理 turn 传递能力完成前，
+插件会在配置和运行时拒绝它。
+
+本插件角色配置当前只描述 OneBot 注册工具。网页搜索、浏览器自动化、终端、文件读写
+等 Hermes 通用工具仍由 Hermes 的 platform toolset 和上游 per-turn policy 控制；
+不要因为 role catalog 出现在提示词中就认为这些工具已被 OneBot 角色硬隔离。若要给
+普通用户开放这类能力，应先在 Hermes 中把它们从 OneBot 平台默认 toolset 移除，只对
+明确的 trusted_user/管理员入口开放。
+
 默认只读工具：
 
 - `qq_get_message`：返回的消息必须属于当前群或当前私聊。
@@ -54,6 +67,21 @@ platforms:
 写工具（撤回、禁言、踢人、全员禁言）只能作用于当前群，普通用户永远拒绝。首次调用只产生预览和短期 `/onebot confirm TOKEN`，不会立即执行；确认命令必须由同一超级管理员在同一群发送，令牌单次消费且不写入审计日志。确认命令在 adapter 入站层直接处理，不会进入 Hermes session 或消息队列。
 
 确认令牌仍只保存在当前 adapter 进程内存中，进程重启会让旧令牌失效；但管理动作台账持久化在同一个队列 SQLite 中。进程恢复会把遗留的 `started` 标记为 `unknown`，同一 fingerprint 在 `unknown` 状态下禁止重复调用。`/onebot resolve action retry OPERATION_ID` 只把动作置为 `retry_armed`，随后必须重新生成预览并再次确认；`discard` 只记录放弃，不访问 OneBot。审计只保留 operation id、fingerprint 摘要、工具、目标和结果，不记录 token、完整参数或媒体 URL。
+
+## 运行时 reload
+
+超级管理员可直接发送 `/onebot reload`。它通过 Hermes 的当前 gateway
+configuration loader 读取已经合并过的 `platforms.onebot11.extra`，再由插件自己的
+严格解析器校验；不在 OneBot 内复制 Hermes 的 YAML merge 规则。环境变量仍是覆盖层，
+所以如果某个白名单字段由环境变量提供，YAML reload 不能覆盖它。
+
+可热更新：`allowed_groups`、DM 白名单/策略、`super_admins`、`trusted_users`、
+`roles.*.tools`、关键词/always/LLM trigger、cooldown、reaction 和纯文本显示配置。
+不可热更新：HTTP/WS 地址、token、self_id、队列数据库路径、session 模式以及其它
+连接/协议边界；这些变化会返回“需要重启”并保留旧 snapshot。解析失败也保留旧
+snapshot。新消息、新 anchor 和恢复任务使用新策略；active turn 继续使用创建时的
+authority 和工具快照，但每次工具/出站仍重新检查当前白名单。成功 reload 会使旧
+confirmation token 失效。
 
 ## 身份传递
 
