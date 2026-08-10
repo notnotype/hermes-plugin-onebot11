@@ -96,6 +96,12 @@ cron 和 standalone sender 的 plugin media 不在本轮可靠性合同内。
 
 `pause` 只停止自动 dispatch，消息继续入队；`clear` 清理 pending 消息和滚动摘要但不删除 Hermes session 历史，活动 lease、`uncertain` 或 `failed` 必须先显式处理。
 
+群级会话生命周期命令是另一条边界：超级管理员可以发送 `/new [title]`、`/reset` 或 `/clear`。
+它们在普通群消息入队前被识别；未授权用户会收到权限拒绝，命令本身不会进入 OneBot
+队列或 Hermes session。`/clear` 作为 OneBot 别名翻译为公共 `/new`，reset 成功后由
+`on_session_reset` hook 清理当前群队列、摘要和内存触发状态。reset 使用命令开始时的消息
+序号作为边界，不会误删 reset 期间新到的消息；reset 期间普通消息需要稍后重发。
+
 ## 分层触发和旁路模型
 
 群消息的触发顺序是“硬触发优先，候选消息再仲裁”：

@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- **阶段**：`feat/i15-pi-ai-trigger-deploy` 正在把插件收口为可部署版。shared session、schema 11、TurnAnchor、权限和 Agent 最终回复图片已在插件侧成立；LLM trigger 已切换为插件自有 pi-ai helper，不修改 Hermes。Arch 仍未切换到本分支。
+- **阶段**：`feat/i16-onebot11-command-acceptance` 正在收口 Issue #16 的 Arch 验收能力。shared session、schema 11、TurnAnchor、权限、Agent 最终回复图片和插件自有 pi-ai trigger 已在插件侧成立；新增群级 `/new`、`/reset`、`/clear` 公共命令桥接和连续对话失败态清理。Arch 仍未切换到本分支。
 - **核心合同**：群固定一个共享 session；群消息持久入队；每个真实 TurnAnchor 固定 batch 和 authority，同群按序单 lease follow-up；非幂等出站结果未知时进入 `uncertain`，不自动重放。
 - **本地验证**：协议/状态机测试通过；使用本地 Hermes 源码与其 site-packages 运行 adapter 测试通过。最终门禁命令和环境见“验证证据”。
 
@@ -21,20 +21,20 @@
 | `onebot11/triggers.py` | 完成 | @、关键词、always、问句/记忆候选、5 秒 debounce、60 秒活跃窗口和显式旁路 LLM 三态判断 |
 | `onebot11/permissions.py` | 完成 | `CallerContext`、`ChatTarget`、精确 `(session_id, turn_id)` binding、user/trusted_user/super_admin 角色、只读边界和 fail-closed |
 | `onebot11/tools.py` | 完成 | 当前群/私聊范围查询和群管理写工具；写操作必须确认 |
-| `adapter.py` | 完成 | Hermes glue、shared session、入站访问策略、hooks、工具 handler、群 turn 👀 指示器、Agent 最终回复的文本/图片出站生命周期、base64 segment、媒体回收、统一配置解析、raw self_id、临时摘要注入、operation resolve 和 pi-ai selector；通用 `send_message`/cron plugin media 不是本轮可靠性合同 |
+| `adapter.py` | 完成 | Hermes glue、shared session、入站访问策略、hooks、群级 slash command、工具 handler、群 turn 👀 指示器、Agent 最终回复的文本/图片出站生命周期、base64 segment、媒体回收、统一配置解析、raw self_id、临时摘要注入、operation resolve 和 pi-ai selector；通用 `send_message`/cron plugin media 不是本轮可靠性合同 |
 | `onebot11/pi_ai.py` + `scripts/onebot11-pi-trigger.mjs` | 完成 | 零 Hermes 依赖的 Python/Node 短生命周期旁路客户端，固定 pi-ai 版本、环境变量密钥、无语义重试和失败分类 |
-| 文档/ADR | 完成 | README、权限、状态、Task 2/3/5 walkthrough、pi-ai、reconnect、operation ledger、TurnAnchor 和验收边界同步到当前合同 |
+| 文档/ADR | 完成 | README、权限、状态、Task 2/3/5/6 walkthrough、pi-ai、reconnect、operation ledger、TurnAnchor、session command 和验收边界同步到当前合同 |
 
 ## 验证证据
 
-- `.venv\\Scripts\\python.exe -m pytest -q`：`166 passed, 1 skipped`；纯插件环境只跳过没有 Hermes gateway 的 adapter 集成测试。
+- `.venv\\Scripts\\python.exe -m pytest -q`：`174 passed, 1 skipped`；唯一 skip 是没有 Hermes gateway 的 `tests/test_adapter.py`，不是业务失败。
 - `.venv\\Scripts\\python.exe -m ruff check .`：通过。
 - `uv pip install --python .venv\\Scripts\\python.exe -e ".[dev]" --no-deps`：editable build 通过；`import onebot11` 通过。当前精简 `.venv` 没有 pip 模块，因此使用 uv 完成等价安装验证。
-- `scripts/verify_hermes_integration.py` 已移除 Hermes auxiliary 注入和 strict 参数检查；当前 smoke 目标是最新 Hermes 组合、9 个工具、4 个 hooks、shared session、queue recovery、reconnect、图片 base64 segment 和 pi-ai helper 离线失败分类。
+- `scripts/verify_hermes_integration.py` 已移除 Hermes auxiliary 注入和 strict 参数检查；当前 smoke 目标是最新 Hermes 组合、9 个工具、5 个 hooks、shared session、queue recovery、reconnect、slash command bridge、图片 base64 segment 和 pi-ai helper 离线失败分类。
 - `@earendil-works/pi-ai@0.83.0` 已固定在 `package-lock.json`；Node helper 缺失、provider/model 不存在、超时、非零退出和非法输出均按不触发处理。
 - `npm ci --omit=dev`、`node --check scripts/onebot11-pi-trigger.mjs`：通过。
 - 自定义 OpenAI-compatible endpoint 本地 smoke：通过；验证 `systemPrompt`、`/v1/chat/completions`、环境变量 Bearer key 和严格 JSON 返回。
-- Hermes `v0.20.0` 本地组合：`249 passed`，smoke 通过，`tools=9 hooks=4 pi_ai_trigger=True reconnect=True`；不再注入 auxiliary worktree，也不修改 Hermes 源码。
+- Hermes `v0.20.0` 本地组合：`269 passed`，smoke 通过，`tools=9 hooks=5 pi_ai_trigger=True reconnect=True slash_commands=True`；不再注入 auxiliary worktree，也不修改 Hermes 源码。
 - Hermes strict auxiliary/media 结果合同不再是本插件依赖，也不创建 Hermes PR；旧 Hermes 的差异只保留为历史调研，不进入当前 adapter 代码。
 
 ## 外部联调状态
@@ -50,7 +50,7 @@
 - 白名单外群 `999999999` 的事件被拒绝，SQLite 中该群为 0 行，指定群队列未变化，没有产生出站。
 - Arch 配置原有 `roles.super_admin.tools: image_generate`（非 OneBot 工具），在备份后按 fail-closed 合同移除；白名单、token、机器人 QQ 和 LLBot 配置未放宽。
 
-本次 `0.6.0` 变更尚未在 Arch 生产部署。通过隔离 queue 和真实 OneBot HTTP/WS adapter smoke 验证了 image-only、文字+图片、多图的 `base64://` segment，以及正负 message id 的 `👀` 添加/移除；这些消息没有经过生产 Agent pipeline，因此真实 QQ Agent 的图片-only、文字+图片、多图、部分成功/unknown 和真人并发仍是待验收项。
+本次 `0.6.0` 变更以及 Issue #16 当前分支尚未在 Arch 生产部署。通过隔离 queue 和真实 OneBot HTTP/WS adapter smoke 验证了 image-only、文字+图片、多图的 `base64://` segment，以及正负 message id 的 `👀` 添加/移除；这些消息没有经过生产 Agent pipeline，因此真实 QQ Agent 的图片-only、文字+图片、多图、部分成功/unknown、slash command 和真人并发仍是待验收项。
 
 Arch 当前生产 live queue 仍为 schema 10，来自 detached Task 5 实现；当前分支已支持真实 v7/v8/v9/v10 表结构迁移并升级到 schema 11，但尚未切换生产 queue。此前没有修改 `PRAGMA user_version`，也没有删除或覆盖生产 queue。
 

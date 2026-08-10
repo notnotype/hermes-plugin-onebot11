@@ -20,6 +20,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -43,6 +44,7 @@ CallerContext = _proto.CallerContext
 ChatTarget = _proto.ChatTarget
 GroupDispatcher = _proto.GroupDispatcher
 QueueFull = _proto.queue.QueueFull
+QueueBusy = _proto.queue.QueueBusy
 QueueLease = _proto.QueueLease
 QueueMessage = _proto.QueueMessage
 QueueStore = _proto.QueueStore
@@ -85,6 +87,8 @@ WRITE_TOOL_NAMES = _proto.tools.WRITE_TOOL_NAMES
 build_llm_trigger_input = _proto.triggers.build_llm_trigger_input
 PiAiTriggerClient = _proto.pi_ai.PiAiTriggerClient
 PiAiTriggerError = _proto.pi_ai.PiAiTriggerError
+ConversationCommand = _proto.commands.ConversationCommand
+parse_conversation_command = _proto.commands.parse_conversation_command
 LayeredTriggerState = _proto.triggers.LayeredTriggerState
 TriggerAction = _proto.triggers.TriggerAction
 parse_llm_decision = _proto.triggers.parse_llm_decision
@@ -106,6 +110,9 @@ _CURRENT_BINDING: contextvars.ContextVar[TurnBinding | None] = contextvars.Conte
 _CURRENT_EVENT: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
     "onebot11_current_event", default=None
 )
+_CURRENT_RESET_MARKER: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "onebot11_current_reset_marker", default=None
+)
 
 _TOOL_HANDLERS: dict[str, Any] = {
     "qq_get_message": handle_get_message,
@@ -114,6 +121,19 @@ _TOOL_HANDLERS: dict[str, Any] = {
     "qq_get_group_info": handle_get_group_info,
     "qq_get_group_member_info": handle_get_group_member_info,
 }
+
+
+@dataclass(frozen=True)
+class _PendingSessionReset:
+    """等待 Hermes ``on_session_reset`` 回调的群级 reset 标记。"""
+
+    marker_id: str
+    chat_id: str
+    session_key: str
+    old_session_id: str | None
+    command: str
+    before_seq: int
+    adapter_epoch: int
 
 
 def _platform() -> Platform:
@@ -346,6 +366,10 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._fenced_leases: set[str] = set()
         self._lease_session_keys: dict[str, str] = {}
         self._pending_completions: dict[str, tuple[ProcessingOutcome, bool, bool, str | None]] = {}
+        self._pending_session_resets: list[_PendingSessionReset] = []
+        self._session_reset_tasks: set[asyncio.Task[None]] = set()
+        self._resetting_groups: set[str] = set()
+        self._conversation_reset_generations: dict[str, int] = {}
         self._aux_event_count = 0
         self._adapter_epoch = 0
         self._closed = False
@@ -414,6 +438,15 @@ class OneBot11Adapter(BasePlatformAdapter):
         if trigger_tasks or timer_tasks:
             await asyncio.gather(*trigger_tasks, *timer_tasks, return_exceptions=True)
 
+    async def _cancel_session_reset_tasks(self) -> None:
+        """断开时取消尚未完成的群级 reset 收尾任务。"""
+        tasks = list(self._session_reset_tasks)
+        self._session_reset_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     def _reset_reconnect_state(self) -> None:
         """丢弃只存在内存中的 engaged/debounce/judging 状态。"""
         self._last_trigger_at.clear()
@@ -431,6 +464,9 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._lease_session_keys.clear()
         self._pending_completions.clear()
         self._processing_reaction_message_ids.clear()
+        self._pending_session_resets.clear()
+        self._resetting_groups.clear()
+        self._conversation_reset_generations.clear()
         self._bindings.clear()
 
     async def _stop_runtime(self, *, mark_disconnected: bool) -> None:
@@ -450,6 +486,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                 self._ws = None
 
         await self._cancel_trigger_tasks()
+        await self._cancel_session_reset_tasks()
         cancel_background = getattr(self, "cancel_background_tasks", None)
         if callable(cancel_background):
             try:
@@ -563,7 +600,26 @@ class OneBot11Adapter(BasePlatformAdapter):
         if normalized_text == "/onebot" or normalized_text.startswith("/onebot "):
             await self._handle_admin_command(event)
             return
+        conversation_command = parse_conversation_command(normalized_text)
+        if conversation_command is not None and event.chat_type == "group":
+            await self._handle_conversation_command(event, conversation_command)
+            return
         if event.chat_type == "group":
+            if str(event.chat_id) in self._resetting_groups:
+                self._audit.record(
+                    "message_deferred",
+                    {
+                        "chat_type": "group",
+                        "chat_id": str(event.chat_id),
+                        "user_id": str(event.user_id),
+                        "reason": "session reset in progress",
+                    },
+                )
+                await self._send_direct(
+                    event,
+                    "当前群正在重置会话，请稍后重新发送这条消息。",
+                )
+                return
             await self._enqueue_group_event(event)
             return
         message_event = await self._build_message_event(event)
@@ -575,6 +631,459 @@ class OneBot11Adapter(BasePlatformAdapter):
                 media_dir=(message_event.metadata or {}).get("onebot11_media_dir"),
             )
             raise
+
+    async def _handle_conversation_command(
+        self,
+        event: _proto.events.InboundEvent,
+        command: ConversationCommand,
+    ) -> None:
+        """在群消息入队前桥接受控会话 reset 到 Hermes 公共命令入口。"""
+        if event.user_id not in self.super_admins:
+            self._audit.record(
+                "permission_denied",
+                {
+                    "chat_type": event.chat_type,
+                    "chat_id": event.chat_id,
+                    "user_id": event.user_id,
+                    "command": command.name,
+                    "reason": "群级会话命令仅超级管理员可用",
+                },
+            )
+            await self._send_direct(event, "仅超级管理员可执行群级会话命令")
+            return
+        if not self._chat_access_allowed("group", event.chat_id, event.user_id):
+            self._audit.record(
+                "access_denied",
+                {
+                    "chat_type": event.chat_type,
+                    "chat_id": event.chat_id,
+                    "user_id": event.user_id,
+                    "command": command.name,
+                    "reason": "会话命令目标不再满足访问策略",
+                },
+            )
+            await self._send_direct(event, "当前群不再满足 OneBot11 访问策略")
+            return
+
+        normalized_chat_id = str(event.chat_id)
+        if normalized_chat_id in self._resetting_groups:
+            self._audit.record(
+                "command_rejected",
+                {
+                    "chat_type": "group",
+                    "chat_id": normalized_chat_id,
+                    "user_id": str(event.user_id),
+                    "command": command.name,
+                    "reason": "session reset already in progress",
+                },
+            )
+            await self._send_direct(event, "当前群已有会话重置正在进行，请稍后重试。")
+            return
+        status_before_reset = await asyncio.to_thread(
+            self._queue.status,
+            normalized_chat_id,
+        )
+        reset_before_seq = int(status_before_reset.get("latest_seq", 0) or 0)
+        self._resetting_groups.add(normalized_chat_id)
+        prepared = await self._prepare_conversation_reset(normalized_chat_id, event)
+        if not prepared:
+            self._resetting_groups.discard(normalized_chat_id)
+            await self._send_direct(
+                event,
+                "当前群有未能安全收口的 turn，未执行会话重置；请稍后重试。",
+            )
+            return
+
+        reset_generation = self._conversation_reset_generations.get(
+            normalized_chat_id,
+            0,
+        ) + 1
+        self._conversation_reset_generations[normalized_chat_id] = reset_generation
+        session_key = self._hermes_session_key_for_event(event)
+        old_session_id = self._session_id_for_key(session_key)
+        marker_id = uuid.uuid4().hex
+        self._pending_session_resets.append(
+            _PendingSessionReset(
+                marker_id=marker_id,
+                chat_id=normalized_chat_id,
+                session_key=session_key,
+                old_session_id=old_session_id,
+                command=command.name,
+                before_seq=reset_before_seq,
+                adapter_epoch=self._adapter_epoch,
+            )
+        )
+        message_event = self._build_conversation_command_event(
+            event,
+            command,
+            reset_marker_id=marker_id,
+        )
+        caller = self._caller_for_event(
+            SimpleNamespace(
+                user_id=event.user_id,
+                chat_type=event.chat_type,
+                chat_id=event.chat_id,
+            )
+        )
+        event_token = _CURRENT_EVENT.set(message_event)
+        caller_token = _CURRENT_CALLER.set(caller)
+        reset_token = _CURRENT_RESET_MARKER.set(marker_id)
+        try:
+            await super().handle_message(message_event)
+        except BaseException:
+            self._remove_pending_session_reset(
+                normalized_chat_id,
+                session_key=session_key,
+            )
+            self._resetting_groups.discard(normalized_chat_id)
+            raise
+        finally:
+            _CURRENT_RESET_MARKER.reset(reset_token)
+            _CURRENT_CALLER.reset(caller_token)
+            _CURRENT_EVENT.reset(event_token)
+
+    async def _prepare_conversation_reset(
+        self,
+        chat_id: str,
+        event: _proto.events.InboundEvent,
+    ) -> bool:
+        """停止旁路触发并 fencing 当前群活动 lease，再交给 Hermes reset。"""
+        normalized_chat_id = str(chat_id)
+        async with self._trigger_lock_for(normalized_chat_id):
+            state = self._trigger_states.get(normalized_chat_id)
+            if state is not None:
+                state.invalidate_judgement()
+            self._last_trigger_at.pop(normalized_chat_id, None)
+        self._cancel_llm_judgement(normalized_chat_id)
+
+        active = self._dispatcher.active(normalized_chat_id)
+        if active is None:
+            status = await asyncio.to_thread(self._queue.status, normalized_chat_id)
+            return int(status.get("leased", 0) or 0) == 0
+
+        lease = active.lease
+        self._fenced_leases.add(lease.lease_id)
+        session_key = self._lease_session_keys.get(lease.lease_id)
+        if not session_key:
+            session_key = self._hermes_session_key_for_event(event)
+        try:
+            await self.cancel_session_processing(
+                session_key,
+                release_guard=True,
+                discard_pending=True,
+            )
+        except Exception:
+            logger.warning(
+                "OneBot11 reset 取消旧 Hermes turn 失败: chat=%s lease=%s",
+                normalized_chat_id,
+                lease.lease_id,
+                exc_info=True,
+            )
+
+        status = await asyncio.to_thread(self._queue.status_for_lease, lease.lease_id)
+        outbound_started = bool(status.get("outbound_started")) or (
+            lease.lease_id in self._outbound_started
+        )
+        try:
+            await self._dispatcher.complete(
+                lease.lease_id,
+                outcome="failure",
+                unknown=outbound_started or lease.lease_id in self._unknown_leases,
+                known_failure=not outbound_started,
+                reason="session reset fencing",
+            )
+        except Exception:
+            logger.warning(
+                "OneBot11 reset lease 结算失败: chat=%s lease=%s",
+                normalized_chat_id,
+                lease.lease_id,
+                exc_info=True,
+            )
+        await self._clear_processing_reaction(lease.lease_id)
+        final_status = await asyncio.to_thread(self._queue.status, normalized_chat_id)
+        return int(final_status.get("leased", 0) or 0) == 0
+
+    def _build_conversation_command_event(
+        self,
+        event: _proto.events.InboundEvent,
+        command: ConversationCommand,
+        *,
+        reset_marker_id: str | None = None,
+    ) -> MessageEvent:
+        """构造不带发送者前缀的 Hermes 原生 slash command 事件。"""
+        command_text = command.name
+        if command.name == "clear":
+            # Hermes gateway 的 /clear 是 CLI-only；OneBot 把它作为
+            # 群级 reset 别名翻译成公共 /new，不调用 Hermes 私有 reset。
+            command_text = "/new"
+        elif command.name == "new":
+            command_text = "/new"
+            if command.argument:
+                command_text = f"{command_text} {command.argument}"
+        else:
+            command_text = "/reset"
+        caller = self._caller_for_event(
+            SimpleNamespace(
+                user_id=event.user_id,
+                chat_type=event.chat_type,
+                chat_id=event.chat_id,
+            )
+        )
+        source = self.build_source(
+            chat_id=event.chat_id,
+            chat_name=event.chat_id,
+            chat_type="group",
+            user_id=event.user_id,
+            user_name=event.user_name,
+            message_id=event.message_id,
+            role_authorized=True,
+        )
+        return MessageEvent(
+            text=command_text,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=event.raw_metadata,
+            message_id=(
+                event.message_id
+                if is_numeric_message_id(event.message_id)
+                else None
+            ),
+            reply_to_message_id=(
+                event.message_id
+                if is_numeric_message_id(event.message_id)
+                else None
+            ),
+            metadata={
+                "onebot11_conversation_command": command.name,
+                "onebot11_target": {
+                    "chat_type": "group",
+                    "chat_id": event.chat_id,
+                },
+                "onebot11_caller_context": _serializable_caller(caller),
+                "onebot11_reset_marker_id": reset_marker_id,
+                "onebot11_reset_generation": self._conversation_reset_generations.get(
+                    str(event.chat_id),
+                    0,
+                ),
+                "onebot11_adapter_epoch": self._adapter_epoch,
+            },
+        )
+
+    def _hermes_session_key_for_event(
+        self,
+        event: _proto.events.InboundEvent,
+    ) -> str:
+        """按 Hermes shared-session 合同生成一个群 session key。"""
+        try:
+            from gateway.session import build_session_key
+
+            source = self.build_source(
+                chat_id=event.chat_id,
+                chat_name=event.chat_id,
+                chat_type="group",
+                user_id=event.user_id,
+                user_name=event.user_name,
+                message_id=event.message_id,
+                role_authorized=True,
+            )
+            return str(
+                build_session_key(
+                    source,
+                    group_sessions_per_user=False,
+                    thread_sessions_per_user=False,
+                )
+            )
+        except Exception:
+            return f"onebot11:group:{event.chat_id}"
+
+    def _session_id_for_key(self, session_key: str) -> str | None:
+        """读取当前 session ID 作为 reset hook 的身份匹配提示。"""
+        store = getattr(self, "_session_store", None)
+        peek = getattr(store, "peek_session_id", None)
+        if not callable(peek):
+            return None
+        try:
+            value = peek(str(session_key))
+        except Exception:
+            return None
+        return str(value) if value else None
+
+    def _remove_pending_session_reset(
+        self,
+        chat_id: str,
+        *,
+        session_key: str | None = None,
+        marker_id: str | None = None,
+    ) -> None:
+        """删除指定群的未完成 reset 标记，避免旧 hook 误清新命令。"""
+        normalized = str(chat_id)
+        self._pending_session_resets = [
+            marker
+            for marker in self._pending_session_resets
+            if not (
+                marker.chat_id == normalized
+                and (session_key is None or marker.session_key == session_key)
+                and (marker_id is None or marker.marker_id == marker_id)
+            )
+        ]
+
+    def _match_pending_session_reset(
+        self,
+        *,
+        old_session_id: str | None,
+        new_session_id: str | None,
+        session_key: str | None = None,
+        marker_id: str | None = None,
+    ) -> _PendingSessionReset | None:
+        """按当前 reset 上下文匹配群，无法确认时保持 fail-closed。"""
+        old_id = str(old_session_id or "")
+        new_id = str(new_session_id or "")
+        hook_session_key = str(session_key or "")
+        context_marker_id = str(marker_id or _CURRENT_RESET_MARKER.get() or "")
+        current_event = _CURRENT_EVENT.get()
+        current_metadata = getattr(current_event, "metadata", None) or {}
+        if not context_marker_id and isinstance(current_metadata, Mapping):
+            context_marker_id = str(
+                current_metadata.get("onebot11_reset_marker_id") or ""
+            )
+        context_chat_id = ""
+        if isinstance(current_metadata, Mapping):
+            target = current_metadata.get("onebot11_target")
+            if isinstance(target, Mapping):
+                context_chat_id = str(target.get("chat_id") or "")
+
+        candidates: dict[str, _PendingSessionReset] = {}
+        for marker in self._pending_session_resets:
+            if marker.adapter_epoch != self._adapter_epoch:
+                continue
+            matches_context = (
+                bool(context_marker_id) and marker.marker_id == context_marker_id
+            )
+            matches_session_key = (
+                bool(hook_session_key) and marker.session_key == hook_session_key
+            )
+            matches_chat = bool(context_chat_id) and marker.chat_id == context_chat_id
+            matches_old_id = bool(old_id) and marker.old_session_id in {old_id, new_id}
+            matches_new_id = bool(new_id) and (
+                self._session_id_for_key(marker.session_key) == new_id
+            )
+            if matches_context or matches_session_key or matches_chat or matches_old_id or matches_new_id:
+                candidates[marker.marker_id] = marker
+
+        if not candidates and len(self._pending_session_resets) == 1 and (
+            old_id or new_id or hook_session_key or context_marker_id or context_chat_id
+        ):
+            # 兼容只提供新 session_id 的旧 Hermes；只有一个带身份线索的
+            # 未决 reset 时可以安全匹配，多个群则必须拒绝猜测。
+            marker = self._pending_session_resets[0]
+            if marker.adapter_epoch == self._adapter_epoch:
+                candidates[marker.marker_id] = marker
+        if len(candidates) != 1:
+            return None
+        marker = next(iter(candidates.values()))
+        self._pending_session_resets.remove(marker)
+        return marker
+
+    async def _finalize_session_reset(self, marker: _PendingSessionReset) -> None:
+        """在 Hermes reset 成功后清空群队列和内存触发状态。"""
+        if marker.adapter_epoch != self._adapter_epoch or self._closed:
+            return
+        try:
+            result = await asyncio.to_thread(
+                self._queue.reset_conversation,
+                marker.chat_id,
+                before_seq=marker.before_seq,
+            )
+        except QueueBusy:
+            self._audit.record(
+                "session_reset_failed",
+                {
+                    "chat_type": "group",
+                    "chat_id": marker.chat_id,
+                    "command": marker.command,
+                    "reason": "queue still has an active lease",
+                },
+            )
+            logger.warning(
+                "OneBot11 Hermes reset 后队列仍有活动 lease: chat=%s",
+                marker.chat_id,
+            )
+            self._resetting_groups.discard(marker.chat_id)
+            return
+        except Exception:
+            self._audit.record(
+                "session_reset_failed",
+                {
+                    "chat_type": "group",
+                    "chat_id": marker.chat_id,
+                    "command": marker.command,
+                    "reason": "QueueStore reset failed",
+                },
+            )
+            logger.warning(
+                "OneBot11 Hermes reset 后队列清理失败: chat=%s",
+                marker.chat_id,
+                exc_info=True,
+            )
+            self._resetting_groups.discard(marker.chat_id)
+            return
+
+        async with self._trigger_lock_for(marker.chat_id):
+            state = self._trigger_states.pop(marker.chat_id, None)
+            if state is not None:
+                state.invalidate_judgement()
+            self._last_trigger_at.pop(marker.chat_id, None)
+        self._cancel_llm_judgement(marker.chat_id)
+        self._resetting_groups.discard(marker.chat_id)
+        self._audit.record(
+            "session_reset",
+            {
+                "chat_type": "group",
+                "chat_id": marker.chat_id,
+                "command": marker.command,
+                "message_count": result.message_count,
+                "trigger_count": result.trigger_count,
+                "paused": result.paused,
+            },
+        )
+        if not result.paused:
+            status = await asyncio.to_thread(self._queue.status, marker.chat_id)
+            if int(status.get("pending_trigger_requests", 0) or 0) > 0:
+                await self._dispatcher.notify(marker.chat_id)
+            elif int(status.get("pending", 0) or 0) > 0:
+                await self._restore_trigger_state(marker.chat_id)
+
+    def _on_session_reset_hook(self, **kwargs: Any) -> None:
+        """接收 Hermes 公共 reset 生命周期并异步清理 OneBot 群状态。"""
+        if _platform_value(kwargs.get("platform")) != _PLATFORM_NAME:
+            return
+        marker = self._match_pending_session_reset(
+            old_session_id=kwargs.get("old_session_id"),
+            new_session_id=kwargs.get("new_session_id") or kwargs.get("session_id"),
+            session_key=kwargs.get("session_key"),
+            marker_id=kwargs.get("onebot11_reset_marker_id"),
+        )
+        if marker is None:
+            if self._pending_session_resets:
+                self._audit.record(
+                    "session_reset_unmatched",
+                    {
+                        "reason": "reset hook identity missing or ambiguous",
+                        "pending_count": len(self._pending_session_resets),
+                    },
+                )
+            return
+        try:
+            task = asyncio.create_task(self._finalize_session_reset(marker))
+        except RuntimeError:
+            logger.warning(
+                "OneBot11 session reset hook 当前没有事件循环: chat=%s",
+                marker.chat_id,
+            )
+            self._resetting_groups.discard(marker.chat_id)
+            return
+        self._session_reset_tasks.add(task)
+        task.add_done_callback(self._session_reset_tasks.discard)
 
     def _access_allowed(self, event: _proto.events.InboundEvent) -> bool:
         """在图片下载和入队前应用严格访问策略。"""
@@ -599,6 +1108,8 @@ class OneBot11Adapter(BasePlatformAdapter):
 
     def _can_dispatch_chat(self, chat_id: str) -> bool:
         """恢复群 lease 前重新应用当前 adapter 的群访问策略。"""
+        if str(chat_id) in self._resetting_groups:
+            return False
         chat_type = self._queue.chat_type(str(chat_id)) or self._chat_types.get(str(chat_id))
         return chat_type == "group" and self._chat_access_allowed("group", str(chat_id))
 
@@ -1842,6 +2353,11 @@ class OneBot11Adapter(BasePlatformAdapter):
                     "onebot11_anchor_message_id": reply_id,
                     "onebot11_anchor_user_id": anchor_message.user_id,
                     "onebot11_anchor_user_name": anchor_message.user_name,
+                    "onebot11_reset_generation": self._conversation_reset_generations.get(
+                        str(lease.chat_id),
+                        0,
+                    ),
+                    "onebot11_adapter_epoch": self._adapter_epoch,
                     "onebot11_media_dir": media_dir if has_images else None,
                     "onebot11_media_paths": list(media_paths),
                     "onebot11_media_limited": media_limited,
@@ -2075,6 +2591,32 @@ class OneBot11Adapter(BasePlatformAdapter):
         should_schedule_timer = False
         should_notify = False
         chat_id = ""
+        fenced_completion = lease_id in self._fenced_leases
+        raw_target = metadata.get("onebot11_target")
+        if isinstance(raw_target, Mapping):
+            chat_id = str(raw_target.get("chat_id") or "")
+        if not chat_id:
+            chat_id = str(getattr(getattr(event, "source", None), "chat_id", "") or "")
+        runtime_fenced = fenced_completion
+        raw_epoch = metadata.get("onebot11_adapter_epoch")
+        if raw_epoch is not None:
+            try:
+                runtime_fenced = runtime_fenced or (
+                    isinstance(raw_epoch, bool)
+                    or int(raw_epoch) != self._adapter_epoch
+                )
+            except (TypeError, ValueError):
+                runtime_fenced = True
+        raw_reset_generation = metadata.get("onebot11_reset_generation")
+        if raw_reset_generation is not None and chat_id:
+            try:
+                current_generation = self._conversation_reset_generations.get(chat_id, 0)
+                runtime_fenced = runtime_fenced or (
+                    isinstance(raw_reset_generation, bool)
+                    or int(raw_reset_generation) != current_generation
+                )
+            except (TypeError, ValueError):
+                runtime_fenced = True
         lease_revision = int(metadata.get("onebot11_lease_revision") or 0)
         try:
             ack, unknown, known_failure, reason = self._queue_completion_decision(lease_id, outcome)
@@ -2102,11 +2644,12 @@ class OneBot11Adapter(BasePlatformAdapter):
                 logger.warning("OneBot11 reaction 收尾失败: %s", lease_id, exc_info=True)
         post_completion_error: BaseException | None = None
         try:
-            raw_target = metadata.get("onebot11_target")
-            chat_id = str(raw_target.get("chat_id") or "") if isinstance(raw_target, Mapping) else ""
-            if not chat_id:
-                chat_id = str(getattr(getattr(event, "source", None), "chat_id", "") or "")
-            if completion_error is None and chat_id in self.trigger_config.llm_allowed_groups and self.trigger_config.llm_enabled:
+            if (
+                completion_error is None
+                and not runtime_fenced
+                and chat_id in self.trigger_config.llm_allowed_groups
+                and self.trigger_config.llm_enabled
+            ):
                 async with self._trigger_lock_for(chat_id):
                     status = await asyncio.to_thread(self._queue.status, chat_id)
                     state = self._trigger_state_for(chat_id)
@@ -2171,7 +2714,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                         and not status.get("paused")
                         and has_hard_trigger
                     )
-            elif completion_error is None:
+            elif completion_error is None and not runtime_fenced:
                 should_notify = bool(completed and ack and not unknown)
             if should_schedule_timer and not self._closed:
                 self._schedule_trigger_timer(chat_id)
@@ -2193,7 +2736,10 @@ class OneBot11Adapter(BasePlatformAdapter):
                 },
             )
         finally:
-            if completion_error is not None or post_completion_error is not None:
+            if (
+                not runtime_fenced
+                and (completion_error is not None or post_completion_error is not None)
+            ):
                 try:
                     if chat_id and await self._ensure_completion_recovery_trigger(chat_id):
                         if not self._closed:
@@ -2459,13 +3005,16 @@ class OneBot11Adapter(BasePlatformAdapter):
                 )
             except ValueError as exc:
                 if lease_id:
-                    self._outbound_known_failure.add(lease_id)
+                    if sent:
+                        self._unknown_leases.add(lease_id)
+                    else:
+                        self._outbound_known_failure.add(lease_id)
                 return SendResult(
                     False,
                     message_id=sent[-1] if sent else None,
                     error=str(exc),
                     raw_response={"sent_chunks": len(sent), "total_chunks": len(pieces)},
-                    error_kind="failed",
+                    error_kind="unknown" if sent else "failed",
                 )
         return SendResult(
             True,
@@ -2484,73 +3033,14 @@ class OneBot11Adapter(BasePlatformAdapter):
     ) -> SendResult:
         """把受信任的本地图片编码为 OneBot ``base64://`` image segment。"""
         del kwargs
+        preflight = self._preflight_image_delivery(chat_id, metadata)
+        if preflight is not None:
+            return preflight
         binding = self._binding_from_context()
         current_event = _CURRENT_EVENT.get()
-        current_event_metadata = getattr(current_event, "metadata", None) or {}
-        managed_context = bool(
-            isinstance(metadata, Mapping)
-            and (
-                metadata.get("onebot11_managed_context")
-                or metadata.get("onebot11_lease_id")
-            )
-        ) or bool(
-            isinstance(current_event_metadata, Mapping)
-            and (
-                current_event_metadata.get("onebot11_managed_context")
-                or current_event_metadata.get("onebot11_lease_id")
-            )
-        )
-        if managed_context and binding is None:
-            stale_lease_id = str(
-                (
-                    metadata.get("onebot11_lease_id")
-                    if isinstance(metadata, Mapping)
-                    else None
-                )
-                or (
-                    current_event_metadata.get("onebot11_lease_id")
-                    if isinstance(current_event_metadata, Mapping)
-                    else None
-                )
-                or ""
-            ).strip()
-            if stale_lease_id:
-                self._fenced_leases.add(stale_lease_id)
-                self._outbound_known_failure.add(stale_lease_id)
-            return SendResult(
-                False,
-                error="OneBot11 managed turn binding unavailable，拒绝出站",
-                error_kind="fenced",
-            )
         lease_id = binding.lease_id if binding else None
-        if self._closed:
-            if lease_id:
-                self._outbound_known_failure.add(lease_id)
-            return SendResult(False, error="OneBot11 adapter is closed", error_kind="not_found")
-        if lease_id and not self._lease_is_current(lease_id):
-            self._fenced_leases.add(lease_id)
-            self._outbound_known_failure.add(lease_id)
-            return SendResult(False, error="OneBot11 lease 已失效，拒绝出站", error_kind="fenced")
         target = self._resolve_target(str(chat_id), metadata)
-        if target is None:
-            if lease_id:
-                self._outbound_known_failure.add(lease_id)
-            return SendResult(False, error="OneBot11 target unknown or ambiguous", error_kind="unknown")
-        caller_user_id = (
-            binding.caller.user_id
-            if binding is not None
-            else target.chat_id
-            if target.chat_type == "dm"
-            else None
-        )
-        if not self._chat_access_allowed(target.chat_type, target.chat_id, caller_user_id):
-            if lease_id:
-                self._outbound_known_failure.add(lease_id)
-            return SendResult(False, error="OneBot11 target 不再满足访问策略", error_kind="permission")
-        if self._ws is None:
-            if lease_id:
-                self._outbound_known_failure.add(lease_id)
-            return SendResult(False, error="Not connected", error_kind="not_found")
+        assert target is not None
 
         safe_path = self.validate_media_delivery_path(str(image_path))
         if not safe_path:
@@ -2661,6 +3151,9 @@ class OneBot11Adapter(BasePlatformAdapter):
         metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         """安全下载远程图片后，以 base64 segment 发送，不回退为 URL 文本。"""
+        preflight = self._preflight_image_delivery(chat_id, metadata)
+        if preflight is not None:
+            return preflight
         media_dir = self._new_media_dir()
         path = await self._api.download_to_temp(str(image_url), media_dir)
         if not path:
@@ -2676,6 +3169,81 @@ class OneBot11Adapter(BasePlatformAdapter):
             )
         finally:
             self._cleanup_media([path], media_dir=media_dir)
+
+    def _preflight_image_delivery(
+        self,
+        chat_id: str,
+        metadata: Mapping[str, Any] | None,
+    ) -> SendResult | None:
+        """在图片下载或 OneBot 请求前校验身份、目标、权限和连接。"""
+        binding = self._binding_from_context()
+        current_event = _CURRENT_EVENT.get()
+        current_event_metadata = getattr(current_event, "metadata", None) or {}
+        managed_context = bool(
+            isinstance(metadata, Mapping)
+            and (
+                metadata.get("onebot11_managed_context")
+                or metadata.get("onebot11_lease_id")
+            )
+        ) or bool(
+            isinstance(current_event_metadata, Mapping)
+            and (
+                current_event_metadata.get("onebot11_managed_context")
+                or current_event_metadata.get("onebot11_lease_id")
+            )
+        )
+        if managed_context and binding is None:
+            stale_lease_id = str(
+                (
+                    metadata.get("onebot11_lease_id")
+                    if isinstance(metadata, Mapping)
+                    else None
+                )
+                or (
+                    current_event_metadata.get("onebot11_lease_id")
+                    if isinstance(current_event_metadata, Mapping)
+                    else None
+                )
+                or ""
+            ).strip()
+            if stale_lease_id:
+                self._fenced_leases.add(stale_lease_id)
+                self._outbound_known_failure.add(stale_lease_id)
+            return SendResult(
+                False,
+                error="OneBot11 managed turn binding unavailable，拒绝出站",
+                error_kind="fenced",
+            )
+        lease_id = binding.lease_id if binding else None
+        if self._closed:
+            if lease_id:
+                self._outbound_known_failure.add(lease_id)
+            return SendResult(False, error="OneBot11 adapter is closed", error_kind="not_found")
+        if lease_id and not self._lease_is_current(lease_id):
+            self._fenced_leases.add(lease_id)
+            self._outbound_known_failure.add(lease_id)
+            return SendResult(False, error="OneBot11 lease 已失效，拒绝出站", error_kind="fenced")
+        target = self._resolve_target(str(chat_id), metadata)
+        if target is None:
+            if lease_id:
+                self._outbound_known_failure.add(lease_id)
+            return SendResult(False, error="OneBot11 target unknown or ambiguous", error_kind="unknown")
+        caller_user_id = (
+            binding.caller.user_id
+            if binding is not None
+            else target.chat_id
+            if target.chat_type == "dm"
+            else None
+        )
+        if not self._chat_access_allowed(target.chat_type, target.chat_id, caller_user_id):
+            if lease_id:
+                self._outbound_known_failure.add(lease_id)
+            return SendResult(False, error="OneBot11 target 不再满足访问策略", error_kind="permission")
+        if self._ws is None:
+            if lease_id:
+                self._outbound_known_failure.add(lease_id)
+            return SendResult(False, error="Not connected", error_kind="not_found")
+        return None
 
     async def send_multiple_images(
         self,
@@ -3599,6 +4167,13 @@ def _post_llm_call_hook(**kwargs: Any) -> None:
     del kwargs
 
 
+def _on_session_reset_hook(**kwargs: Any) -> None:
+    """把 Hermes 公共 session reset 生命周期转给活动 OneBot adapter。"""
+    adapter = _get_live_adapter()
+    if adapter is not None:
+        adapter._on_session_reset_hook(**kwargs)
+
+
 def check_requirements() -> bool:
     """只检查插件运行依赖；部署配置由 validate_config 读取 YAML 或环境变量。"""
     try:
@@ -3740,6 +4315,7 @@ def register(ctx: Any) -> None:
         register_hook("pre_llm_call", _pre_llm_call_hook)
         register_hook("pre_tool_call", _pre_tool_call_hook)
         register_hook("post_llm_call", _post_llm_call_hook)
+        register_hook("on_session_reset", _on_session_reset_hook)
 def _tool_dispatch(name: str):
     """注册全局 handler，运行时解析当前 OneBot adapter。"""
 

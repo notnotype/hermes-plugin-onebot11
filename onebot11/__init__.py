@@ -2,6 +2,7 @@
 
 from . import (
     audit,
+    commands,
     config,
     confirm,
     context,
@@ -25,12 +26,14 @@ from .queue import (
     OperationStart,
     QueueLease,
     QueueMessage,
+    QueueResetResult,
     QueueStore,
     TriggerRequest,
 )
 
 __all__ = [
     "events",
+    "commands",
     "http_api",
     "message",
     "pi_ai",
@@ -52,6 +55,7 @@ __all__ = [
     "TurnBindingStore",
     "QueueLease",
     "QueueMessage",
+    "QueueResetResult",
     "QueueStore",
     "TriggerRequest",
     "OperationRecord",
