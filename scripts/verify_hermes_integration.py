@@ -166,10 +166,74 @@ async def _smoke(
         if instance._trigger_states:
             raise AssertionError("reconnect 后不应恢复内存 active/debounce/judging 状态")
 
-        # 斜杠命令在群消息入队前桥接到 Hermes 公共命令入口；这里只验证
-        # synthetic event 合同，不调用 Hermes 私有 reset 实现。
+        # Hermes 的 pre_llm_call 可能在 worker thread 执行，而最终出站
+        # 回到 async event loop；验证插件能从 synthetic event metadata
+        # 恢复精确 binding，而不是依赖 worker ContextVar。
         from onebot11.events import InboundEvent
 
+        instance._chat_types["888"] = "group"
+        binding_event = await instance._build_message_event(
+            InboundEvent(
+                text="worker binding smoke",
+                chat_id="888",
+                chat_type="group",
+                user_id="123",
+                user_name="smoke",
+                message_id="binding-smoke",
+            )
+        )
+        binding_caller = instance._caller_for_event(binding_event.source)
+        binding_event.metadata.update(
+            {
+                "onebot11_managed_context": True,
+                "onebot11_caller_context": adapter._serializable_caller(
+                    binding_caller
+                ),
+            }
+        )
+        original_live_adapter = adapter._get_live_adapter
+        original_send_message = instance._api.send_message
+
+        async def fake_binding_send(
+            _target_id: str,
+            _content: str,
+            *,
+            chat_type: str,
+            reply_to: str | None = None,
+        ) -> str:
+            del reply_to
+            if chat_type != "group":
+                raise AssertionError("worker binding smoke 目标类型错误")
+            return "worker-binding-smoke-1"
+
+        adapter._get_live_adapter = lambda: instance
+        instance._api.send_message = fake_binding_send
+        event_token = adapter._CURRENT_EVENT.set(binding_event)
+        caller_token = adapter._CURRENT_CALLER.set(binding_caller)
+        binding_token = adapter._CURRENT_BINDING.set(None)
+        try:
+            await asyncio.to_thread(
+                adapter._pre_llm_call_hook,
+                session_id="worker-session",
+                turn_id="worker-turn",
+                platform="onebot11",
+            )
+            result = await instance.send(
+                "888",
+                "worker binding smoke",
+                metadata={"notify": True},
+            )
+            if not result.success:
+                raise AssertionError(f"worker binding 出站 smoke 失败: {result!r}")
+        finally:
+            adapter._CURRENT_BINDING.reset(binding_token)
+            adapter._CURRENT_CALLER.reset(caller_token)
+            adapter._CURRENT_EVENT.reset(event_token)
+            adapter._get_live_adapter = original_live_adapter
+            instance._api.send_message = original_send_message
+
+        # 斜杠命令在群消息入队前桥接到 Hermes 公共命令入口；这里只验证
+        # synthetic event 合同，不调用 Hermes 私有 reset 实现。
         command_event = InboundEvent(
             text="/new integration",
             chat_id="888",
@@ -195,7 +259,7 @@ async def _smoke(
             raise AssertionError("reset marker 未绑定到 synthetic command")
         instance._targets["888"] = adapter.ChatTarget("group", "888")
         instance._chat_types["888"] = "group"
-        original_send_message = instance._api.send_message
+        original_command_send = instance._api.send_message
 
         async def fake_command_reply(
             target_id: str,
@@ -223,7 +287,7 @@ async def _smoke(
             )
         finally:
             adapter._CURRENT_EVENT.reset(event_token)
-            instance._api.send_message = original_send_message
+            instance._api.send_message = original_command_send
         if not command_reply.success:
             raise AssertionError(f"会话命令回执被错误拦截: {command_reply!r}")
 
@@ -267,7 +331,6 @@ async def _smoke(
         # 路径被转换为可跨 Docker 边界传输的 base64://。
         image_path = Path(instance._media_root) / "integration-image.png"
         image_path.write_bytes(b"\x89PNG\r\n\x1a\nintegration")
-        instance._chat_types["888"] = "group"
         captured_segments: list[list[dict]] = []
 
         async def fake_send_segments(

@@ -1,8 +1,9 @@
 # Task 6：OneBot 11 群级命令与 Arch 验收收口
 
 - 关联 Issue：[Issue #16：OneBot 11 Arch 验收收口](https://github.com/notnotype/hermes-plugin-onebot11/issues/16)
-- 分支：`feat/i16-onebot11-command-acceptance`
-- 状态：本地实现和 Hermes 组合 smoke 已完成；尚未合并 PR，也尚未部署 Arch
+- 前置修复：[Issue #13：OneBot 11 出站 Binding](https://github.com/notnotype/hermes-plugin-onebot11/issues/13)
+- 当前分支：`fix/i13-onebot11-delivery-binding`
+- 状态：命令/触发实现已在 master；本分支补齐 worker-thread 到 async final delivery 的 Binding 恢复。PR 合并前不部署 Arch，也不发送真实验收消息。
 
 ## 目标
 
@@ -12,7 +13,8 @@
 2. 成功回复后的 60 秒内可以不重复 @ 继续对话；
 3. `/new`、`/reset`、`/clear` 可以在群内重置当前 shared session；
 4. 普通用户和超级管理员的工具集合保持可配置、可审计、fail-closed；
-5. 本机分支经过 PR 合并后，Arch 只需 `git pull --ff-only` 和安装 Node 依赖即可部署。
+5. worker thread 建立 binding 后，async final delivery 的文本/图片不会因 ContextVar 缺失而被错误标记为 `fenced`；
+6. 本机分支经过 PR 合并后，Arch 只需 `git pull --ff-only` 和安装 Node 依赖即可部署。
 
 ## 已实现
 
@@ -33,6 +35,8 @@
 - hard trigger（@、关键词、always、管理员 flush）不消耗 selector；问句、记忆候选和
   engaged 内普通 follow-up 才进入插件自有 pi-ai selector。selector 失败按 ignore，
   pending 消息保留。
+- 文本、单图片和多图片出站统一按 event metadata 恢复精确 `(session_id, turn_id)` binding；
+  binding 缺失、冲突、旧 epoch 或 lease 失效时 fail-closed，不访问 OneBot。
 
 ## 权限与 Arch 验收配置
 
@@ -56,8 +60,9 @@
 
 - 插件纯环境：`174 passed, 1 skipped`（只跳过没有 Hermes gateway 的 adapter 集成文件）
 - `ruff check .`：通过
-- Hermes `v0.20.0` 组合：`269 passed`
-- 集成 smoke：`tools=9 hooks=5 pi_ai_trigger=True reconnect=True slash_commands=True`
+- Hermes `v0.20.0` 组合：`275 passed`
+- 集成 smoke：`tools=9 hooks=5 pi_ai_trigger=True reconnect=True slash_commands=True`，包含
+  worker-thread Binding 恢复和 slash command bridge。
 - 真实 Arch 验收仍需在 PR 合并后进行；本地通过不等同于真人 QQ 双用户并发已验收。
 
 ## 计划出入与边界

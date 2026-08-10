@@ -301,6 +301,271 @@ async def test_真实工具handler可从当前binding补齐缺失turn_id(monkeyp
         await adapter.disconnect()
 
 
+async def test_worker线程建立binding后async最终出站可恢复精确binding(monkeypatch):
+    """Hermes worker hook 与 async final delivery 不共享 ContextVar 时仍可安全出站。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    adapter._ws = object()
+    adapter._chat_types["888"] = "group"
+    event = await adapter._build_message_event(
+        InboundEvent(
+            text="最终回复",
+            chat_id="888",
+            chat_type="group",
+            user_id="123",
+            user_name="小明",
+            message_id="1001",
+        )
+    )
+    caller = adapter._caller_for_event(event.source)
+    event.metadata["onebot11_managed_context"] = True
+    event.metadata["onebot11_caller_context"] = adapter_module._serializable_caller(caller)
+    calls: list[tuple[str, str]] = []
+
+    async def fake_send_message(
+        _target_id: str,
+        content: str,
+        *,
+        chat_type: str,
+        reply_to: str | None = None,
+    ) -> str:
+        del reply_to
+        calls.append((content, chat_type))
+        return "reply-1"
+
+    monkeypatch.setattr(adapter._api, "send_message", fake_send_message)
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    adapter_module._pre_gateway_dispatch_hook(event)
+
+    # pre_llm_call 可能在 Hermes 的 worker thread 执行；async final
+    # delivery 回到原 event loop 后，不能依赖 worker 的 ContextVar。
+    await asyncio.to_thread(
+        adapter_module._pre_llm_call_hook,
+        session_id="session-1",
+        turn_id="turn-1",
+        platform="onebot11",
+    )
+    assert event.metadata["onebot11_binding_key"] == {
+        "session_id": "session-1",
+        "turn_id": "turn-1",
+    }
+    adapter_module._CURRENT_BINDING.set(None)
+
+    try:
+        result = await adapter.send(
+            "888",
+            "最终回复",
+            # Hermes final delivery 只传平台通用 metadata，不会复制
+            # synthetic event 的 OneBot binding 字段。
+            metadata={"notify": True},
+        )
+        assert result.success
+        assert calls == [("最终回复", "group")]
+    finally:
+        adapter_module._CURRENT_EVENT.set(None)
+        adapter_module._CURRENT_CALLER.set(None)
+        adapter_module._CURRENT_BINDING.set(None)
+        await adapter.disconnect()
+
+
+async def test出站binding缺失或session_turn不匹配时不访问OneBot(monkeypatch):
+    """managed turn 没有精确 binding 时必须 fail-closed。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    adapter._ws = object()
+    adapter._chat_types["888"] = "group"
+    calls: list[str] = []
+
+    async def fail_if_called(*_args, **_kwargs):
+        calls.append("called")
+        raise AssertionError("binding 无效时不能访问 OneBot")
+
+    monkeypatch.setattr(adapter._api, "send_message", fail_if_called)
+    event = SimpleNamespace(
+        metadata={
+            "onebot11_managed_context": True,
+            "onebot11_binding_key": {
+                "session_id": "missing-session",
+                "turn_id": "missing-turn",
+            },
+            "onebot11_lease_id": "missing-lease",
+        }
+    )
+    event_token = adapter_module._CURRENT_EVENT.set(event)
+    try:
+        result = await adapter.send("888", "不能发送", metadata=event.metadata)
+        assert not result.success
+        assert result.error_kind == "fenced"
+        assert calls == []
+    finally:
+        adapter_module._CURRENT_EVENT.reset(event_token)
+        await adapter.disconnect()
+
+
+@pytest.mark.parametrize("invalid_field", ["self_id", "adapter_epoch", "lease"])
+async def test_metadata_binding身份epoch或lease失效时不访问OneBot(
+    monkeypatch,
+    invalid_field: str,
+):
+    """跨线程恢复不能绕过 bot 身份、adapter epoch 或 lease fencing。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    async def fake_stop() -> None:
+        return None
+
+    adapter._ws = SimpleNamespace(stop=fake_stop)
+    adapter._chat_types["888"] = "group"
+    calls: list[str] = []
+
+    async def fail_if_called(*_args, **_kwargs):
+        calls.append("called")
+        raise AssertionError("失效 binding 不能访问 OneBot")
+
+    monkeypatch.setattr(adapter._api, "send_message", fail_if_called)
+    caller_kwargs: dict[str, object] = {
+        "user_id": "123",
+        "chat_type": "group",
+        "chat_id": "888",
+        "role": "user",
+        "allowed_tools": adapter_module.READ_ONLY_TOOLS,
+        "self_id": "1",
+        "adapter_epoch": adapter._adapter_epoch,
+    }
+    if invalid_field == "self_id":
+        caller_kwargs["self_id"] = "999"
+    elif invalid_field == "adapter_epoch":
+        caller_kwargs["adapter_epoch"] = adapter._adapter_epoch + 1
+    else:
+        caller_kwargs["lease_id"] = "lease-invalid"
+    caller = adapter_module.CallerContext(**caller_kwargs)
+    binding = adapter_module.TurnBinding(
+        "session-invalid",
+        "turn-invalid",
+        caller,
+        caller.lease_id,
+    )
+    adapter._bindings.bind(binding)
+    event = SimpleNamespace(
+        metadata={
+            "onebot11_managed_context": True,
+            "onebot11_caller_context": adapter_module._serializable_caller(caller),
+            "onebot11_binding_key": {
+                "session_id": "session-invalid",
+                "turn_id": "turn-invalid",
+            },
+            "onebot11_lease_id": caller.lease_id,
+        }
+    )
+    event_token = adapter_module._CURRENT_EVENT.set(event)
+    try:
+        result = await adapter.send("888", "不能发送", metadata={"notify": True})
+        assert not result.success
+        assert result.error_kind == "fenced"
+        assert calls == []
+    finally:
+        adapter_module._CURRENT_EVENT.reset(event_token)
+        await adapter.disconnect()
+
+
+async def test文本图片和多图片出站复用同一metadata_binding(monkeypatch):
+    """文本、单图和多图入口都必须使用同一条精确 turn binding。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    async def fake_stop() -> None:
+        return None
+
+    adapter._ws = SimpleNamespace(stop=fake_stop)
+    adapter._chat_types["888"] = "group"
+    event = SimpleNamespace(
+        message_id="1001",
+        metadata={"onebot11_managed_context": True},
+    )
+    caller = adapter_module.CallerContext(
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+        role="user",
+        allowed_tools=adapter_module.READ_ONLY_TOOLS,
+        self_id="1",
+    )
+    binding = adapter_module.TurnBinding("session-media", "turn-media", caller)
+    adapter._bindings.bind(binding)
+    event.metadata.update(
+        {
+            "onebot11_caller_context": adapter_module._serializable_caller(caller),
+            "onebot11_binding_key": {
+                "session_id": "session-media",
+                "turn_id": "turn-media",
+            },
+        }
+    )
+    image_payload = b"\x89PNG\r\n\x1a\nimage"
+    calls: list[dict] = []
+
+    async def fake_segments(
+        target_id: str,
+        segments: list[dict],
+        *,
+        chat_type: str,
+    ) -> str:
+        calls.append(
+            {
+                "target_id": target_id,
+                "segments": segments,
+                "chat_type": chat_type,
+            }
+        )
+        return f"image-{len(calls)}"
+
+    async def fake_download(_url: str, media_dir: str) -> str:
+        path = Path(media_dir) / "downloaded.png"
+        path.write_bytes(image_payload)
+        return str(path)
+
+    monkeypatch.setattr(adapter._api, "send_message_segments", fake_segments)
+    monkeypatch.setattr(adapter._api, "download_to_temp", fake_download)
+    first = Path(adapter._media_root) / "binding-first.png"
+    second = Path(adapter._media_root) / "binding-second.png"
+    first.write_bytes(image_payload)
+    second.write_bytes(image_payload)
+    event_token = adapter_module._CURRENT_EVENT.set(event)
+    caller_token = adapter_module._CURRENT_CALLER.set(caller)
+    binding_token = adapter_module._CURRENT_BINDING.set(None)
+    try:
+        single = await adapter.send_image(
+            "888",
+            "https://example.invalid/image.png",
+            metadata=event.metadata,
+        )
+        multiple = await adapter.send_multiple_images(
+            "888",
+            [(f"file://{first}", ""), (f"file://{second}", "")],
+            metadata=event.metadata,
+        )
+        assert single.success
+        assert [result.success for result in multiple] == [True, True]
+        assert len(calls) == 3
+    finally:
+        first.unlink(missing_ok=True)
+        second.unlink(missing_ok=True)
+        adapter_module._CURRENT_BINDING.reset(binding_token)
+        adapter_module._CURRENT_CALLER.reset(caller_token)
+        adapter_module._CURRENT_EVENT.reset(event_token)
+        await adapter.disconnect()
+
+
 async def test_lease在工具访问HTTP前失效时拒绝新请求(monkeypatch):
     """第一次检查通过、真正访问 API 前 lease 失效时，不能发起新查询。"""
     adapter = _make_adapter(
