@@ -34,7 +34,7 @@ platforms:
           tools: [qq_get_message, qq_get_group_msg_history, qq_get_friend_msg_history,
                   qq_get_group_info, qq_get_group_member_info]
         trusted_user:
-          users: ["2056963663"]
+          users: []
           tools: [qq_get_message, qq_get_group_msg_history, qq_get_group_info]
         super_admin:
           tools: [qq_get_message, qq_get_group_msg_history, qq_get_friend_msg_history,
@@ -95,6 +95,12 @@ cron 和 standalone sender 的 plugin media 不在本轮可靠性合同内。
 `/onebot status`、`/onebot queue`、`/onebot flush`、`/onebot clear`、`/onebot pause`、`/onebot resume`、`/onebot resolve retry`、`/onebot resolve discard`、`/onebot resolve action retry OPERATION_ID`、`/onebot resolve action discard OPERATION_ID`、`/onebot confirm TOKEN`。
 
 `pause` 只停止自动 dispatch，消息继续入队；`clear` 清理 pending 消息和滚动摘要但不删除 Hermes session 历史，活动 lease、`uncertain` 或 `failed` 必须先显式处理。
+
+群级会话生命周期命令是另一条边界：超级管理员可以发送 `/new [title]`、`/reset` 或 `/clear`。
+它们在普通群消息入队前被识别；未授权用户会收到权限拒绝，命令本身不会进入 OneBot
+队列或 Hermes session。`/clear` 作为 OneBot 别名翻译为公共 `/new`，reset 成功后由
+`on_session_reset` hook 清理当前群队列、摘要和内存触发状态。reset 使用命令开始时的消息
+序号作为边界，不会误删 reset 期间新到的消息；reset 期间普通消息需要稍后重发。
 
 ## 分层触发和旁路模型
 

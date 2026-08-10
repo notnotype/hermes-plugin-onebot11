@@ -109,7 +109,7 @@ async def _smoke(
     plugin_root: Path,
     hermes_home: Path,
 ) -> None:
-    """执行平台、工具、hooks、shared session、reconnect 和图片 smoke。"""
+    """执行平台、工具、hooks、shared session、命令、reconnect 和图片 smoke。"""
     del plugin_root
     _register_platform_if_needed()
     from gateway.config import PlatformConfig
@@ -135,8 +135,10 @@ async def _smoke(
         raise AssertionError(f"平台注册数量错误: {len(context.platforms)}")
     if len(context.tools) != 9:
         raise AssertionError(f"工具注册数量错误: {len(context.tools)}")
-    if len(context.hooks) != 4:
+    if len(context.hooks) != 5:
         raise AssertionError(f"hook 注册数量错误: {len(context.hooks)}")
+    if "on_session_reset" not in {name for name, _callback in context.hooks}:
+        raise AssertionError("缺少 on_session_reset hook")
     queue_db = hermes_home / "onebot11" / "integration.sqlite3"
     config = PlatformConfig(
         enabled=True,
@@ -163,6 +165,67 @@ async def _smoke(
             raise AssertionError("reconnect 后 queue/dispatcher 仍是 closed")
         if instance._trigger_states:
             raise AssertionError("reconnect 后不应恢复内存 active/debounce/judging 状态")
+
+        # 斜杠命令在群消息入队前桥接到 Hermes 公共命令入口；这里只验证
+        # synthetic event 合同，不调用 Hermes 私有 reset 实现。
+        from onebot11.events import InboundEvent
+
+        command_event = InboundEvent(
+            text="/new integration",
+            chat_id="888",
+            chat_type="group",
+            user_id="123",
+            user_name="smoke",
+            message_id="command-smoke",
+        )
+        parsed_command = adapter.parse_conversation_command(command_event.text)
+        if parsed_command is None or parsed_command.name != "new":
+            raise AssertionError("群级 /new 命令解析 smoke 失败")
+        synthetic = instance._build_conversation_command_event(
+            command_event,
+            parsed_command,
+            reset_marker_id="integration-reset-marker",
+        )
+        if synthetic.text != "/new integration":
+            raise AssertionError("群级 /new 没有桥接为 Hermes 公共命令")
+        if (
+            synthetic.metadata.get("onebot11_reset_marker_id")
+            != "integration-reset-marker"
+        ):
+            raise AssertionError("reset marker 未绑定到 synthetic command")
+        instance._targets["888"] = adapter.ChatTarget("group", "888")
+        instance._chat_types["888"] = "group"
+        original_send_message = instance._api.send_message
+
+        async def fake_command_reply(
+            target_id: str,
+            content: str,
+            *,
+            chat_type: str,
+            reply_to: str | None = None,
+        ) -> str:
+            if (
+                target_id != "888"
+                or content != "reset completed"
+                or chat_type != "group"
+                or reply_to != "command-smoke"
+            ):
+                raise AssertionError("会话命令回执目标或内容错误")
+            return "command-reply-1"
+
+        instance._api.send_message = fake_command_reply
+        event_token = adapter._CURRENT_EVENT.set(synthetic)
+        try:
+            command_reply = await instance._send_with_retry(
+                "888",
+                "reset completed",
+                reply_to="command-smoke",
+            )
+        finally:
+            adapter._CURRENT_EVENT.reset(event_token)
+            instance._api.send_message = original_send_message
+        if not command_reply.success:
+            raise AssertionError(f"会话命令回执被错误拦截: {command_reply!r}")
 
         # 持久 trigger 不依赖入站历史；暂停群避免 smoke 启动真实 Agent，
         # 只验证断开/重连后消息和 durable request 都还在。
@@ -287,7 +350,7 @@ async def _smoke(
     print(
         "Hermes integration smoke passed: "
         f"tools={len(context.tools)} hooks={len(context.hooks)} "
-        "pi_ai_trigger=True reconnect=True"
+        "pi_ai_trigger=True reconnect=True slash_commands=True"
     )
 
 

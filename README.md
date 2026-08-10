@@ -7,6 +7,7 @@
 - **私聊**：和机器人一对一聊天,每条消息都会回复。
 - **群聊**：整群共享一个 Hermes session；允许的消息先进入持久 SQLite 队列。每个 durable TurnAnchor 只消费自己边界内的批次，同群仍保持单活动 turn 并按 anchor 顺序串行处理；@、关键词、`always` 或分层 LLM trigger 才会创建 anchor。
 - **连续对话**：成功回复后进入最多 60 秒的活跃窗口；窗口内普通消息经过 5 秒 trailing debounce，再交给低成本旁路模型判断是否回复，单窗口最多仲裁 3 次。
+- **群级会话命令**：超级管理员可以发送 `/new [title]`、`/reset` 或 `/clear` 重置当前群的 shared session；命令在入队前处理，不会作为普通群消息交给 Agent。重置通过 Hermes 公共命令入口完成，成功后才清理该群的队列和摘要。
 - **处理指示器**：群 turn 认领后给触发消息添加 👀，Hermes turn 收尾时自动移除；没有真实消息 ID 或 QQ 框架不支持该扩展时按 best-effort 跳过，不影响回复。
 - **上下文**：队列有条数、字节数和单条消息上限，确认后形成滚动摘要，并保留最近消息原文；当前批次作为普通 user message，摘要优先通过 Hermes `channel_prompt` 临时注入，不重复写入 shared session transcript。旧 Hermes 不支持时退回有界文本模式并记录审计。
 - **图片与消息段**：兼容 array/CQ 字符串，支持图片、reply、文件、语音、视频、转发和未知段标记；入站图片下载有 host、端口、类型、魔数和大小限制，出站图片使用受限 `base64://` segment，适配 Hermes 宿主机与 LLBot 容器路径隔离。
@@ -120,7 +121,7 @@ platforms:
         provider: ""
         model: ""
         base_url: ""
-        api_key_env: OPENCODE_API_KEY
+        api_key_env: OPENCODE_GO_API_KEY
         groups: []
         timeout: 10
         input_bytes: 12000
@@ -136,7 +137,7 @@ platforms:
           tools: [qq_get_message, qq_get_group_msg_history, qq_get_friend_msg_history,
                   qq_get_group_info, qq_get_group_member_info]
         trusted_user:
-          users: ["2056963663"]
+          users: []
           tools: [qq_get_message, qq_get_group_msg_history, qq_get_group_info]
         super_admin:
           tools: [qq_get_message, qq_get_group_msg_history, qq_get_friend_msg_history,
@@ -203,7 +204,7 @@ python scripts/verify_hermes_integration.py \
   --hermes-source /path/to/hermes-agent
 ```
 
-该命令使用临时 `HERMES_HOME`，会真实收集平台、9 个工具、4 个 hooks，
+该命令使用临时 `HERMES_HOME`，会真实收集平台、9 个工具、5 个 hooks，
 并执行 shared session、pending trigger 恢复、显式 home cron、schema recovery、
 reconnect、图片 base64 segment 和 pi-ai helper 合同 smoke；
 不会把测试队列、审计或 session 写入真实 Hermes home。CI 只负责插件可安装、`onebot11/`

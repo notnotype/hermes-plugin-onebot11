@@ -56,3 +56,5 @@ Hermes 自优化只适合生成配置 diff/建议并由管理员审核，不允�
 ## 计划出入
 
 spike 没有接真实 provider；生产代码改为由插件自有 pi-ai helper 接入显式 provider/model，并把 provider fallback 与隐式重试关掉。Hermes strict auxiliary 不再是代码路径，也不创建 Hermes PR。没有加入 RAG、向量库、自动语义压缩或运行时自优化。活跃窗口仍是内存状态，重启后回到 idle，只恢复 SQLite 消息和显式 trigger request。
+
+Issue #16 的验收收口保留这套 balanced 状态机：问句和活跃窗口普通消息继续进入 pi-ai selector，@/关键词/always/管理员命令继续绕过 selector。Arch 默认只开启问句 selector，关键词是否启用由部署配置决定；本地代码和状态机测试覆盖关键词，但未把它写成 Arch 已验收能力。

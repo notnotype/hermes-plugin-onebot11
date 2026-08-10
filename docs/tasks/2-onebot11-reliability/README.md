@@ -37,7 +37,7 @@
 ## 验证
 
 - 本地插件门禁：`.venv\\Scripts\\python.exe -m pytest -q` 的纯插件结果见最终交付记录；纯插件环境只跳过需要 Hermes gateway 的 adapter 集成测试。
-- Hermes 集成：运行 `scripts\\verify_hermes_integration.ps1` 或跨平台 Python 入口；当前脚本覆盖真实 adapter import、注册、4 个 hooks、工具 handler、shared session key、TurnAnchor authority、lease fencing、同实例 reconnect、配置合同、operation resolve、触发竞争、上下文分段、媒体孤儿清理、raw self_id、home cron、reaction 生命周期和出站图片 base64 segment。
+- Hermes 集成：运行 `scripts\\verify_hermes_integration.ps1` 或跨平台 Python 入口；当前脚本覆盖真实 adapter import、注册、5 个 hooks、工具 handler、shared session key、TurnAnchor authority、lease fencing、同实例 reconnect、slash command bridge、配置合同、operation resolve、触发竞争、上下文分段、媒体孤儿清理、raw self_id、home cron、reaction 生命周期和出站图片 base64 segment。
 - pi-ai helper：在插件 Node/npm 环境单独验证 Node 缺失、helper 输出、超时和失败分类；不依赖 Hermes auxiliary。
 - 静态检查：`.venv\\Scripts\\python.exe -m ruff check .`，当前通过；临时干净环境 `pip install -e ".[dev]"` 和 `import onebot11` 也已通过。
 - Arch + LLBot 外部联调：2026-08-08 严格使用机器人 QQ `3101482118`、群白名单 `1072992996`、私聊白名单 `2056963663` 和 `home_channel_type=dm`。旧 TurnAnchor 版本的真实 WS/HTTP 连接、真实历史 message ID 的 reaction 添加/移除、TurnAnchor batch 边界、重启后 pending 保留和白名单外群拒绝通过；随后在隔离 queue 上完成了 image-only、文字+图片、多图的真实 OneBot segment/reaction smoke。入站仍为受控 WS payload，图片 smoke 也未经过生产 Agent pipeline，不等同于真人 QQ 发言；双用户并发、部分成功/unknown 出站和 resolve 仍待验收。Arch live queue schema 10 尚未切换到当前 schema 11 分支。

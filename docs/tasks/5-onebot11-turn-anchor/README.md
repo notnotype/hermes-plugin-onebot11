@@ -2,7 +2,7 @@
 
 - 关联需求：OneBot 11 原始需求中的“群一个 shared session + 队列上下文”
 - 状态：本地实现和 Hermes 媒体/unknown 组合验证完成；真实 OneBot adapter 图片/reaction smoke 已通过。Agent 最终回复是图片出站的主要支持场景；通用 `send_message`/cron plugin media 不在本任务可靠性合同内。真人并发、unknown resolve 和生产 Agent 图片 pipeline 仍未完成。
-- 分支：`fix/i9-turn-anchor-contract`
+- 当前收口分支：`feat/i16-onebot11-command-acceptance`
 
 ## 目标
 
@@ -35,7 +35,7 @@
 ## 验证
 
 - 纯插件：`pytest -q`、`ruff check .`、editable install、`import onebot11`。
-- Hermes 组合：`scripts/verify_hermes_integration.py` 使用临时 `HERMES_HOME` 验证真实注册、9 个工具、4 个 hooks、shared session、TurnAnchor authority、reconnect、queue recovery 和图片 base64 segment；pi-ai helper 另用 Node/npm 依赖 smoke 验证。
+- Hermes 组合：`scripts/verify_hermes_integration.py` 使用临时 `HERMES_HOME` 验证真实注册、9 个工具、5 个 hooks、shared session、TurnAnchor authority、reconnect、queue recovery、slash command bridge 和图片 base64 segment；pi-ai helper 另用 Node/npm 依赖 smoke 验证。
 - 外部：只允许群 `1072992996`、用户 `2056963663`，机器人 QQ `3101482118`；已验证真实历史 message ID 的 reaction 添加/移除、TurnAnchor batch 边界、重启 pending 保留和白名单外拒绝，并在隔离 queue 上验证真实 OneBot image-only、文字+图片和多图 `base64://` segment。该 smoke 未经过生产 Agent pipeline；真人并发、部分成功/unknown resolve 和生产 schema 10→11 迁移仍需联调。
 
 ## 计划出入
