@@ -137,7 +137,7 @@ platforms:
           tools: [qq_get_message, qq_get_group_msg_history, qq_get_friend_msg_history,
                   qq_get_group_info, qq_get_group_member_info]
         trusted_user:
-          users: ["2056963663"]
+          users: []
           tools: [qq_get_message, qq_get_group_msg_history, qq_get_group_info]
         super_admin:
           tools: [qq_get_message, qq_get_group_msg_history, qq_get_friend_msg_history,
