@@ -6,9 +6,11 @@ description: >
   OneBot 11 (QQ) gateway adapter for Hermes Agent.
   Reverse WebSocket + HTTP API. Shared group sessions, durable TurnAnchor
   context, layered triggers, active conversation windows, scoped query tools
-  and confirmed group-management actions. Outbound images use bounded
+  confirmed group-management actions and administrator-only /new, /reset, /clear
+  session commands. Outbound images use bounded
   base64:// segments; unknown non-idempotent delivery is never retried.
-  Optional layered LLM trigger uses the plugin's Node/pi-ai helper, not Hermes auxiliary.
+  Optional layered LLM trigger uses the plugin's Node.js >=22.19/pi-ai helper,
+  not Hermes auxiliary; install runtime dependencies with npm ci --omit=dev.
 author: notnotype
 requires_env: []
 optional_env:

@@ -4,7 +4,14 @@ import sqlite3
 
 import pytest
 
-from onebot11.queue import SCHEMA_VERSION, QueueError, QueueMessage, QueueStore, TriggerRequest
+from onebot11.queue import (
+    SCHEMA_VERSION,
+    QueueBusy,
+    QueueError,
+    QueueMessage,
+    QueueStore,
+    TriggerRequest,
+)
 
 
 def _message(message_id: str, *, chat_id: str = "888", text: str = "消息") -> QueueMessage:
@@ -962,4 +969,108 @@ def test_显式anchor消息消失时不静默改绑到最早消息(tmp_path):
     )
     assert store.status("888")["pending_trigger_requests"] == 0
     assert store.peek("888")[0].message_key == first.message_key
+    store.close()
+
+
+def test_reset_conversation清理群队列但保留去重暂停和operation(tmp_path):
+    """群级 reset 清理消息上下文，不影响去重、暂停状态和操作台账。"""
+    store = QueueStore(tmp_path / "queue-reset.sqlite3")
+    first = _message("reset-summary", text="摘要来源")
+    store.enqueue(first, _trigger(first))
+    lease = store.claim("888")
+    assert lease is not None
+    assert store.ack(lease)
+    store.set_paused("888", True)
+
+    pending = _message("reset-pending", text="待清理")
+    failed = _message("reset-failed", text="失败")
+    uncertain = _message("reset-uncertain", text="未知")
+    other = _message("reset-other", chat_id="889", text="其他群")
+    store.enqueue(pending, _trigger(pending))
+    store.enqueue(failed, _trigger(failed))
+    store.enqueue(uncertain, _trigger(uncertain))
+    store.enqueue(other, _trigger(other))
+    store._conn.execute(
+        """
+        UPDATE onebot_queue_message
+        SET state='failed', lease_phase='failed', failure_reason='test failed'
+        WHERE message_key=?
+        """,
+        (failed.message_key,),
+    )
+    store._conn.execute(
+        """
+        UPDATE onebot_queue_message
+        SET state='uncertain', lease_phase='uncertain', outbound_started=1,
+            uncertain_reason='test unknown'
+        WHERE message_key=?
+        """,
+        (uncertain.message_key,),
+    )
+    store._conn.execute(
+        "UPDATE onebot_queue_trigger SET status='failed' WHERE message_key=?",
+        (failed.message_key,),
+    )
+    store._conn.execute(
+        "UPDATE onebot_queue_trigger SET status='uncertain' WHERE message_key=?",
+        (uncertain.message_key,),
+    )
+    store._conn.commit()
+    operation = store.start_operation(
+        fingerprint="reset-operation",
+        tool_name="qq_set_group_ban",
+        chat_type="group",
+        chat_id="888",
+        caller_user_id="123",
+        params={"user_id": "456", "duration": 60},
+    )
+    assert operation.started
+    before_revision = store.revision("888")
+
+    result = store.reset_conversation("888")
+
+    assert result.message_count == 3
+    assert result.trigger_count == 3
+    assert result.paused is True
+    assert store.status("888")["pending"] == 0
+    assert store.status("888")["failed"] == 0
+    assert store.status("888")["uncertain"] == 0
+    assert store.status("888")["summary"] == ""
+    assert store.revision("888") > before_revision
+    assert store.operation_records("888")[0].operation_id == operation.operation.operation_id
+    assert store.enqueue(pending).duplicate
+    assert store.status("889")["pending"] == 1
+    store.close()
+
+
+def test_reset_conversation活动lease必须先由上层结算(tmp_path):
+    """QueueStore 不擅自删除活动 lease，避免旧 Hermes turn 继续产生副作用。"""
+    store = QueueStore(tmp_path / "queue-reset-busy.sqlite3")
+    message = _message("reset-busy")
+    store.enqueue(message, _trigger(message))
+    lease = store.claim("888")
+    assert lease is not None
+
+    with pytest.raises(QueueBusy):
+        store.reset_conversation("888")
+
+    assert store.status("888")["leased"] == 1
+    store.close()
+
+
+def test_reset_conversation只清理命令前消息(tmp_path):
+    """reset 期间新到的消息属于新会话，不能被旧会话清理误删。"""
+    store = QueueStore(tmp_path / "queue-reset-boundary.sqlite3")
+    old = _message("reset-old", text="旧上下文")
+    store.enqueue(old, _trigger(old))
+    before_seq = store.status("888")["latest_seq"]
+
+    new = _message("reset-new", text="reset 期间的新消息")
+    store.enqueue(new, _trigger(new))
+
+    result = store.reset_conversation("888", before_seq=before_seq)
+
+    assert result.message_count == 1
+    assert [message.message_id for message in store.peek("888")] == ["reset-new"]
+    assert store.status("888")["pending_trigger_requests"] == 1
     store.close()

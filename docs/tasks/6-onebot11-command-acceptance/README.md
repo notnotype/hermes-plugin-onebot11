@@ -1,59 +1,74 @@
-# Task 6：OneBot 11 Arch 验收
+# Task 6：OneBot 11 群级命令与 Arch 验收收口
 
-- 关联 Issue：[#16](https://github.com/notnotype/hermes-plugin-onebot11/issues/16)
-- 前置修复：[#13](https://github.com/notnotype/hermes-plugin-onebot11/issues/13)
-- 状态：验收未完成；当前分支先修复出站 Binding，PR 合并后再部署和发送真实验收消息。
-- 允许范围：群 `1072992996`、私聊用户 `2056963663`、机器人 `3101482118`。
+- 关联 Issue：[Issue #16：OneBot 11 Arch 验收收口](https://github.com/notnotype/hermes-plugin-onebot11/issues/16)
+- 前置修复：[Issue #13：OneBot 11 出站 Binding](https://github.com/notnotype/hermes-plugin-onebot11/issues/13)
+- 当前分支：`fix/i13-onebot11-delivery-binding`
+- 状态：命令/触发实现已在 master；本分支补齐 worker-thread 到 async final delivery 的 Binding 恢复。PR 合并前不部署 Arch，也不发送真实验收消息。
 
-## 验收目标
+## 目标
 
-只在指定群和指定私聊用户验证：
+让当前插件具备可直接验收的用户闭环：
 
-1. @/mention、关键词、问句 selector 和活跃窗口触发；
-2. 不带 @ 的中文问句经过插件自有 pi-ai selector；
-3. 成功回复后 60 秒内的普通 follow-up 可以连续对话；
-4. `/new`、`/reset`、`/clear` 不进入普通消息队列，只重置当前群 shared session；
-5. 普通用户只能使用只读工具，超级管理员的写工具停在预览和确认提示；
-6. worker thread 建立 binding 后，async final delivery 的文本/图片不会因为 ContextVar 缺失而被错误标记为 `fenced`；
-7. 两名群成员并发 @ 时仍只有一个 shared session 和一个活动 lease。
+1. @、关键词、问句 selector 和活跃窗口触发路径各自有清晰边界；
+2. 成功回复后的 60 秒内可以不重复 @ 继续对话；
+3. `/new`、`/reset`、`/clear` 可以在群内重置当前 shared session；
+4. 普通用户和超级管理员的工具集合保持可配置、可审计、fail-closed；
+5. worker thread 建立 binding 后，async final delivery 的文本/图片不会因 ContextVar 缺失而被错误标记为 `fenced`；
+6. 本机分支经过 PR 合并后，Arch 只需 `git pull --ff-only` 和安装 Node 依赖即可部署。
 
-## 当前证据边界
+## 已实现
 
-- PR #17 已合并，Arch 当前基线是 `master`、commit `fd246b7`、插件 `0.6.0`、queue schema `11`，服务 active。
-- 本分支的 Binding 修复尚未合并或部署；本地纯插件门禁、Hermes 组合 smoke 和 fake OneBot 出站测试不能替代真实 QQ Agent pipeline。
-- 关键词当前只保留代码能力，Arch 配置未启用关键词时不能报告为真实关键词验收通过。
-- 不执行真实禁言、踢人、撤回或全员禁言；unknown/resolve 使用本地 mock 或无副作用路径。
+- 群消息仍先经过访问策略，再进入持久 SQLite 队列；命令在入队前识别。
+- `/new [title]`、`/reset`、`/clear` 仅允许超级管理员，未知命令和 `/onebot ...`
+  不会被误识别为会话命令。
+- `/new` 和 `/reset` 使用 Hermes 公共命令入口；`/clear` 翻译为公共 `/new`。
+  OneBot 不调用 Hermes 私有 reset 实现，而是通过 `on_session_reset` hook 在 Hermes
+  reset 成功后清理当前群队列、摘要和内存触发状态。
+- reset 使用消息序号边界：命令开始后抵达的新消息不会被旧 reset 删除；reset
+  期间的普通群消息返回明确提示并不进入旧队列。
+- reset 会先停止 selector、debounce 和 engaged timer，并 fence 当前群活动 lease。
+  未开始出站的旧 turn 可以回收；已开始或结果未知的操作保留 unknown，不自动重放。
+- reset 如果无法安全收口，不会推进 generation；文本已部分发送、图片 lease 失效和
+  命令回执分别保持 unknown-safe 或普通命令直发，不混入 Agent turn 门禁。
+- 旧 adapter epoch、旧 reset generation 的 late completion 可以完成资源收口，但不能
+  回写新连接的 engaged/debounce 状态或创建 recovery trigger。
+- hard trigger（@、关键词、always、管理员 flush）不消耗 selector；问句、记忆候选和
+  engaged 内普通 follow-up 才进入插件自有 pi-ai selector。selector 失败按 ignore，
+  pending 消息保留。
+- 文本、单图片和多图片出站统一按 event metadata 恢复精确 `(session_id, turn_id)` binding；
+  binding 缺失、冲突、旧 epoch 或 lease 失效时 fail-closed，不访问 OneBot。
 
-## 部署前保护
+## 权限与 Arch 验收配置
 
-1. 通过 `ssh arch` 只读记录插件 commit、Hermes 服务、queue schema 和队列统计。
-2. 由超级管理员在指定群暂停自动 dispatch。
-3. 停止服务并备份 config、`.env`、session、SQLite 主文件/WAL/SHM。
-4. 确认 checkout 无未提交修改，随后在插件目录 `git pull --ff-only` 和 `npm ci --omit=dev`。
-5. 用 Hermes 实际 Python 环境执行 `validate_config()` dry-run，确认白名单、`self_id`、角色工具和 pi-ai 环境变量。
-6. 只有确认旧消息是验收残留时，才由管理员 `/new` 清理指定群；不直接编辑 SQLite。
+本轮验收只允许：
 
-## 验收矩阵
+- 群：`1072992996`
+- 私聊用户：`2056963663`
+- 机器人：`3101482118`
 
-| 场景 | 预期 |
-|---|---|
-| `/new`、`/reset`、`/clear` | 不入普通队列，只影响当前群 |
-| @ 机器人 | 直接 hard trigger，`👀` 添加后在 turn 收尾移除 |
-| 不带 @ 的中文问句 | 记录 pi-ai selector，按 `trigger/wait/ignore` 处理 |
-| 成功回复后普通 follow-up | 5 秒 trailing debounce 后继续同一 shared session |
-| 活跃窗口过期后的普通闲聊 | 不直接触发，消息保留 pending |
-| 普通用户调用写工具 | 权限错误，不产生 OneBot 管理写请求 |
-| 超级管理员调用写工具 | 只生成预览和确认提示，不执行真实动作 |
-| 两名成员同时 @ | 一个 shared session、一个活动 lease、anchor 严格串行 |
-| 重启 | pending/durable trigger 保留，active/debounce/judging 回到 idle |
-| 白名单外目标 | 入站拒绝，无出站 |
+建议的角色合同：
 
-## 已执行的本地验证
+- `user`：`qq_get_message`、`qq_get_group_msg_history`、`qq_get_friend_msg_history`、
+  `qq_get_group_info`、`qq_get_group_member_info`
+- `trusted_user`：不配置实际用户；如配置只能使用显式只读工具
+- `super_admin`：9 个有效 OneBot 工具，写工具仍需预览和同群同管理员确认
 
-- 纯插件：`166 passed, 1 skipped`，Ruff 通过，editable build、`import onebot11`、`npm ci --omit=dev` 和 Node helper 语法检查通过。
-- Hermes 组合：`scripts/verify_hermes_integration.py` 输出 `255 passed`，并通过 9 工具、4 hooks、shared session、reconnect、queue recovery、worker-thread binding、图片 segment 和 pi-ai helper smoke。
-- 以上证据不代表 Arch 真人验收完成；PR 合并和真实 LLBot/QQ 验收仍是后续步骤。
+角色和白名单只写入 Hermes `config.yaml`/环境变量，不硬编码进插件。Arch 不执行
+真实禁言、踢人、撤回或全员禁言；写操作只验收预览和确认提示。
 
-## 不纳入本任务
+## 验证证据
 
-RAG/向量库、Hermes runtime 自优化、Docker Hermes、OneBot 12、exactly-once 非幂等出站，以及真实群管理写操作。
+- 插件纯环境：`174 passed, 1 skipped`（只跳过没有 Hermes gateway 的 adapter 集成文件）
+- `ruff check .`：通过
+- Hermes `v0.20.0` 组合：`275 passed`
+- 集成 smoke：`tools=9 hooks=5 pi_ai_trigger=True reconnect=True slash_commands=True`，包含
+  worker-thread Binding 恢复和 slash command bridge。
+- 真实 Arch 验收仍需在 PR 合并后进行；本地通过不等同于真人 QQ 双用户并发已验收。
+
+## 计划出入与边界
+
+- 不修改 Hermes 源码，不创建 strict auxiliary 或媒体结果合同 PR。
+- LLM trigger 由插件自有 Node/pi-ai helper 调用；Hermes auxiliary 不参与。
+- Arch 默认只启用问句 selector；关键词保留代码和本地测试能力，是否启用由部署配置决定。
+- 不纳入 RAG、向量库、运行时自优化、OneBot 12、原始 WS spool 或 exactly-once
+  非幂等出站。

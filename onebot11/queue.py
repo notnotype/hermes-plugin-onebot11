@@ -153,6 +153,17 @@ class EnqueueResult:
 
 
 @dataclass(frozen=True)
+class QueueResetResult:
+    """群级会话 reset 的持久化结果。"""
+
+    chat_id: str
+    message_count: int
+    trigger_count: int
+    summary_cleared: bool
+    paused: bool
+
+
+@dataclass(frozen=True)
 class QueueLease:
     """一批被某个 Hermes turn 认领的消息。"""
 
@@ -2377,6 +2388,183 @@ class QueueStore:
                 )
                 self._conn.commit()
                 return int(count)
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def reset_conversation(
+        self,
+        chat_id: str,
+        *,
+        before_seq: int | None = None,
+    ) -> QueueResetResult:
+        """清理 reset 命令之前的队列，保留 reset 期间新到的消息。"""
+        normalized_chat_id = str(chat_id)
+        seq_clause = ""
+        seq_params: tuple[Any, ...] = ()
+        if before_seq is not None:
+            seq_clause = " AND seq<=?"
+            seq_params = (int(before_seq),)
+        with self._lock:
+            try:
+                self._transaction()
+                active_message = self._conn.execute(
+                    f"""
+                    SELECT COUNT(*) FROM onebot_queue_message
+                    WHERE chat_id=? AND state='leased'
+                    {seq_clause}
+                    """,
+                    (normalized_chat_id, *seq_params),
+                ).fetchone()
+                active_trigger = self._conn.execute(
+                    """
+                    SELECT COUNT(*) FROM onebot_queue_trigger
+                    WHERE chat_id=? AND status='claimed'
+                      AND (
+                          anchor_seq IS NULL
+                          OR anchor_seq<=?
+                          OR EXISTS (
+                              SELECT 1
+                              FROM onebot_queue_message AS message
+                              WHERE message.chat_id=onebot_queue_trigger.chat_id
+                                AND message.message_key=onebot_queue_trigger.message_key
+                                AND message.seq<=?
+                          )
+                      )
+                    """
+                    if before_seq is not None
+                    else """
+                    SELECT COUNT(*) FROM onebot_queue_trigger
+                    WHERE chat_id=? AND status='claimed'
+                    """,
+                    (
+                        (normalized_chat_id, int(before_seq), int(before_seq))
+                        if before_seq is not None
+                        else (normalized_chat_id,)
+                    ),
+                ).fetchone()
+                if (
+                    (active_message and int(active_message[0]) > 0)
+                    or (active_trigger and int(active_trigger[0]) > 0)
+                ):
+                    raise QueueBusy("当前群存在活动 turn，必须先 fencing 并结算")
+
+                message_rows = self._conn.execute(
+                    f"""
+                    SELECT message_key, seq
+                    FROM onebot_queue_message
+                    WHERE chat_id=? AND state IN ('pending','uncertain','failed')
+                    {seq_clause}
+                    """,
+                    (normalized_chat_id, *seq_params),
+                ).fetchall()
+                trigger_row = self._conn.execute(
+                    """
+                    SELECT COUNT(*) FROM onebot_queue_trigger
+                    WHERE chat_id=? AND status IN ('pending','uncertain','failed')
+                      AND (
+                          anchor_seq IS NULL
+                          OR anchor_seq<=?
+                          OR EXISTS (
+                              SELECT 1
+                              FROM onebot_queue_message AS message
+                              WHERE message.chat_id=onebot_queue_trigger.chat_id
+                                AND message.message_key=onebot_queue_trigger.message_key
+                                AND message.seq<=?
+                          )
+                      )
+                    """
+                    if before_seq is not None
+                    else """
+                    SELECT COUNT(*) FROM onebot_queue_trigger
+                    WHERE chat_id=? AND status IN ('pending','uncertain','failed')
+                    """,
+                    (
+                        (normalized_chat_id, int(before_seq), int(before_seq))
+                        if before_seq is not None
+                        else (normalized_chat_id,)
+                    ),
+                ).fetchone()
+                chat_row = self._conn.execute(
+                    """
+                    SELECT summary, paused
+                    FROM onebot_queue_chat
+                    WHERE chat_id=?
+                    """,
+                    (normalized_chat_id,),
+                ).fetchone()
+                now = self._now()
+                if message_rows:
+                    self._conn.executemany(
+                        """
+                        INSERT OR REPLACE INTO onebot_queue_dedupe(
+                            chat_id, message_key, seq, created_at
+                        ) VALUES (?,?,?,?)
+                        """,
+                        [
+                            (
+                                normalized_chat_id,
+                                str(row["message_key"]),
+                                int(row["seq"]),
+                                now,
+                            )
+                            for row in message_rows
+                        ],
+                    )
+                self._conn.execute(
+                    f"""
+                    DELETE FROM onebot_queue_message
+                    WHERE chat_id=? AND state IN ('pending','uncertain','failed')
+                    {seq_clause}
+                    """,
+                    (normalized_chat_id, *seq_params),
+                )
+                if before_seq is None:
+                    self._conn.execute(
+                        """
+                        DELETE FROM onebot_queue_trigger
+                        WHERE chat_id=? AND status IN ('pending','uncertain','failed')
+                        """,
+                        (normalized_chat_id,),
+                    )
+                else:
+                    self._conn.execute(
+                        """
+                        DELETE FROM onebot_queue_trigger
+                        WHERE chat_id=? AND status IN ('pending','uncertain','failed')
+                          AND (
+                              anchor_seq IS NULL
+                              OR anchor_seq<=?
+                              OR EXISTS (
+                                  SELECT 1
+                                  FROM onebot_queue_message AS message
+                                  WHERE message.chat_id=onebot_queue_trigger.chat_id
+                                    AND message.message_key=onebot_queue_trigger.message_key
+                                    AND message.seq<=?
+                              )
+                          )
+                        """,
+                        (normalized_chat_id, int(before_seq), int(before_seq)),
+                    )
+                summary_cleared = bool(chat_row and str(chat_row["summary"] or ""))
+                paused = bool(chat_row and chat_row["paused"])
+                if chat_row is not None:
+                    self._conn.execute(
+                        """
+                        UPDATE onebot_queue_chat
+                        SET summary='', revision=revision+1, updated_at=?
+                        WHERE chat_id=?
+                        """,
+                        (now, normalized_chat_id),
+                    )
+                self._conn.commit()
+                return QueueResetResult(
+                    chat_id=normalized_chat_id,
+                    message_count=len(message_rows),
+                    trigger_count=int(trigger_row[0] if trigger_row else 0),
+                    summary_cleared=summary_cleared,
+                    paused=paused,
+                )
             except Exception:
                 self._conn.rollback()
                 raise

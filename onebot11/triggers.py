@@ -285,9 +285,18 @@ class LayeredTriggerState:
         has_hard_trigger: bool = False,
     ) -> None:
         """成功 Agent turn 进入 engaged；有新消息时不覆盖其待处理状态。"""
+        if preserve_pending and not success:
+            # 失败/取消/unknown 的 turn 不属于连续对话成功窗口；即使期间
+            # 有 pending 消息，也不能把下一条普通消息误判成 follow-up。
+            self._judgement_generation += 1
+            self.debounce_due = None
+            self.wait_until = None
+            self._candidate_type = ""
+            self.dirty_revision = None
+            self._leave_engaged()
+            return
         if preserve_pending and (
-            not success
-            or has_hard_trigger
+            has_hard_trigger
             or self.mode in {"debounce", "judging", "waiting"}
         ):
             return
