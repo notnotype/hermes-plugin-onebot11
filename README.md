@@ -205,7 +205,7 @@ python scripts/verify_hermes_integration.py \
 
 该命令使用临时 `HERMES_HOME`，会真实收集平台、9 个工具、4 个 hooks，
 并执行 shared session、pending trigger 恢复、显式 home cron、schema recovery、
-reconnect、图片 base64 segment 和 pi-ai helper 合同 smoke；
+reconnect、worker-thread binding 恢复、图片 base64 segment 和 pi-ai helper 合同 smoke；
 不会把测试队列、审计或 session 写入真实 Hermes home。CI 只负责插件可安装、`onebot11/`
 协议/状态机测试和 Ruff；Hermes 组合测试是本地验收证据。纯插件环境只保证
 `import onebot11`，根目录 `adapter.py` 需要 Hermes gateway 依赖。

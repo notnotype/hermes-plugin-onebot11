@@ -167,6 +167,20 @@ def _serializable_caller(context: CallerContext) -> dict[str, Any]:
     }
 
 
+def _binding_key_from_metadata(value: Any) -> tuple[str, str] | None:
+    """只读取 metadata 中显式的 session/turn binding key，不做推断。"""
+    if not isinstance(value, Mapping):
+        return None
+    raw_key = value.get("onebot11_binding_key")
+    if not isinstance(raw_key, Mapping):
+        return None
+    session_id = str(raw_key.get("session_id") or "").strip()
+    turn_id = str(raw_key.get("turn_id") or "").strip()
+    if not session_id or not turn_id:
+        return None
+    return session_id, turn_id
+
+
 def _caller_from_metadata(value: Any) -> CallerContext | None:
     """读取持久化身份快照，并只与当前配置做权限交集。"""
     if not isinstance(value, Mapping):
@@ -316,6 +330,7 @@ class OneBot11Adapter(BasePlatformAdapter):
             ),
         )
         self._bindings = TurnBindingStore()
+        self._binding_diagnostic_keys: set[tuple[str, str, str, str]] = set()
         self._confirmations = ConfirmationStore(runtime.confirm_ttl_seconds)
         audit_path = runtime.audit_path or (
             str(self._hermes_home / "onebot11" / "audit.jsonl")
@@ -431,6 +446,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._lease_session_keys.clear()
         self._pending_completions.clear()
         self._processing_reaction_message_ids.clear()
+        self._binding_diagnostic_keys.clear()
         self._bindings.clear()
 
     async def _stop_runtime(self, *, mark_disconnected: bool) -> None:
@@ -2342,7 +2358,9 @@ class OneBot11Adapter(BasePlatformAdapter):
         metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         """显式解析 ChatTarget 后发送，并记录部分/未知出站结果。"""
-        binding = self._binding_from_context()
+        binding = self._binding_from_context(
+            metadata if isinstance(metadata, Mapping) else None
+        )
         current_event = _CURRENT_EVENT.get()
         current_event_metadata = getattr(current_event, "metadata", None) or {}
         managed_context = bool(
@@ -2359,6 +2377,10 @@ class OneBot11Adapter(BasePlatformAdapter):
             )
         )
         if managed_context and binding is None:
+            self._log_binding_diagnostic(
+                metadata if isinstance(metadata, Mapping) else None,
+                reason="binding_missing_or_invalid",
+            )
             stale_lease_id = str(
                 (
                     metadata.get("onebot11_lease_id")
@@ -2389,7 +2411,7 @@ class OneBot11Adapter(BasePlatformAdapter):
             self._fenced_leases.add(lease_id)
             self._outbound_known_failure.add(lease_id)
             return SendResult(False, error="OneBot11 lease 已失效，拒绝出站", error_kind="fenced")
-        target = self._resolve_target(str(chat_id), metadata)
+        target = self._resolve_target(str(chat_id), metadata, binding=binding)
         if target is None:
             if lease_id:
                 self._outbound_known_failure.add(lease_id)
@@ -2484,7 +2506,9 @@ class OneBot11Adapter(BasePlatformAdapter):
     ) -> SendResult:
         """把受信任的本地图片编码为 OneBot ``base64://`` image segment。"""
         del kwargs
-        binding = self._binding_from_context()
+        binding = self._binding_from_context(
+            metadata if isinstance(metadata, Mapping) else None
+        )
         current_event = _CURRENT_EVENT.get()
         current_event_metadata = getattr(current_event, "metadata", None) or {}
         managed_context = bool(
@@ -2501,6 +2525,10 @@ class OneBot11Adapter(BasePlatformAdapter):
             )
         )
         if managed_context and binding is None:
+            self._log_binding_diagnostic(
+                metadata if isinstance(metadata, Mapping) else None,
+                reason="binding_missing_or_invalid",
+            )
             stale_lease_id = str(
                 (
                     metadata.get("onebot11_lease_id")
@@ -2531,7 +2559,7 @@ class OneBot11Adapter(BasePlatformAdapter):
             self._fenced_leases.add(lease_id)
             self._outbound_known_failure.add(lease_id)
             return SendResult(False, error="OneBot11 lease 已失效，拒绝出站", error_kind="fenced")
-        target = self._resolve_target(str(chat_id), metadata)
+        target = self._resolve_target(str(chat_id), metadata, binding=binding)
         if target is None:
             if lease_id:
                 self._outbound_known_failure.add(lease_id)
@@ -2661,6 +2689,63 @@ class OneBot11Adapter(BasePlatformAdapter):
         metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         """安全下载远程图片后，以 base64 segment 发送，不回退为 URL 文本。"""
+        binding = self._binding_from_context(
+            metadata if isinstance(metadata, Mapping) else None
+        )
+        current_event = _CURRENT_EVENT.get()
+        current_event_metadata = getattr(current_event, "metadata", None) or {}
+        managed_context = bool(
+            isinstance(metadata, Mapping)
+            and (
+                metadata.get("onebot11_managed_context")
+                or metadata.get("onebot11_lease_id")
+            )
+        ) or bool(
+            isinstance(current_event_metadata, Mapping)
+            and (
+                current_event_metadata.get("onebot11_managed_context")
+                or current_event_metadata.get("onebot11_lease_id")
+            )
+        )
+        if managed_context and binding is None:
+            self._log_binding_diagnostic(
+                metadata if isinstance(metadata, Mapping) else None,
+                reason="binding_missing_or_invalid_before_media_download",
+            )
+            return SendResult(
+                False,
+                error="OneBot11 managed turn binding unavailable，拒绝出站",
+                error_kind="fenced",
+            )
+        lease_id = binding.lease_id if binding else None
+        if self._closed:
+            if lease_id:
+                self._outbound_known_failure.add(lease_id)
+            return SendResult(False, error="OneBot11 adapter is closed", error_kind="not_found")
+        if lease_id and not self._lease_is_current(lease_id):
+            self._fenced_leases.add(lease_id)
+            self._outbound_known_failure.add(lease_id)
+            return SendResult(False, error="OneBot11 lease 已失效，拒绝出站", error_kind="fenced")
+        target = self._resolve_target(str(chat_id), metadata, binding=binding)
+        if target is None:
+            if lease_id:
+                self._outbound_known_failure.add(lease_id)
+            return SendResult(False, error="OneBot11 target unknown or ambiguous", error_kind="unknown")
+        caller_user_id = (
+            binding.caller.user_id
+            if binding is not None
+            else target.chat_id
+            if target.chat_type == "dm"
+            else None
+        )
+        if not self._chat_access_allowed(target.chat_type, target.chat_id, caller_user_id):
+            if lease_id:
+                self._outbound_known_failure.add(lease_id)
+            return SendResult(False, error="OneBot11 target 不再满足访问策略", error_kind="permission")
+        if self._ws is None:
+            if lease_id:
+                self._outbound_known_failure.add(lease_id)
+            return SendResult(False, error="Not connected", error_kind="not_found")
         media_dir = self._new_media_dir()
         path = await self._api.download_to_temp(str(image_url), media_dir)
         if not path:
@@ -2697,7 +2782,9 @@ class OneBot11Adapter(BasePlatformAdapter):
                 for _image_url, _caption in images
             ]
 
-        binding = self._binding_from_context()
+        binding = self._binding_from_context(
+            metadata if isinstance(metadata, Mapping) else None
+        )
         current_event = _CURRENT_EVENT.get()
         current_event_metadata = getattr(current_event, "metadata", None) or {}
         managed_context = bool(
@@ -2720,6 +2807,10 @@ class OneBot11Adapter(BasePlatformAdapter):
                 and not self._lease_is_current(binding.lease_id)
             )
         ):
+            self._log_binding_diagnostic(
+                metadata if isinstance(metadata, Mapping) else None,
+                reason="binding_missing_or_invalid",
+            )
             return [
                 SendResult(
                     False,
@@ -2828,7 +2919,13 @@ class OneBot11Adapter(BasePlatformAdapter):
             raise ValueError("OneBot11 target unknown or ambiguous")
         return {"name": target.chat_id, "type": target.chat_type}
 
-    def _resolve_target(self, chat_id: str, metadata: Any) -> ChatTarget | None:
+    def _resolve_target(
+        self,
+        chat_id: str,
+        metadata: Any,
+        *,
+        binding: TurnBinding | None = None,
+    ) -> ChatTarget | None:
         """按当前 turn binding、显式 metadata 或唯一登记解析目标。"""
         candidate: ChatTarget | None = None
         trusted_target = False
@@ -2840,9 +2937,11 @@ class OneBot11Adapter(BasePlatformAdapter):
                     candidate = ChatTarget(str(raw["chat_type"]), str(raw["chat_id"]))
                 except (KeyError, TypeError, ValueError):
                     return None
-        binding = self._binding_from_context()
-        if binding is not None:
-            bound_target = binding.caller.target()
+        resolved_binding = binding or self._binding_from_context(
+            metadata if isinstance(metadata, Mapping) else None
+        )
+        if resolved_binding is not None:
+            bound_target = resolved_binding.caller.target()
             if bound_target.chat_id != chat_id:
                 return None
             if candidate is not None and candidate != bound_target:
@@ -2872,18 +2971,163 @@ class OneBot11Adapter(BasePlatformAdapter):
             return ChatTarget(legacy_type, chat_id)
         return None
 
-    def _binding_from_context(self) -> TurnBinding | None:
-        """读取当前异步 turn 的精确 binding。"""
-        binding = _CURRENT_BINDING.get()
+    def _binding_is_current(
+        self,
+        binding: TurnBinding,
+        *,
+        expected_caller: CallerContext | None = None,
+        require_self_id: bool = False,
+        check_lease: bool = False,
+    ) -> bool:
+        """验证 binding 仍属于当前 adapter、目标和 lease。"""
+        current = self._bindings.get(binding.session_id, binding.turn_id)
+        if current != binding:
+            return False
+        if expected_caller is not None and expected_caller != binding.caller:
+            return False
+        caller = binding.caller
+        if require_self_id and not caller.self_id:
+            return False
+        if caller.self_id and caller.self_id != self.self_id:
+            return False
+        if (
+            caller.adapter_epoch is not None
+            and caller.adapter_epoch != self._adapter_epoch
+        ):
+            return False
+        if not self._chat_access_allowed(
+            caller.chat_type,
+            caller.chat_id,
+            caller.user_id,
+        ):
+            return False
+        if binding.lease_id != caller.lease_id:
+            return False
+        if check_lease and binding.lease_id:
+            try:
+                if not self._lease_is_current(binding.lease_id):
+                    return False
+                if not self._lease_matches_target(
+                    binding.lease_id,
+                    caller.chat_type,
+                    caller.chat_id,
+                ):
+                    return False
+            except (OSError, RuntimeError, TypeError, ValueError):
+                return False
+        return True
+
+    def _log_binding_diagnostic(
+        self,
+        metadata: Mapping[str, Any] | None,
+        *,
+        reason: str,
+    ) -> None:
+        """按 session/turn/lease 只记录一次 binding 恢复诊断。"""
+        current_event = _CURRENT_EVENT.get()
+        event_metadata = getattr(current_event, "metadata", None) or {}
+        sources = [event_metadata, metadata]
+        session_id = ""
+        turn_id = ""
+        lease_id = ""
+        for source in sources:
+            if not isinstance(source, Mapping):
+                continue
+            key = _binding_key_from_metadata(source)
+            if key is not None:
+                session_id, turn_id = key
+            raw_lease_id = str(source.get("onebot11_lease_id") or "").strip()
+            if raw_lease_id:
+                lease_id = raw_lease_id
+        diagnostic_key = (session_id, turn_id, lease_id, reason)
+        if diagnostic_key in self._binding_diagnostic_keys:
+            return
+        self._binding_diagnostic_keys.add(diagnostic_key)
+        logger.warning(
+            "OneBot11 managed outbound binding unavailable: "
+            "session_id=%s turn_id=%s lease_id=%s reason=%s",
+            session_id or "<missing>",
+            turn_id or "<missing>",
+            lease_id or "<missing>",
+            reason,
+        )
+
+    def _binding_from_context(
+        self,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> TurnBinding | None:
+        """优先读取 ContextVar，缺失时按 event metadata 恢复精确 binding。"""
+        current_event = _CURRENT_EVENT.get()
+        event_metadata = getattr(current_event, "metadata", None) or {}
+        sources = [
+            source
+            for source in (event_metadata, metadata)
+            if isinstance(source, Mapping)
+        ]
+        binding_keys = [
+            key
+            for source in sources
+            if (key := _binding_key_from_metadata(source)) is not None
+        ]
+        if binding_keys and any(key != binding_keys[0] for key in binding_keys[1:]):
+            return None
+        metadata_key = binding_keys[0] if binding_keys else None
+        context_binding = _CURRENT_BINDING.get()
+
+        for source in sources:
+            raw_caller = source.get("onebot11_caller_context")
+            if isinstance(raw_caller, Mapping):
+                raw_self_id = raw_caller.get("self_id")
+                if (
+                    raw_self_id is not None
+                    and str(raw_self_id).strip() != self.self_id
+                ):
+                    return None
+            raw_lease_id = str(source.get("onebot11_lease_id") or "").strip()
+            if raw_lease_id:
+                # 先在 metadata 边界检查 lease 冲突，再交给下面的
+                # _lease_is_current 检查它是否仍然有效。
+                if (
+                    context_binding is not None
+                    and raw_lease_id
+                    != str(context_binding.lease_id or "")
+                ):
+                    return None
+
+        current_caller = _CURRENT_CALLER.get()
+        if context_binding is not None:
+            # ContextVar 可能跨 reconnect/取消边界残留；只有 binding store
+            # 中仍是同一个对象，并且 caller 没有串到另一个 turn，才可复用。
+            if not self._binding_is_current(
+                context_binding,
+                expected_caller=current_caller,
+            ):
+                return None
+            context_key = (context_binding.session_id, context_binding.turn_id)
+            if metadata_key is not None and metadata_key != context_key:
+                return None
+            return context_binding
+
+        if metadata_key is None:
+            return None
+        binding = self._bindings.get(*metadata_key)
         if binding is None:
             return None
-        caller = _CURRENT_CALLER.get()
-        if caller is None or caller != binding.caller:
+        if current_caller is not None and current_caller != binding.caller:
             return None
-        # ContextVar 可能跨 reconnect/取消边界残留；只有 binding store 中
-        # 仍存在完全相同的 (session_id, turn_id) 才允许继续出站。
-        current = self._bindings.get(binding.session_id, binding.turn_id)
-        return current if current == binding else None
+        # Metadata 恢复是跨线程/任务边界的安全入口，要求 snapshot 带有
+        # 当前 bot self_id；缺失或伪造身份都不能获得出站能力。
+        if not self._binding_is_current(
+            binding,
+            require_self_id=True,
+            check_lease=True,
+        ):
+            return None
+        for source in sources:
+            raw_lease_id = str(source.get("onebot11_lease_id") or "").strip()
+            if raw_lease_id and raw_lease_id != str(binding.lease_id or ""):
+                return None
+        return binding
 
     def _resolve_binding(self, session_id: str | None, turn_id: str | None) -> TurnBinding | None:
         """按完整 Hermes 路由键读取 caller，不使用最近来源缓存。"""

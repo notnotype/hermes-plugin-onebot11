@@ -58,6 +58,7 @@ platforms:
 ## 身份传递
 
 每次入站 turn 都创建不可变 `CallerContext`。Hermes 的 `session_key` 只用于 session 路由，不能当作身份；工具身份按 `(session_id, turn_id)` 绑定，并在 Hermes registry 没传 `turn_id` 的兼容路径使用当前 task 的 binding，同时校验 `session_id`。找不到精确 binding 时 fail-closed。
+Hermes 的 worker thread 与 async final delivery 可能不共享 `ContextVar`；最终文本和图片出站在缺少当前 task binding 时，只能从当前 synthetic event 的精确 `onebot11_binding_key` 恢复，并继续校验 binding store、adapter epoch、机器人 `self_id`、lease、目标和访问策略。没有该 key、key 冲突或恢复失败时不访问 OneBot。
 
 出站目标使用明确的 `ChatTarget(group|dm, chat_id)`。当前 turn 只能向它绑定的目标发送；同一个数字同时被识别为群号和 QQ 号时，未带明确类型的发送会被拒绝。
 
