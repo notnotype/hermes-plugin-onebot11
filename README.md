@@ -6,9 +6,9 @@
 
 - **私聊**：和机器人一对一聊天,每条消息都会回复。
 - **群聊**：整群共享一个 Hermes session；允许的消息先进入持久 SQLite 队列。每个 durable TurnAnchor 只消费自己边界内的批次，同群仍保持单活动 turn 并按 anchor 顺序串行处理；@、关键词、`always` 或分层 LLM trigger 才会创建 anchor。
-- **连续对话**：成功回复后进入最多 60 秒的活跃窗口；窗口内普通消息经过 5 秒 trailing debounce，再交给低成本旁路模型判断是否回复，单窗口最多仲裁 3 次。窗口内的短确认词（如“可以”“好的”“嗯”“继续”）直接触发，不消耗旁路模型；带实际问题的消息（如“可以吗？”）仍走 selector。
+- **连续对话**：成功回复后进入最多 60 秒的活跃窗口；窗口内普通消息交给低成本旁路模型判断是否回复，单窗口最多仲裁 3 次。debounce 是自适应的：群消息间隔超过 5 秒（不活跃）时立即判断，间隔小于 5 秒（活跃）时按 trailing 节流合并。窗口内的短确认词（如“可以”“好的”“嗯”“继续”）直接触发，不消耗旁路模型；带实际问题的消息（如“可以吗？”）仍走 selector。
 - **群级旁路命令**：`/context`、`/ctx` 在入队前返回有界队列/lease/policy 诊断；超级管理员可以发送 `/new [title]`、`/reset` 或 `/clear` 重置当前群的 shared session。它们都不会作为普通群消息交给 Agent。
-- **处理指示器**：问句/记忆候选进入 selector 等待时给候选消息添加 ⏳，判断结束（触发、忽略、超时或 wait 到期）后移除；selector 判定触发后，群 turn 认领时给触发消息添加 👀，Hermes turn 收尾时自动移除。两种指示器都是 best-effort，失败或结果未知不影响回复、队列 ack 或 Agent 完成，也不重放设置请求；没有真实消息 ID 或 QQ 框架不支持该扩展时按 best-effort 跳过。
+- **处理指示器**：问句/记忆候选进入 selector 判断时给候选消息添加 👀（表示“bot 正在看这条消息”），判断结束（触发、忽略、超时或 wait 到期）后移除；任何触发方式（selector、@、关键词、短确认词）进入回复阶段后，给触发消息添加 ⌛（表示“正在回复这一条”），Hermes turn 收尾时自动移除。两种指示器都是 best-effort，失败或结果未知不影响回复、队列 ack 或 Agent 完成，也不重放设置请求；没有真实消息 ID 或 QQ 框架不支持该扩展时按 best-effort 跳过。
 - **回复格式**：默认把 Markdown 转成 OneBot 可读的纯文本；同一 turn 内重复的本地图片/URL/相同内容只投递一次。Markdown 图片逃生口 `[[onebot11:markdown-image]]...[[/onebot11:markdown-image]]` 目前只去掉 marker 并按纯文本发送，不访问其中的外部 URL。
 - **运行时配置**：超级管理员可以发送 `/onebot reload` 热更新白名单、角色工具、trigger、cooldown、reaction、一次性长时间提示延迟和显示策略；HTTP/WS 地址、token、机器人 QQ 号、队列路径和 session 模式仍需重启。reload 后 active turn 保留创建时的权限快照，并清理旧确认令牌。
 - **上下文**：队列有条数、字节数和单条消息上限，确认后形成滚动摘要，并保留最近消息原文；每条消息还带 `seq`、真实 `message_id`、去重 `message_key`、用户、role、reply 和媒体标记。当前批次作为普通 user message，摘要优先通过 Hermes `channel_prompt` 临时注入，不重复写入 shared session transcript。旧 Hermes 不支持时退回有界文本模式并记录审计。
@@ -135,7 +135,7 @@ platforms:
         engaged_max_seconds: 300
         engaged_max_arbitrations: 3
       processing_reaction_enabled: true
-      processing_reaction_emoji_id: "128064"  # LLBot 的 👀
+      processing_reaction_emoji_id: "8971"  # LLBot 的 ⌛，表示正在回复
       roles:
         user:
           tools: [qq_get_message, qq_get_group_msg_history, qq_get_friend_msg_history,
@@ -155,7 +155,7 @@ platforms:
 LLM trigger 默认关闭，启用时必须同时配置明确的 `provider`、`model` 和群 allowlist；每群最多一个判断任务，使用 5 秒 debounce 和全局并发上限。判断由插件自有 Node helper 通过固定版本 `@earendil-works/pi-ai` 发起，不经过 Hermes auxiliary，不回退 Hermes 主 Agent，也不主动切换 provider。`api_key_env` 只保存环境变量名，密钥值不会进入 YAML、命令行、日志或 SQLite。Node、依赖缺失、超时、非法 JSON 或模型失败都按不触发处理，消息继续留在 pending。
 旁路模型只接受 `{"decision":"trigger","anchor_seq":123}`、`{"decision":"wait","anchor_seq":null}` 或 `{"decision":"ignore","anchor_seq":null}`；`trigger` 必须选择真实 pending 消息的 seq，权限完全继承该消息。非法结果、超时或模型失败按不触发处理，并按持久化退避等待后续判断。
 `media_orphan_ttl_seconds` 到期后由下一次 adapter 启动或 turn 收尾清理遗留媒体目录。
-`processing_reaction_enabled` 默认开启；它使用 LLBot 的 `set_msg_emoji_like` 扩展，只作用于群聊真实消息 ID。添加或移除 reaction 的未知结果不会重放 Agent turn，也不会阻断队列 ack。
+`processing_reaction_enabled` 默认开启；它使用 LLBot 的 `set_msg_emoji_like` 扩展，只作用于群聊真实消息 ID。回复阶段的 ⌛ 使用 `processing_reaction_emoji_id`（默认 `8971`）；selector 判断阶段的 👀 使用固定 ID `128064`（LLBot/QQ 已验证支持，`9203` 即 ⏳ 不被 QQ reaction API 支持）。添加或移除 reaction 的未知结果不会重放 Agent turn，也不会阻断队列 ack。
 
 长时间运行提示不通过匹配 `⏳ Working` 等文本识别。只有 Hermes 提供
 `hermes_control_plane=true` 且 `hermes_control_kind=long_running`，或未来的

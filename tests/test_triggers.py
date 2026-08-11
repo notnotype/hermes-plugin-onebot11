@@ -508,8 +508,8 @@ def test_judging中短确认词不打断当前selector判断():
     assert state.llm_calls == 0
 
 
-def test_debounce中短确认词保持原有debounce():
-    """debounce 中短确认词按 trailing 语义延长窗口，不直接触发。"""
+def test_debounce中短确认词直接触发():
+    """debounce（候选等待）中活跃窗口内的短确认词直接触发，不再消耗 selector。"""
     state = LayeredTriggerState(TriggerConfig(debounce_seconds=5))
     state.on_turn_complete(success=True, now=0)
     state.mode = "debounce"
@@ -524,9 +524,76 @@ def test_debounce中短确认词保持原有debounce():
         now=3,
     )
 
-    assert action.kind == "schedule"
-    assert state.mode == "debounce"
+    assert action.kind == "direct"
+    assert action.reason == "engaged_ack"
     assert state.llm_calls == 0
+
+
+def test_自适应debounce第一条消息立即判断():
+    """本群第一条候选消息视为不活跃，立即进入判断而不是等待固定窗口。"""
+    state = LayeredTriggerState(TriggerConfig(debounce_seconds=5))
+
+    action = state.observe_message(
+        chat_type="group",
+        text="这个问题怎么处理？",
+        mentioned_self=False,
+        has_context=False,
+        revision=1,
+        now=10,
+    )
+
+    assert action.kind == "schedule"
+    assert state.debounce_due == 10
+
+
+def test_自适应debounce消息间隔超过窗口立即判断():
+    """距上一条消息超过 debounce 窗口（群不活跃）时立即判断。"""
+    state = LayeredTriggerState(TriggerConfig(debounce_seconds=5))
+    state.observe_message(
+        chat_type="group",
+        text="闲聊",
+        mentioned_self=False,
+        has_context=False,
+        revision=1,
+        now=0,
+    )
+
+    action = state.observe_message(
+        chat_type="group",
+        text="这个问题怎么处理？",
+        mentioned_self=False,
+        has_context=False,
+        revision=2,
+        now=10,
+    )
+
+    assert action.kind == "schedule"
+    assert state.debounce_due == 10
+
+
+def test_自适应debounce消息间隔在窗口内则补齐等待():
+    """距上一条消息 3 秒（活跃）时补齐到 5 秒窗口再判断。"""
+    state = LayeredTriggerState(TriggerConfig(debounce_seconds=5))
+    state.observe_message(
+        chat_type="group",
+        text="闲聊",
+        mentioned_self=False,
+        has_context=False,
+        revision=1,
+        now=0,
+    )
+
+    action = state.observe_message(
+        chat_type="group",
+        text="这个问题怎么处理？",
+        mentioned_self=False,
+        has_context=False,
+        revision=2,
+        now=3,
+    )
+
+    assert action.kind == "schedule"
+    assert state.debounce_due == 5
 
 
 def test_失败turn即使保留pending也退出engaged():

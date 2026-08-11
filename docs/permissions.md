@@ -18,7 +18,7 @@
 
 群消息即使没有 @、关键词或 `always` trigger，也会先写入 SQLite 队列；这保证触发时能拿到上次触发以来的上下文。没有 trigger 不会启动 Agent turn。
 
-群 turn 认领后，插件默认使用 LLBot 的 `set_msg_emoji_like` 扩展给触发消息添加 `emoji_id=128064`（👀），Hermes turn 收尾时发送 `set=false` 移除。问句/记忆候选进入旁路 selector 等待时，先给候选消息添加 `emoji_id=9203`（⏳），判断结束（触发、忽略、超时或 wait 到期）后移除；硬触发和短确认词直接触发时跳过 ⏳ 直接使用 👀。两个指示器都只作用于当前群的真实消息 ID；内部 hash、私聊消息或 lease 已失效时跳过。reaction 是 best-effort UI 提示，失败或结果未知不会阻断 Agent 回复、队列 ack，也不会重放 `set=true`。清理记录持久化在队列 SQLite 中，启动恢复最多有限次数地尝试 `unset`；达到上限后只在状态/审计中保留，不会无限刷屏。进程硬崩溃遗留的远端 ⏳/👀 不纳入清理承诺。
+群 turn 认领后，插件默认使用 LLBot 的 `set_msg_emoji_like` 扩展给触发消息添加 `emoji_id=8971`（⌛，表示正在回复这一条），Hermes turn 收尾时发送 `set=false` 移除。问句/记忆候选进入旁路 selector 判断时，先给候选消息添加 `emoji_id=128064`（👀，表示 bot 正在看这条消息），判断结束（触发、忽略、超时或 wait 到期）后移除；硬触发和短确认词直接触发时跳过 👀 直接使用 ⌛。两个指示器都只作用于当前群的真实消息 ID；内部 hash、私聊消息或 lease 已失效时跳过。reaction 是 best-effort UI 提示，失败或结果未知不会阻断 Agent 回复、队列 ack，也不会重放 `set=true`。清理记录持久化在队列 SQLite 中，启动恢复最多有限次数地尝试 `unset`；达到上限后只在状态/审计中保留，不会无限刷屏。进程硬崩溃遗留的远端 ⌛/👀 不纳入清理承诺。emoji ID 说明：`9203`（⏳）不被 QQ reaction API 支持（返回 failed），因此 ⌛ 使用实测可用的 `8971`。
 
 ## 角色与工具
 

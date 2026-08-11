@@ -29,7 +29,7 @@ from .permissions import (
 )
 from .triggers import TriggerConfig, build_trigger_config
 
-_PROCESSING_REACTION_EMOJI_ID = "128064"
+_PROCESSING_REACTION_EMOJI_ID = "8971"
 
 
 @dataclass(frozen=True)
