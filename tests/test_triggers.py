@@ -414,6 +414,78 @@ def test_完成时保留新消息建立的debounce状态():
     assert state.debounce_due == due_at
 
 
+def test_engaged短确认词直接触发且不消耗selector():
+    """活跃对话中的短确认词不能再交给低价模型决定是否唤醒。"""
+    state = LayeredTriggerState(TriggerConfig(debounce_seconds=5))
+    state.on_turn_complete(success=True, now=0)
+
+    action = state.observe_message(
+        chat_type="group",
+        text="可以。",
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=1,
+    )
+
+    assert action.kind == "direct"
+    assert action.reason == "engaged_ack"
+    assert state.llm_calls == 0
+    assert state.mode == "idle"
+
+
+def test_waiting短确认词直接触发但真实问句仍进入selector():
+    """selector 的等待状态也允许短确认词直达，但不能吞掉真正的问题。"""
+    state = LayeredTriggerState(TriggerConfig(debounce_seconds=5))
+    state.on_turn_complete(success=True, now=0)
+    state.mode = "waiting"
+    state.wait_until = 30
+
+    acknowledgement = state.observe_message(
+        chat_type="group",
+        text="好的",
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=1,
+    )
+    assert acknowledgement.kind == "direct"
+    assert acknowledgement.reason == "engaged_ack"
+    assert state.llm_calls == 0
+
+    state = LayeredTriggerState(TriggerConfig(debounce_seconds=5))
+    state.on_turn_complete(success=True, now=0)
+    question = state.observe_message(
+        chat_type="group",
+        text="可以吗？",
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=1,
+    )
+    assert question.kind == "schedule"
+    assert question.candidate_type == "engaged"
+    assert state.llm_calls == 0
+
+
+def test_idle短确认词不直接唤醒():
+    """没有成功 Agent 回复建立活跃窗口时，短确认词仍然只是普通闲聊。"""
+    state = LayeredTriggerState(TriggerConfig(debounce_seconds=5))
+
+    action = state.observe_message(
+        chat_type="group",
+        text="可以",
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=1,
+    )
+
+    assert action.kind == "none"
+    assert action.reason == "non_candidate"
+    assert state.llm_calls == 0
+
+
 def test_失败turn即使保留pending也退出engaged():
     """失败、取消或 unknown 不能把下一条普通消息误当连续对话。"""
     state = LayeredTriggerState(TriggerConfig(debounce_seconds=5))

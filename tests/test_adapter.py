@@ -1726,6 +1726,755 @@ async def test_LLM候选入队不会在群触发锁上死锁(monkeypatch):
         await adapter.disconnect()
 
 
+async def test_engaged短确认词不调用selector并创建durable_trigger(monkeypatch):
+    """活跃窗口中的短确认词直接进入同一群的共享 session。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "groups": ["888"],
+                },
+            },
+        )
+    )
+    state = adapter._trigger_state_for("888")
+    state.on_turn_complete(success=True, now=time.monotonic())
+    notifications: list[str] = []
+
+    def fail_selector(**_kwargs):
+        pytest.fail("engaged acknowledgement 不应调用 pi-ai selector")
+
+    async def fake_notify(chat_id: str) -> bool:
+        notifications.append(str(chat_id))
+        return True
+
+    monkeypatch.setattr(adapter_module, "PiAiTriggerClient", fail_selector)
+    monkeypatch.setattr(adapter._dispatcher, "notify", fake_notify)
+    message = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="engaged-ack-1",
+        user_id="123",
+        user_name="小明",
+        text="可以。",
+        message_key="group:engaged-ack-1",
+    )
+    caller = adapter_module.CallerContext(
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+        role="user",
+        allowed_tools=adapter_module.READ_ONLY_TOOLS,
+        self_id="1",
+    )
+    try:
+        await adapter._enqueue_group_message(
+            message,
+            mentioned_self=False,
+            caller=caller,
+            user_name="小明",
+        )
+        status = adapter._queue.status("888")
+        assert status["pending"] == 1
+        assert status["pending_trigger_requests"] == 1
+        assert notifications == ["888"]
+        requests = adapter._queue.recover_trigger_requests(["888"])
+        assert len(requests) == 1
+        assert requests[0].reason == "engaged_ack"
+        assert requests[0].message_key == "group:engaged-ack-1"
+    finally:
+        await adapter.disconnect()
+
+
+async def test_selector候选添加并清理queued_reaction(monkeypatch):
+    """LLM selector 等待期间使用 ⏳，创建 anchor 后移除它。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "groups": ["888"],
+                },
+            },
+        )
+    )
+    calls: list[tuple[str, str, bool]] = []
+
+    async def fake_reaction(message_id: str, emoji_id: str, *, enabled: bool) -> None:
+        calls.append((message_id, emoji_id, enabled))
+
+    monkeypatch.setattr(adapter._api, "set_message_emoji_like", fake_reaction)
+    message = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1001",
+        user_id="123",
+        user_name="小明",
+        text="这个问题怎么处理？",
+        message_key="group:1001",
+    )
+    caller = adapter_module.CallerContext(
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+        role="user",
+        allowed_tools=adapter_module.READ_ONLY_TOOLS,
+        self_id="1",
+    )
+    try:
+        await adapter._enqueue_group_message(
+            message,
+            mentioned_self=False,
+            caller=caller,
+            user_name="小明",
+        )
+        await asyncio.sleep(0.05)
+        assert calls == [("1001", "9203", True)]
+
+        state = adapter._trigger_states["888"]
+        due_at = state.debounce_due
+        assert due_at is not None
+        action = state.on_timer(now=due_at + 1)
+        assert action.kind == "judge"
+        async with adapter._trigger_lock_for("888"):
+            result_action, notify, failure = await adapter._apply_llm_result_locked(
+                "888",
+                action,
+                decision="trigger",
+                anchor_seq=1,
+                observed_revision=1,
+                observed_seq=1,
+            )
+        assert result_action is not None
+        assert result_action.reason == "llm"
+        assert notify is True
+        assert failure is None
+        await asyncio.sleep(0.05)
+        assert calls == [
+            ("1001", "9203", True),
+            ("1001", "9203", False),
+        ]
+    finally:
+        await adapter.disconnect()
+
+
+async def test_selector_ignore清理queued_reaction并保留pending(monkeypatch):
+    """selector 明确不触发时移除 ⏳，但不删除待处理消息。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "groups": ["888"],
+                },
+            },
+        )
+    )
+    calls: list[tuple[str, str, bool]] = []
+
+    async def fake_reaction(message_id: str, emoji_id: str, *, enabled: bool) -> None:
+        calls.append((message_id, emoji_id, enabled))
+
+    monkeypatch.setattr(adapter._api, "set_message_emoji_like", fake_reaction)
+    message = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1002",
+        user_id="123",
+        user_name="小明",
+        text="这个问题怎么处理？",
+        message_key="group:1002",
+    )
+    adapter._queue.enqueue(message)
+    state = adapter._trigger_state_for("888")
+    state.observe_message(
+        chat_type="group",
+        text=message.text,
+        mentioned_self=False,
+        has_context=False,
+        revision=1,
+        now=0,
+    )
+    adapter._schedule_queued_reaction("888", message)
+    await asyncio.sleep(0.05)
+    action = state.on_timer(now=6)
+    assert action.kind == "judge"
+    async with adapter._trigger_lock_for("888"):
+        result_action, notify, failure = await adapter._apply_llm_result_locked(
+            "888",
+            action,
+            decision="ignore",
+            anchor_seq=None,
+            observed_revision=1,
+            observed_seq=1,
+        )
+    assert result_action is not None
+    assert result_action.reason == "llm_ignore"
+    assert notify is False
+    assert failure is None
+    try:
+        await asyncio.sleep(0.05)
+        assert calls == [
+            ("1002", "9203", True),
+            ("1002", "9203", False),
+        ]
+        assert adapter._queue.status("888")["pending"] == 1
+        assert adapter._queue.status("888")["pending_trigger_requests"] == 0
+    finally:
+        await adapter.disconnect()
+
+
+async def test_selector_dirty_revision迁移queued_reaction到最新候选(monkeypatch):
+    """selector 判断期间出现新消息时，⏳ 必须跟随最新候选而不是停在旧消息。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "groups": ["888"],
+                },
+            },
+        )
+    )
+    calls: list[tuple[str, str, bool]] = []
+
+    async def fake_reaction(message_id: str, emoji_id: str, *, enabled: bool) -> None:
+        calls.append((message_id, emoji_id, enabled))
+
+    monkeypatch.setattr(adapter._api, "set_message_emoji_like", fake_reaction)
+    first = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1003",
+        user_id="123",
+        user_name="小明",
+        text="第一条问题怎么处理？",
+        message_key="group:1003",
+    )
+    second = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1004",
+        user_id="456",
+        user_name="小红",
+        text="补充的问题怎么处理？",
+        message_key="group:1004",
+    )
+    caller = adapter_module.CallerContext(
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+        role="user",
+        allowed_tools=adapter_module.READ_ONLY_TOOLS,
+        self_id="1",
+    )
+    try:
+        await adapter._enqueue_group_message(
+            first,
+            mentioned_self=False,
+            caller=caller,
+            user_name="小明",
+        )
+        await asyncio.sleep(0.05)
+        assert calls == [("1003", "9203", True)]
+
+        state = adapter._trigger_states["888"]
+        due_at = state.debounce_due
+        assert due_at is not None
+        judgement = state.on_timer(now=due_at + 1)
+        assert judgement.kind == "judge"
+
+        assert adapter._queue.enqueue(second).inserted
+        dirty = state.observe_message(
+            chat_type="group",
+            text=second.text,
+            mentioned_self=False,
+            has_context=True,
+            revision=2,
+            now=time.monotonic(),
+        )
+        assert dirty.reason == "judging_dirty"
+
+        async with adapter._trigger_lock_for("888"):
+            result_action, notify, failure = await adapter._apply_llm_result_locked(
+                "888",
+                judgement,
+                decision="ignore",
+                anchor_seq=None,
+                observed_revision=1,
+                observed_seq=1,
+            )
+        assert result_action is not None
+        assert result_action.reason == "queue_dirty"
+        assert notify is False
+        assert failure is None
+        await asyncio.sleep(0.05)
+        assert calls == [
+            ("1003", "9203", True),
+            ("1003", "9203", False),
+            ("1004", "9203", True),
+        ]
+    finally:
+        await adapter.disconnect()
+
+
+async def test_restore_selector为待处理候选补回queued_reaction(monkeypatch):
+    """重启恢复的候选也应显示 ⏳，但不创建 lease 或 Agent turn。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "groups": ["888"],
+                },
+            },
+        )
+    )
+    calls: list[tuple[str, str, bool]] = []
+
+    async def fake_reaction(message_id: str, emoji_id: str, *, enabled: bool) -> None:
+        calls.append((message_id, emoji_id, enabled))
+
+    monkeypatch.setattr(adapter._api, "set_message_emoji_like", fake_reaction)
+    message = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1005",
+        user_id="123",
+        user_name="小明",
+        text="重启后这个问题怎么处理？",
+        message_key="group:1005",
+    )
+    adapter._queue.enqueue(message)
+    try:
+        assert await adapter._restore_trigger_state("888") is False
+        await asyncio.sleep(0.05)
+        assert calls == [("1005", "9203", True)]
+        status = adapter._queue.status("888")
+        assert status["pending"] == 1
+        assert status["pending_trigger_requests"] == 0
+        assert adapter._dispatcher.active("888") is None
+    finally:
+        await adapter.disconnect()
+
+
+async def test_selector_failure清理queued_reaction并保留pending(monkeypatch):
+    """selector 超时/模型失败只清理 ⏳，不删除待处理消息。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "groups": ["888"],
+                },
+            },
+        )
+    )
+    calls: list[tuple[str, str, bool]] = []
+
+    async def fake_reaction(message_id: str, emoji_id: str, *, enabled: bool) -> None:
+        calls.append((message_id, emoji_id, enabled))
+
+    monkeypatch.setattr(adapter._api, "set_message_emoji_like", fake_reaction)
+    message = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1006",
+        user_id="123",
+        user_name="小明",
+        text="这个问题怎么处理？",
+        message_key="group:1006",
+    )
+    caller = adapter_module.CallerContext(
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+        role="user",
+        allowed_tools=adapter_module.READ_ONLY_TOOLS,
+        self_id="1",
+    )
+    try:
+        await adapter._enqueue_group_message(
+            message,
+            mentioned_self=False,
+            caller=caller,
+            user_name="小明",
+        )
+        await asyncio.sleep(0.05)
+        state = adapter._trigger_states["888"]
+        due_at = state.debounce_due
+        assert due_at is not None
+        action = state.on_timer(now=due_at + 1)
+        assert action.kind == "judge"
+
+        await adapter._apply_llm_failure(
+            "888",
+            action,
+            failure="timeout",
+            pending=1,
+            input_bytes=128,
+            duration_ms=10_000,
+            model_call_started=True,
+        )
+        await asyncio.sleep(0.05)
+        assert calls == [
+            ("1006", "9203", True),
+            ("1006", "9203", False),
+        ]
+        assert adapter._queue.status("888")["pending"] == 1
+    finally:
+        await adapter.disconnect()
+
+
+async def test_selector_wait到期清理queued_reaction(monkeypatch):
+    """selector 返回 wait 时暂留 ⏳，等待窗口真正到期后清理。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "groups": ["888"],
+                },
+            },
+        )
+    )
+    calls: list[tuple[str, str, bool]] = []
+
+    async def fake_reaction(message_id: str, emoji_id: str, *, enabled: bool) -> None:
+        calls.append((message_id, emoji_id, enabled))
+
+    monkeypatch.setattr(adapter._api, "set_message_emoji_like", fake_reaction)
+    message = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1007",
+        user_id="123",
+        user_name="小明",
+        text="这个问题怎么处理？",
+        message_key="group:1007",
+    )
+    adapter._queue.enqueue(message)
+    state = adapter._trigger_state_for("888")
+    state.observe_message(
+        chat_type="group",
+        text=message.text,
+        mentioned_self=False,
+        has_context=False,
+        revision=1,
+        now=0,
+    )
+    adapter._schedule_queued_reaction("888", message)
+    await asyncio.sleep(0.05)
+    action = state.on_timer(now=6)
+    assert action.kind == "judge"
+    async with adapter._trigger_lock_for("888"):
+        result_action, notify, failure = await adapter._apply_llm_result_locked(
+            "888",
+            action,
+            decision="wait",
+            anchor_seq=None,
+            observed_revision=1,
+            observed_seq=1,
+        )
+    assert result_action is not None
+    assert result_action.reason == "llm_wait"
+    assert notify is False
+    assert failure is None
+
+    adapter._cancel_llm_judgement("888")
+    state.wait_until = time.monotonic() + 0.01
+    timer = asyncio.create_task(adapter._run_trigger_timer("888"))
+    try:
+        await asyncio.sleep(0.08)
+        assert calls == [
+            ("1007", "9203", True),
+            ("1007", "9203", False),
+        ]
+    finally:
+        timer.cancel()
+        await asyncio.gather(timer, return_exceptions=True)
+        await adapter.disconnect()
+
+
+async def test_hard_trigger会清理旧候选queued_reaction(monkeypatch):
+    """硬触发优先时，旧 selector 候选的 ⏳ 先清理，不迁移到硬触发消息。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "groups": ["888"],
+                },
+            },
+        )
+    )
+    calls: list[tuple[str, str, bool]] = []
+
+    async def fake_reaction(message_id: str, emoji_id: str, *, enabled: bool) -> None:
+        calls.append((message_id, emoji_id, enabled))
+
+    async def fake_notify(_chat_id: str) -> bool:
+        return False
+
+    monkeypatch.setattr(adapter._api, "set_message_emoji_like", fake_reaction)
+    monkeypatch.setattr(adapter._dispatcher, "notify", fake_notify)
+    candidate = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1008",
+        user_id="123",
+        user_name="小明",
+        text="候选问题怎么处理？",
+        message_key="group:1008",
+    )
+    hard = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1009",
+        user_id="123",
+        user_name="小明",
+        text="@bot 直接处理",
+        message_key="group:1009",
+    )
+    caller = adapter_module.CallerContext(
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+        role="user",
+        allowed_tools=adapter_module.READ_ONLY_TOOLS,
+        self_id="1",
+    )
+    try:
+        await adapter._enqueue_group_message(
+            candidate,
+            mentioned_self=False,
+            caller=caller,
+            user_name="小明",
+        )
+        await asyncio.sleep(0.05)
+        await adapter._enqueue_group_message(
+            hard,
+            mentioned_self=True,
+            caller=caller,
+            user_name="小明",
+        )
+        await asyncio.sleep(0.05)
+        assert calls == [
+            ("1008", "9203", True),
+            ("1008", "9203", False),
+        ]
+        assert adapter._queue.status("888")["pending_trigger_requests"] == 1
+    finally:
+        await adapter.disconnect()
+
+
+async def test_pause会清理queued_reaction(monkeypatch):
+    """暂停群级自动触发时尽力移除当前 selector 的 ⏳。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "groups": ["888"],
+                },
+            },
+        )
+    )
+    calls: list[tuple[str, str, bool]] = []
+
+    async def fake_reaction(message_id: str, emoji_id: str, *, enabled: bool) -> None:
+        calls.append((message_id, emoji_id, enabled))
+
+    monkeypatch.setattr(adapter._api, "set_message_emoji_like", fake_reaction)
+    message = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1010",
+        user_id="123",
+        user_name="小明",
+        text="暂停前的问题怎么处理？",
+        message_key="group:1010",
+    )
+    adapter._queue.enqueue(message)
+    state = adapter._trigger_state_for("888")
+    state.observe_message(
+        chat_type="group",
+        text=message.text,
+        mentioned_self=False,
+        has_context=False,
+        revision=1,
+        now=0,
+    )
+    adapter._schedule_queued_reaction("888", message)
+    await asyncio.sleep(0.05)
+    try:
+        assert await adapter._set_group_paused("888", True)
+        await asyncio.sleep(0.05)
+        assert calls == [
+            ("1010", "9203", True),
+            ("1010", "9203", False),
+        ]
+    finally:
+        await adapter.disconnect()
+
+
+async def test_clear会清理queued_reaction(monkeypatch):
+    """/onebot clear 清理队列时同时移除 selector 等待提示。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "groups": ["888"],
+                },
+            },
+        )
+    )
+    calls: list[tuple[str, str, bool]] = []
+
+    async def fake_reaction(message_id: str, emoji_id: str, *, enabled: bool) -> None:
+        calls.append((message_id, emoji_id, enabled))
+
+    monkeypatch.setattr(adapter._api, "set_message_emoji_like", fake_reaction)
+    message = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1011",
+        user_id="123",
+        user_name="小明",
+        text="清理前的问题怎么处理？",
+        message_key="group:1011",
+    )
+    adapter._queue.enqueue(message)
+    state = adapter._trigger_state_for("888")
+    state.observe_message(
+        chat_type="group",
+        text=message.text,
+        mentioned_self=False,
+        has_context=False,
+        revision=1,
+        now=0,
+    )
+    adapter._schedule_queued_reaction("888", message)
+    await asyncio.sleep(0.05)
+    try:
+        assert await adapter._clear_group("888") == 1
+        await asyncio.sleep(0.05)
+        assert calls == [
+            ("1011", "9203", True),
+            ("1011", "9203", False),
+        ]
+        assert adapter._queue.status("888")["pending"] == 0
+    finally:
+        await adapter.disconnect()
+
+
+async def test_disconnect会清理queued_reaction(monkeypatch):
+    """断开时尽力移除内存中残留的 selector 等待提示。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "groups": ["888"],
+                },
+            },
+        )
+    )
+    calls: list[tuple[str, str, bool]] = []
+
+    async def fake_reaction(message_id: str, emoji_id: str, *, enabled: bool) -> None:
+        calls.append((message_id, emoji_id, enabled))
+
+    monkeypatch.setattr(adapter._api, "set_message_emoji_like", fake_reaction)
+    message = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1012",
+        user_id="123",
+        user_name="小明",
+        text="断开前的问题怎么处理？",
+        message_key="group:1012",
+    )
+    adapter._queue.enqueue(message)
+    state = adapter._trigger_state_for("888")
+    state.observe_message(
+        chat_type="group",
+        text=message.text,
+        mentioned_self=False,
+        has_context=False,
+        revision=1,
+        now=0,
+    )
+    adapter._schedule_queued_reaction("888", message)
+    await asyncio.sleep(0.05)
+    assert calls == [("1012", "9203", True)]
+    await adapter.disconnect()
+    await asyncio.sleep(0.05)
+    assert calls == [
+        ("1012", "9203", True),
+        ("1012", "9203", False),
+    ]
+    assert not adapter._queued_reaction_message_ids
+    assert not adapter._queued_reaction_tasks
+
+
 async def test_LLM_trigger的reaction锚定候选批次最新消息(monkeypatch):
     """旁路判断使用最新候选消息时，👀 不能回到队列最早消息。"""
     adapter = OneBot11Adapter(
