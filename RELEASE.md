@@ -15,7 +15,8 @@
 ## 当前 worktree
 
 Task 7 在当前 `0.6.0` 版本上补充媒体同轮去重、默认纯文本、控制面状态提示、运行时策略 reload、
-generic Hermes 工具硬门禁、持久 selector/cooldown、`/context` 旁路和 lease/reaction 收口。
+generic Hermes 工具硬门禁、持久 selector/cooldown、`/context` 旁路、lease/reaction 收口、
+活跃窗口短确认词直触发（`engaged_ack`）和 selector 候选 ⏳ 等待提示。
 这些变更仍需通过分支 PR、合并后复审和指定白名单范围内的 Arch 验收，尚未构成新的发布版本。
 
 ## 升级与迁移

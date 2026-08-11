@@ -46,8 +46,10 @@
 - 候选：空闲状态只识别问句，以及带回指词且当前群有摘要/最近原文的记忆候选；候选经过 5 秒 trailing debounce。
 - 旁路结果：严格接受 `trigger|wait|ignore` 三态；`wait` 使用 `5/10/30/60` 秒，只等待真实新消息，不创建 lease 或空轮询；`trigger/ignore` 的 `wait_seconds` 必须为 `0`。
 - 活跃窗口：成功 Agent turn 后 idle 60 秒，最长连续 300 秒，最多 3 次 LLM 仲裁；失败、取消和 uncertain 不进入 engaged。
+- 短确认词：engaged/waiting 窗口内的“可以、好的、好、行、嗯、嗯嗯、明白、收到、继续、接着、对、是的”等短确认词由确定性规则直接创建 trigger（`engaged_ack`），不调用旁路模型、不消耗仲裁次数；带实际问题的消息（如“可以吗？”）仍进入 selector。idle 状态下的短确认词不触发。
 - 竞争处理：每群最多一个判断任务；判断期间的队列 revision 变化会重新安排一次，硬触发会使旧结果失效。
 - waiting 状态也受当前活跃窗口的仲裁上限约束；达到上限后只等待硬触发或管理员 flush，不再消耗旁路模型调用。
+- selector 等待提示：问句/记忆候选进入 debounce/判断时给候选消息添加 `emoji_id=9203`（⏳），判断结束（触发、忽略、超时、非法结果或 wait 到期）后移除；selector 判定触发后由群 turn 的 👀 接管。硬触发和短确认词直接触发时跳过 ⏳。⏳ 是 best-effort 内存状态，重启后不恢复，进程崩溃遗留的远端 reaction 不纳入清理承诺。
 - 旁路调用只接受显式 provider/model 和群 allowlist，由插件自有 Node helper 调用固定版本的 `@earendil-works/pi-ai`；不经过 Hermes auxiliary，不做 provider fallback 或主 Agent fallback。Node/依赖/provider/model/模型结果异常时安全按 `ignore`。
 - 上下文：群当前 anchor batch 作为普通 user message，滚动摘要优先通过 `channel_prompt` 临时注入；旧 Hermes 明确退回有界文本模式。摘要不会作为每轮普通 user transcript 重复累积。
 

@@ -112,6 +112,7 @@ FormattedText = _proto.formatting.FormattedText
 logger = logging.getLogger(__name__)
 _PLATFORM_NAME = "onebot11"
 _PROCESSING_REACTION_EMOJI_ID = "128064"  # LLBot 的 QQ Emoji「👀」ID
+_QUEUED_REACTION_EMOJI_ID = "9203"  # LLBot 的 QQ Emoji「⏳」ID
 _REQUIRED_HERMES_HOOKS = frozenset(
     {"pre_gateway_dispatch", "pre_llm_call", "pre_tool_call"}
 )
@@ -499,6 +500,8 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._outbound_known_failure: set[str] = set()
         self._delivery_summaries: dict[str, DeliverySummary] = {}
         self._processing_reaction_message_ids: dict[str, str] = {}
+        self._queued_reaction_message_ids: dict[str, tuple[str, str]] = {}
+        self._queued_reaction_tasks: dict[str, asyncio.Task[None]] = {}
         self._reaction_recovery_task: asyncio.Task[None] | None = None
         self._fenced_leases: set[str] = set()
         self._lease_session_keys: dict[str, str] = {}
@@ -756,6 +759,8 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._lease_session_keys.clear()
         self._pending_completions.clear()
         self._processing_reaction_message_ids.clear()
+        self._queued_reaction_message_ids.clear()
+        self._queued_reaction_tasks.clear()
         self._binding_diagnostic_keys.clear()
         self._pending_session_resets.clear()
         self._resetting_groups.clear()
@@ -965,6 +970,10 @@ class OneBot11Adapter(BasePlatformAdapter):
             try:
                 await asyncio.wait_for(
                     self._clear_all_processing_reactions(allow_shutdown=True),
+                    timeout=2.0,
+                )
+                await asyncio.wait_for(
+                    self._clear_all_queued_reactions(allow_shutdown=True),
                     timeout=2.0,
                 )
             except Exception:
@@ -2124,6 +2133,8 @@ class OneBot11Adapter(BasePlatformAdapter):
         chat_id = str(message.chat_id)
         should_notify = False
         cancel_judgement = False
+        clear_queued_reaction = False
+        queued_reaction_message: QueueMessage | None = None
         async with self._trigger_lock_for(chat_id):
             before = await asyncio.to_thread(self._queue.status, chat_id)
             now = time.monotonic()
@@ -2137,19 +2148,28 @@ class OneBot11Adapter(BasePlatformAdapter):
                 last_trigger_at=previous_trigger_at,
                 now=now,
             )
+            state = self._trigger_states.get(chat_id)
+            engaged_ack = bool(
+                not decision.triggered
+                and self.trigger_config.llm_enabled
+                and chat_id in self.trigger_config.llm_allowed_groups
+                and not bool(before.get("paused"))
+                and state is not None
+                and state.direct_acknowledgement_allowed(message.text, now=now)
+            )
             trigger = (
                 TriggerRequest.create(
                     chat_id,
                     str(message.message_key),
-                    decision.reason,
+                    decision.reason if decision.triggered else "engaged_ack",
                     caller.user_id,
                     user_name or caller.user_id,
-                    anchor_kind="hard",
+                    anchor_kind="hard" if decision.triggered else "engaged_ack",
                     authority_role=caller.role,
                     authority_tools=caller.allowed_tools,
                     authority_self_id=caller.self_id,
                 )
-                if decision.triggered
+                if decision.triggered or engaged_ack
                 else None
             )
             try:
@@ -2169,11 +2189,12 @@ class OneBot11Adapter(BasePlatformAdapter):
                 # 只在释放群触发锁后通知 dispatcher。通知可能认领 lease 并
                 # 启动完整 Hermes turn，不能和入队状态机嵌套在同一把锁里。
                 should_notify = bool(result.trigger_request_id)
-                if decision.triggered and result.trigger_request_id:
+                if (decision.triggered or engaged_ack) and result.trigger_request_id:
                     state = self._trigger_states.get(chat_id)
                     if state is not None:
                         state.invalidate_judgement()
                         cancel_judgement = True
+                    clear_queued_reaction = True
             else:
                 action = TriggerAction("none", reason=decision.reason)
                 status = await asyncio.to_thread(self._queue.status, chat_id)
@@ -2195,6 +2216,8 @@ class OneBot11Adapter(BasePlatformAdapter):
                     )
                     if action.kind == "schedule":
                         await self._apply_trigger_action_locked(chat_id, action)
+                        if state.mode == "debounce":
+                            queued_reaction_message = message
                 if decision.triggered or action.kind == "direct":
                     if decision.triggered:
                         self._last_trigger_at[chat_id] = wall_now
@@ -2202,10 +2225,18 @@ class OneBot11Adapter(BasePlatformAdapter):
                         if state is not None:
                             state.invalidate_judgement()
                             cancel_judgement = True
+                    if action.reason == "engaged_ack":
+                        cancel_judgement = True
+                    if decision.triggered or action.reason == "engaged_ack":
+                        clear_queued_reaction = True
                     should_notify = True
 
         if cancel_judgement:
             self._cancel_llm_judgement(chat_id)
+        if queued_reaction_message is not None:
+            self._schedule_queued_reaction(chat_id, queued_reaction_message)
+        elif clear_queued_reaction:
+            self._schedule_clear_queued_reaction(chat_id)
         if should_notify:
             await self._dispatcher.notify(chat_id)
 
@@ -2376,6 +2407,8 @@ class OneBot11Adapter(BasePlatformAdapter):
                         state.pause() if block_reason == "paused" else state.invalidate_judgement()
                         return
                     action = state.on_timer(now=time.monotonic())
+                if action.reason in {"wait_expired", "engaged_expired"}:
+                    self._schedule_clear_queued_reaction(chat_id)
                 if action.kind == "judge":
                     await self._start_llm_judgement(chat_id, action)
                 elif action.kind in {"schedule", "wait"}:
@@ -2459,6 +2492,9 @@ class OneBot11Adapter(BasePlatformAdapter):
                 {
                     "chat_id": normalized,
                     "candidate_type": action.candidate_type or "candidate",
+                    "candidate_message_key": None,
+                    "candidate_seq": None,
+                    "queue_revision": int(action.revision or 0),
                     "reason": "provider_missing",
                     "pending": int(status.get("pending", 0)),
                     "input_bytes": 0,
@@ -2466,9 +2502,12 @@ class OneBot11Adapter(BasePlatformAdapter):
                     "decision": "ignore",
                     "anchor_seq": None,
                     "failure": "provider_missing",
+                    "provider": self.trigger_config.llm_provider,
+                    "model": self.trigger_config.llm_model,
                     "concurrency_waited": False,
                 },
             )
+            self._schedule_clear_queued_reaction(normalized)
             return
         self._schedule_trigger_timer(normalized)
 
@@ -2529,16 +2568,22 @@ class OneBot11Adapter(BasePlatformAdapter):
                     {
                         "chat_id": normalized,
                         "candidate_type": action.candidate_type or "candidate",
+                        "candidate_message_key": None,
+                        "candidate_seq": None,
+                        "queue_revision": int(action.revision or 0),
                         "pending": int(status.get("pending", 0)),
                         "input_bytes": 0,
                         "decision": "ignore",
                         "anchor_seq": None,
                         "duration_ms": 0,
                         "failure": failure,
+                        "provider": self.trigger_config.llm_provider,
+                        "model": self.trigger_config.llm_model,
                         "concurrency_waited": False,
                         "concurrency_wait_ms": 0,
                     },
                 )
+                self._schedule_clear_queued_reaction(normalized)
                 if state.engaged_until is not None:
                     self._schedule_trigger_timer(normalized)
                 return
@@ -2669,6 +2714,7 @@ class OneBot11Adapter(BasePlatformAdapter):
             ) > 0
         if cancel_judgement:
             self._cancel_llm_judgement(normalized)
+        self._schedule_clear_queued_reaction(normalized)
         if not has_request:
             return False, False, paused
         started = await self._dispatcher.notify(normalized)
@@ -2690,6 +2736,7 @@ class OneBot11Adapter(BasePlatformAdapter):
             )
         if cancel_judgement:
             self._cancel_llm_judgement(normalized)
+        self._schedule_clear_queued_reaction(normalized)
         return count
 
     async def _set_group_paused(self, chat_id: str, paused: bool) -> bool:
@@ -2715,6 +2762,8 @@ class OneBot11Adapter(BasePlatformAdapter):
             )
         if cancel_judgement:
             self._cancel_llm_judgement(normalized)
+        if paused:
+            self._schedule_clear_queued_reaction(normalized)
         if not paused:
             await self._restore_trigger_state(normalized)
         return True
@@ -2859,6 +2908,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                         self._schedule_trigger_timer(normalized)
                     else:
                         await self._apply_trigger_action_locked(normalized, action)
+                    self._schedule_queued_reaction(normalized, eligible_messages[-1])
         if should_notify:
             await self._dispatcher.notify(normalized)
         return should_notify
@@ -2877,9 +2927,11 @@ class OneBot11Adapter(BasePlatformAdapter):
         normalized = str(chat_id)
         state = self._trigger_states.get(normalized)
         if state is None or not state.judgement_is_current(action.generation):
+            self._schedule_clear_queued_reaction(normalized)
             return None, False, "stale_judgement"
         if not self._chat_access_allowed("group", normalized):
             state.invalidate_judgement()
+            self._schedule_clear_queued_reaction(normalized)
             return None, False, "access_denied"
         status = await asyncio.to_thread(self._queue.status, normalized)
         block_reason = self._selector_block_reason(status)
@@ -2888,6 +2940,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                 state.pause()
             else:
                 state.invalidate_judgement()
+            self._schedule_clear_queued_reaction(normalized)
             return None, False, block_reason
         current_revision = int(status.get("revision", 0))
         result_action = state.on_llm_result(
@@ -2906,6 +2959,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                 anchor_seq=result_action.anchor_seq,
                 observed_seq=observed_seq,
             )
+            self._schedule_clear_queued_reaction(normalized)
             return result_action, bool(request_id), None if request_id else "trigger_not_created"
         if (
             current_revision == observed_revision
@@ -2922,8 +2976,20 @@ class OneBot11Adapter(BasePlatformAdapter):
                 return result_action, False, "queue_closed"
         if result_action.kind in {"schedule", "wait"}:
             await self._apply_trigger_action_locked(normalized, result_action)
+            if result_action.reason == "queue_dirty":
+                messages = await asyncio.to_thread(
+                    self._queue.peek,
+                    normalized,
+                )
+                latest = messages[-1] if messages else None
+                if latest is None:
+                    self._schedule_clear_queued_reaction(normalized)
+                else:
+                    self._schedule_queued_reaction(normalized, latest)
         elif state.engaged_until is not None:
             self._schedule_trigger_timer(normalized)
+        if result_action.reason in {"llm_ignore", "invalid_result"}:
+            self._schedule_clear_queued_reaction(normalized)
         return result_action, False, None
 
     async def _persist_llm_failure_locked(
@@ -2989,6 +3055,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         concurrency_wait_ms: int = 0,
         model_call_started: bool = False,
         observed_seq: int | None = None,
+        candidate_message_key: str | None = None,
     ) -> None:
         """在群锁内处理取消/失败结果，避免旧 task 污染新状态。"""
         normalized = str(chat_id)
@@ -3023,17 +3090,23 @@ class OneBot11Adapter(BasePlatformAdapter):
                         failure=failure,
                         observed_seq=observed_seq,
                     )
+        self._schedule_clear_queued_reaction(normalized)
         self._audit.record(
             "llm_trigger",
             {
                 "chat_id": normalized,
                 "candidate_type": action.candidate_type or "candidate",
+                "candidate_message_key": candidate_message_key,
+                "candidate_seq": observed_seq,
+                "queue_revision": int(action.revision or 0),
                 "pending": int(pending),
                 "input_bytes": int(input_bytes),
                 "decision": "ignore",
                 "anchor_seq": None,
                 "duration_ms": int(duration_ms),
                 "failure": "stale_judgement" if stale else failure,
+                "provider": self.trigger_config.llm_provider,
+                "model": self.trigger_config.llm_model,
                 "concurrency_waited": bool(concurrency_waited),
                 "concurrency_wait_ms": int(concurrency_wait_ms),
                 "model_call_started": bool(model_call_started),
@@ -3054,6 +3127,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         messages_count = 0
         input_bytes = 0
         observed_seq: int | None = None
+        candidate_message_key: str | None = None
         notify = False
         model_call_started = False
         try:
@@ -3093,6 +3167,9 @@ class OneBot11Adapter(BasePlatformAdapter):
                                         if message.seq is not None
                                     ),
                                     default=None,
+                                )
+                                candidate_message_key = str(
+                                    messages[-1].message_key
                                 )
                                 if not observed_revision:
                                     observed_revision = int(status.get("revision", 0))
@@ -3166,11 +3243,16 @@ class OneBot11Adapter(BasePlatformAdapter):
                     {
                         "chat_id": normalized,
                         "candidate_type": candidate_type,
+                        "candidate_message_key": candidate_message_key,
+                        "candidate_seq": observed_seq,
+                        "queue_revision": observed_revision,
                         "pending": messages_count,
                         "input_bytes": input_bytes,
                         "decision": decision_name,
                         "anchor_seq": anchor_seq,
                         "duration_ms": int((time.monotonic() - started_at) * 1000),
+                        "provider": self.trigger_config.llm_provider,
+                        "model": self.trigger_config.llm_model,
                         "concurrency_waited": concurrency_waited,
                         "concurrency_wait_ms": concurrency_wait_ms,
                         "model_call_started": True,
@@ -3210,6 +3292,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                     concurrency_wait_ms=concurrency_wait_ms,
                     model_call_started=model_call_started,
                     observed_seq=observed_seq,
+                    candidate_message_key=candidate_message_key,
                 )
             current = self._llm_trigger_tasks.get(normalized)
             if current is asyncio.current_task():
@@ -3548,6 +3631,187 @@ class OneBot11Adapter(BasePlatformAdapter):
             if str(message.message_key) == anchor_key:
                 return message
         return None
+
+    def _schedule_queued_reaction(self, chat_id: str, message: QueueMessage) -> None:
+        """异步给当前 selector 候选消息添加一次性 ⏳ 提示。"""
+        normalized = str(chat_id)
+        if not self._processing_reaction_enabled:
+            self._schedule_clear_queued_reaction(normalized)
+            return
+        message_id = str(message.message_id or "").strip()
+        if (
+            not self._chat_access_allowed("group", normalized)
+            or not is_numeric_message_id(message_id)
+        ):
+            self._schedule_clear_queued_reaction(normalized)
+            return
+        previous = self._queued_reaction_tasks.get(normalized)
+        current = asyncio.current_task()
+        if previous is not None and not previous.done() and previous is not current:
+            previous.cancel()
+        try:
+            task = asyncio.create_task(
+                self._set_queued_reaction(
+                    normalized,
+                    str(message.message_key),
+                    message_id,
+                )
+            )
+        except RuntimeError:
+            logger.debug("OneBot11 无法创建 queued reaction task", exc_info=True)
+            return
+        self._queued_reaction_tasks[normalized] = task
+
+    def _schedule_clear_queued_reaction(self, chat_id: str) -> None:
+        """异步清理一个群当前内存登记的 ⏳ reaction。"""
+        normalized = str(chat_id)
+        current = asyncio.current_task()
+        previous = self._queued_reaction_tasks.get(normalized)
+        if previous is not None and not previous.done() and previous is not current:
+            previous.cancel()
+        try:
+            task = asyncio.create_task(self._clear_queued_reaction(normalized))
+        except RuntimeError:
+            self._queued_reaction_message_ids.pop(normalized, None)
+            logger.debug("OneBot11 无法创建 queued reaction cleanup task", exc_info=True)
+            return
+        self._queued_reaction_tasks[normalized] = task
+
+    async def _set_queued_reaction(
+        self,
+        chat_id: str,
+        message_key: str,
+        message_id: str,
+    ) -> None:
+        """添加 ⏳，并在同群候选替换时先清理旧 reaction。"""
+        normalized = str(chat_id)
+        entry = (str(message_key), str(message_id))
+        try:
+            previous = self._queued_reaction_message_ids.get(normalized)
+            if previous is not None and previous != entry:
+                await self._unset_queued_reaction_entry(normalized, previous)
+            if (
+                self._closed
+                or not self._chat_access_allowed("group", normalized)
+                or self._queued_reaction_tasks.get(normalized) is not asyncio.current_task()
+            ):
+                return
+            self._queued_reaction_message_ids[normalized] = entry
+            async with self._outbound_gate:
+                if (
+                    self._closed
+                    or self._queued_reaction_message_ids.get(normalized) != entry
+                    or not self._chat_access_allowed("group", normalized)
+                ):
+                    return
+                await self._api.set_message_emoji_like(
+                    message_id,
+                    _QUEUED_REACTION_EMOJI_ID,
+                    enabled=True,
+                )
+        except OneBotApiError as exc:
+            logger.warning(
+                "OneBot11 queued reaction 添加失败: chat=%s message=%s status=%s",
+                normalized,
+                message_id,
+                exc.status,
+            )
+            if not exc.unknown_outcome and self._queued_reaction_message_ids.get(normalized) == entry:
+                self._queued_reaction_message_ids.pop(normalized, None)
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "OneBot11 queued reaction 添加失败: chat=%s message=%s error=%s",
+                normalized,
+                message_id,
+                exc,
+            )
+            if self._queued_reaction_message_ids.get(normalized) == entry:
+                self._queued_reaction_message_ids.pop(normalized, None)
+        finally:
+            if self._queued_reaction_tasks.get(normalized) is asyncio.current_task():
+                self._queued_reaction_tasks.pop(normalized, None)
+
+    async def _unset_queued_reaction_entry(
+        self,
+        chat_id: str,
+        entry: tuple[str, str],
+        *,
+        allow_shutdown: bool = False,
+    ) -> None:
+        """尽力移除一个已登记的 ⏳，不改变队列和 Agent 状态。"""
+        normalized = str(chat_id)
+        _message_key, message_id = entry
+        if not is_numeric_message_id(message_id):
+            if self._queued_reaction_message_ids.get(normalized) == entry:
+                self._queued_reaction_message_ids.pop(normalized, None)
+            return
+        if (
+            (self._closed and not allow_shutdown)
+            or not self._chat_access_allowed("group", normalized)
+        ):
+            if self._queued_reaction_message_ids.get(normalized) == entry:
+                self._queued_reaction_message_ids.pop(normalized, None)
+            return
+        try:
+            async with self._outbound_gate:
+                if self._closed and not allow_shutdown:
+                    return
+                await self._api.set_message_emoji_like(
+                    message_id,
+                    _QUEUED_REACTION_EMOJI_ID,
+                    enabled=False,
+                )
+        except (OneBotApiError, OSError, ValueError) as exc:
+            logger.warning(
+                "OneBot11 queued reaction 移除失败: chat=%s message=%s error=%s",
+                normalized,
+                message_id,
+                exc,
+            )
+        finally:
+            if self._queued_reaction_message_ids.get(normalized) == entry:
+                self._queued_reaction_message_ids.pop(normalized, None)
+
+    async def _clear_queued_reaction(
+        self,
+        chat_id: str,
+        *,
+        allow_shutdown: bool = False,
+    ) -> None:
+        """取消当前群的 queued reaction task 并尽力移除 ⏳。"""
+        normalized = str(chat_id)
+        current = asyncio.current_task()
+        task = self._queued_reaction_tasks.get(normalized)
+        if task is not None and task is not current and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        entry = self._queued_reaction_message_ids.get(normalized)
+        if entry is not None:
+            await self._unset_queued_reaction_entry(
+                normalized,
+                entry,
+                allow_shutdown=allow_shutdown,
+            )
+        if self._queued_reaction_tasks.get(normalized) is current:
+            self._queued_reaction_tasks.pop(normalized, None)
+
+    async def _clear_all_queued_reactions(self, *, allow_shutdown: bool = False) -> None:
+        """断开或 reset 时清理所有内存登记的 ⏳ reaction。"""
+        current = asyncio.current_task()
+        tasks = [
+            task
+            for task in self._queued_reaction_tasks.values()
+            if task is not current and not task.done()
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for chat_id in list(self._queued_reaction_message_ids):
+            await self._clear_queued_reaction(
+                chat_id,
+                allow_shutdown=allow_shutdown,
+            )
 
     async def _set_processing_reaction(self, lease: QueueLease, *, enabled: bool) -> str | None:
         """持久化并按需添加处理指示器；绝不自动重放历史 set 请求。"""

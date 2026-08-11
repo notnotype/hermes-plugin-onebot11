@@ -16,6 +16,23 @@ from typing import Any
 from .permissions import parse_bool, parse_id_list
 from .queue import QueueMessage
 
+_ENGAGED_ACKNOWLEDGEMENTS = frozenset(
+    {
+        "可以",
+        "好的",
+        "好",
+        "行",
+        "嗯",
+        "嗯嗯",
+        "明白",
+        "收到",
+        "继续",
+        "接着",
+        "对",
+        "是的",
+    }
+)
+
 
 @dataclass(frozen=True)
 class TriggerConfig:
@@ -126,12 +143,18 @@ class LayeredTriggerState:
         if self.mode == "engaged":
             if self.engaged_until is not None and now >= self.engaged_until:
                 self._leave_engaged()
+            elif self.direct_acknowledgement_allowed(text, now=now):
+                self._clear_pending_judgement()
+                return TriggerAction("direct", reason="engaged_ack")
             elif self.arbitration_count >= self.config.engaged_max_arbitrations:
                 return TriggerAction("none", reason="arbitration_limit")
             else:
                 return self._schedule("engaged", revision, now)
 
         if self.mode == "waiting":
+            if self.direct_acknowledgement_allowed(text, now=now):
+                self._clear_pending_judgement()
+                return TriggerAction("direct", reason="engaged_ack")
             if self.arbitration_count >= self.config.engaged_max_arbitrations:
                 return TriggerAction("none", reason="arbitration_limit")
             return self._schedule("wait_followup", revision, now)
@@ -280,6 +303,19 @@ class LayeredTriggerState:
             and generation == self._judgement_generation
         )
 
+    def direct_acknowledgement_allowed(self, text: str, *, now: float) -> bool:
+        """判断短确认词是否仍处于有效的连续对话窗口。"""
+        if not is_engaged_acknowledgement(text):
+            return False
+        if self.mode not in {"engaged", "waiting"}:
+            return False
+        return bool(
+            self.engaged_until is not None
+            and self.engaged_until > now
+            and self.engaged_max_until is not None
+            and self.engaged_max_until > now
+        )
+
     def invalidate_judgement(self) -> None:
         """使已经离开当前状态机的旁路结果永久失效并回到 idle。"""
         self._judgement_generation += 1
@@ -422,6 +458,13 @@ class LayeredTriggerState:
             self.mode = "engaged"
         else:
             self._leave_engaged()
+
+
+def is_engaged_acknowledgement(text: str) -> bool:
+    """判断活跃窗口内是否是一条短确认词，而不是新的实际问题。"""
+    normalized = re.sub(r"\s+", "", str(text or "").casefold())
+    normalized = normalized.strip("。！？!?，,、；;：:~～…")
+    return normalized in _ENGAGED_ACKNOWLEDGEMENTS
 
 
 def _parse_keywords(value: Any) -> tuple[str, ...]:
