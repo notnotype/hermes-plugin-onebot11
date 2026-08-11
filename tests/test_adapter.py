@@ -1388,8 +1388,8 @@ async def test_群turn给触发消息加眼睛并在收尾移除(monkeypatch):
         )
         await adapter._finish_queue_turn(event, ProcessingOutcome.SUCCESS)
         assert reaction_calls == [
-            ("-1001", "128064", True),
-            ("-1001", "128064", False),
+            ("-1001", "8971", True),
+            ("-1001", "8971", False),
         ]
         assert adapter._queue.status("888")["pending"] == 1
     finally:
@@ -1414,7 +1414,7 @@ async def test_fenced_reaction恢复只执行unset(monkeypatch):
     monkeypatch.setattr(adapter._api, "set_message_emoji_like", fake_reaction)
     try:
         await adapter._recover_processing_reactions_once()
-        assert calls == [("1001", "128064", False)]
+        assert calls == [("1001", "8971", False)]
         assert adapter._queue.reaction_for_lease("fenced-reaction") is None
     finally:
         await adapter.disconnect()
@@ -1833,6 +1833,9 @@ async def test_selector候选添加并清理queued_reaction(monkeypatch):
         self_id="1",
     )
     try:
+        # 先制造活跃消息间隔：自适应 debounce 下第一条消息会立即判断，
+        # 这里让候选消息落在 5 秒节流窗口内，保持固定等待节奏。
+        adapter._trigger_state_for("888").last_message_at = time.monotonic() - 1
         await adapter._enqueue_group_message(
             message,
             mentioned_self=False,
@@ -1840,11 +1843,10 @@ async def test_selector候选添加并清理queued_reaction(monkeypatch):
             user_name="小明",
         )
         await asyncio.sleep(0.05)
-        assert calls == [("1001", "9203", True)]
-
         state = adapter._trigger_states["888"]
         due_at = state.debounce_due
         assert due_at is not None
+        assert calls == [("1001", "128064", True)]
         action = state.on_timer(now=due_at + 1)
         assert action.kind == "judge"
         async with adapter._trigger_lock_for("888"):
@@ -1862,8 +1864,8 @@ async def test_selector候选添加并清理queued_reaction(monkeypatch):
         assert failure is None
         await asyncio.sleep(0.05)
         assert calls == [
-            ("1001", "9203", True),
-            ("1001", "9203", False),
+            ("1001", "128064", True),
+            ("1001", "128064", False),
         ]
     finally:
         await adapter.disconnect()
@@ -1931,8 +1933,8 @@ async def test_selector_ignore清理queued_reaction并保留pending(monkeypatch)
     try:
         await asyncio.sleep(0.05)
         assert calls == [
-            ("1002", "9203", True),
-            ("1002", "9203", False),
+            ("1002", "128064", True),
+            ("1002", "128064", False),
         ]
         assert adapter._queue.status("888")["pending"] == 1
         assert adapter._queue.status("888")["pending_trigger_requests"] == 0
@@ -1990,6 +1992,7 @@ async def test_selector_dirty_revision迁移queued_reaction到最新候选(monke
         self_id="1",
     )
     try:
+        adapter._trigger_state_for("888").last_message_at = time.monotonic() - 1
         await adapter._enqueue_group_message(
             first,
             mentioned_self=False,
@@ -1997,7 +2000,7 @@ async def test_selector_dirty_revision迁移queued_reaction到最新候选(monke
             user_name="小明",
         )
         await asyncio.sleep(0.05)
-        assert calls == [("1003", "9203", True)]
+        assert calls == [("1003", "128064", True)]
 
         state = adapter._trigger_states["888"]
         due_at = state.debounce_due
@@ -2031,9 +2034,9 @@ async def test_selector_dirty_revision迁移queued_reaction到最新候选(monke
         assert failure is None
         await asyncio.sleep(0.05)
         assert calls == [
-            ("1003", "9203", True),
-            ("1003", "9203", False),
-            ("1004", "9203", True),
+            ("1003", "128064", True),
+            ("1003", "128064", False),
+            ("1004", "128064", True),
         ]
     finally:
         await adapter.disconnect()
@@ -2075,7 +2078,7 @@ async def test_restore_selector为待处理候选补回queued_reaction(monkeypat
     try:
         assert await adapter._restore_trigger_state("888") is False
         await asyncio.sleep(0.05)
-        assert calls == [("1005", "9203", True)]
+        assert calls == [("1005", "128064", True)]
         status = adapter._queue.status("888")
         assert status["pending"] == 1
         assert status["pending_trigger_requests"] == 0
@@ -2125,6 +2128,7 @@ async def test_selector_failure清理queued_reaction并保留pending(monkeypatch
         self_id="1",
     )
     try:
+        adapter._trigger_state_for("888").last_message_at = time.monotonic() - 1
         await adapter._enqueue_group_message(
             message,
             mentioned_self=False,
@@ -2149,8 +2153,8 @@ async def test_selector_failure清理queued_reaction并保留pending(monkeypatch
         )
         await asyncio.sleep(0.05)
         assert calls == [
-            ("1006", "9203", True),
-            ("1006", "9203", False),
+            ("1006", "128064", True),
+            ("1006", "128064", False),
         ]
         assert adapter._queue.status("888")["pending"] == 1
     finally:
@@ -2223,8 +2227,8 @@ async def test_selector_wait到期清理queued_reaction(monkeypatch):
     try:
         await asyncio.sleep(0.08)
         assert calls == [
-            ("1007", "9203", True),
-            ("1007", "9203", False),
+            ("1007", "128064", True),
+            ("1007", "128064", False),
         ]
     finally:
         timer.cancel()
@@ -2301,8 +2305,8 @@ async def test_hard_trigger会清理旧候选queued_reaction(monkeypatch):
         )
         await asyncio.sleep(0.05)
         assert calls == [
-            ("1008", "9203", True),
-            ("1008", "9203", False),
+            ("1008", "128064", True),
+            ("1008", "128064", False),
         ]
         assert adapter._queue.status("888")["pending_trigger_requests"] == 1
     finally:
@@ -2357,8 +2361,8 @@ async def test_pause会清理queued_reaction(monkeypatch):
         assert await adapter._set_group_paused("888", True)
         await asyncio.sleep(0.05)
         assert calls == [
-            ("1010", "9203", True),
-            ("1010", "9203", False),
+            ("1010", "128064", True),
+            ("1010", "128064", False),
         ]
     finally:
         await adapter.disconnect()
@@ -2412,8 +2416,8 @@ async def test_clear会清理queued_reaction(monkeypatch):
         assert await adapter._clear_group("888") == 1
         await asyncio.sleep(0.05)
         assert calls == [
-            ("1011", "9203", True),
-            ("1011", "9203", False),
+            ("1011", "128064", True),
+            ("1011", "128064", False),
         ]
         assert adapter._queue.status("888")["pending"] == 0
     finally:
@@ -2464,12 +2468,12 @@ async def test_disconnect会清理queued_reaction(monkeypatch):
     )
     adapter._schedule_queued_reaction("888", message)
     await asyncio.sleep(0.05)
-    assert calls == [("1012", "9203", True)]
+    assert calls == [("1012", "128064", True)]
     await adapter.disconnect()
     await asyncio.sleep(0.05)
     assert calls == [
-        ("1012", "9203", True),
-        ("1012", "9203", False),
+        ("1012", "128064", True),
+        ("1012", "128064", False),
     ]
     assert not adapter._queued_reaction_message_ids
     assert not adapter._queued_reaction_tasks
@@ -3453,6 +3457,273 @@ async def test_completion后普通消息进入engaged_debounce(monkeypatch):
         assert state.mode == "debounce"
         assert state.debounce_due is not None
         assert adapter._queue.status("888")["pending"] == 1
+    finally:
+        await adapter.disconnect()
+
+
+async def test_completion后短确认词followup创建engaged_ack_trigger(monkeypatch):
+    """turn 期间入队的短确认词在成功收口后直接创建 engaged_ack trigger。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "groups": ["888"],
+                },
+            },
+        )
+    )
+    adapter._processing_reaction_enabled = False
+    first = adapter_module.QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="complete-ack-1",
+        user_id="123",
+        user_name="成员",
+        text="原始触发",
+        metadata={
+            "onebot11_authority": {
+                "role": "user",
+                "allowed_tools": sorted(adapter.role_tools["user"]),
+                "self_id": "1",
+            }
+        },
+        message_key="group:complete-ack-1",
+    )
+    adapter._queue.enqueue(
+        first,
+        adapter_module.TriggerRequest.create(
+            "888",
+            "group:complete-ack-1",
+            "mention",
+            "123",
+            "成员",
+            authority_role="user",
+            authority_tools=adapter.role_tools["user"],
+            authority_self_id="1",
+        ),
+    )
+
+    async def fake_handle_message(_adapter, _event) -> None:
+        return None
+
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", fake_handle_message)
+    original_complete = adapter._dispatcher.complete
+
+    async def complete_after_ack(
+        lease_id: str,
+        *,
+        outcome: str,
+        unknown: bool,
+        **kwargs,
+    ) -> bool:
+        ack_message = adapter_module.QueueMessage(
+            chat_id="888",
+            chat_type="group",
+            message_id="complete-ack-2",
+            user_id="123",
+            user_name="成员",
+            text="可以",
+            metadata={
+                "onebot11_authority": {
+                    "role": "user",
+                    "allowed_tools": sorted(adapter.role_tools["user"]),
+                    "self_id": "1",
+                }
+            },
+            message_key="group:complete-ack-2",
+        )
+        await adapter._enqueue_group_message(
+            ack_message,
+            mentioned_self=False,
+            caller=adapter_module.CallerContext(
+                user_id="123",
+                chat_type="group",
+                chat_id="888",
+                role="user",
+                allowed_tools=adapter_module.READ_ONLY_TOOLS,
+                self_id="1",
+            ),
+            user_name="成员",
+        )
+        return await original_complete(
+            lease_id,
+            outcome=outcome,
+            unknown=unknown,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(adapter._dispatcher, "complete", complete_after_ack)
+    try:
+        assert await adapter._dispatcher.notify("888")
+        active = adapter._dispatcher.active("888")
+        assert active is not None
+        first_lease = active.lease.lease_id
+        adapter._outbound_started.add(first_lease)
+        adapter._outbound_successful.add(first_lease)
+        await adapter._finish_queue_turn(
+            SimpleNamespace(
+                metadata={
+                    "onebot11_lease_id": first_lease,
+                    "onebot11_lease_revision": active.lease.revision,
+                    "onebot11_target": {"chat_type": "group", "chat_id": "888"},
+                },
+                media_urls=[],
+            ),
+            ProcessingOutcome.SUCCESS,
+        )
+        # followup 的 engaged_ack trigger 应立即被 dispatcher 接管为新 lease。
+        second_active = adapter._dispatcher.active("888")
+        assert second_active is not None
+        assert second_active.lease.lease_id != first_lease
+        status = adapter._queue.status("888")
+        assert int(status.get("leased", 0)) == 1
+        assert int(status.get("pending", 0)) == 0
+    finally:
+        await adapter.disconnect()
+
+
+async def test_debounce中短确认词创建trigger不调用selector(monkeypatch):
+    """候选等待（debounce）期间活跃窗口内的短确认词直接创建 trigger。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "groups": ["888"],
+                },
+            },
+        )
+    )
+    adapter._processing_reaction_enabled = False
+
+    class FakeClient:
+        async def complete(self, prompt: str, timeout_seconds: float = 10):
+            pytest.fail("debounce 中的短确认词不应调用 pi-ai selector")
+
+    monkeypatch.setattr(
+        adapter,
+        "_pi_ai_trigger_client",
+        lambda: FakeClient(),
+    )
+    notifications: list[str] = []
+
+    async def fake_notify(chat_id: str) -> bool:
+        notifications.append(str(chat_id))
+        return True
+
+    monkeypatch.setattr(adapter._dispatcher, "notify", fake_notify)
+    state = adapter._trigger_state_for("888")
+    state.on_turn_complete(success=True, now=time.monotonic())
+    state.last_message_at = time.monotonic() - 1
+    candidate = adapter_module.QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="debounce-ack-1",
+        user_id="123",
+        user_name="小明",
+        text="这个问题怎么处理？",
+        message_key="group:debounce-ack-1",
+    )
+    caller = adapter_module.CallerContext(
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+        role="user",
+        allowed_tools=adapter_module.READ_ONLY_TOOLS,
+        self_id="1",
+    )
+    try:
+        await adapter._enqueue_group_message(
+            candidate,
+            mentioned_self=False,
+            caller=caller,
+            user_name="小明",
+        )
+        assert adapter._trigger_states["888"].mode == "debounce"
+        ack = adapter_module.QueueMessage(
+            chat_id="888",
+            chat_type="group",
+            message_id="debounce-ack-2",
+            user_id="123",
+            user_name="小明",
+            text="可以",
+            message_key="group:debounce-ack-2",
+        )
+        await adapter._enqueue_group_message(
+            ack,
+            mentioned_self=False,
+            caller=caller,
+            user_name="小明",
+        )
+        status = adapter._queue.status("888")
+        assert status["pending_trigger_requests"] == 1
+        requests = adapter._queue.recover_trigger_requests(["888"])
+        assert len(requests) == 1
+        assert requests[0].reason == "engaged_ack"
+        assert requests[0].message_key == "group:debounce-ack-2"
+        assert notifications == ["888"]
+    finally:
+        await adapter.disconnect()
+
+
+async def test_第一条候选消息立即进入判断(monkeypatch):
+    """自适应 debounce：本群第一条候选消息不等待固定窗口，立即判断。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "groups": ["888"],
+                },
+            },
+        )
+    )
+    adapter._processing_reaction_enabled = False
+    candidate = adapter_module.QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="instant-judge-1",
+        user_id="123",
+        user_name="小明",
+        text="这个问题怎么处理？",
+        message_key="group:instant-judge-1",
+    )
+    caller = adapter_module.CallerContext(
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+        role="user",
+        allowed_tools=adapter_module.READ_ONLY_TOOLS,
+        self_id="1",
+    )
+    try:
+        await adapter._enqueue_group_message(
+            candidate,
+            mentioned_self=False,
+            caller=caller,
+            user_name="小明",
+        )
+        now = time.monotonic()
+        state = adapter._trigger_states["888"]
+        assert state.mode == "judging" or (
+            state.debounce_due is not None and state.debounce_due - now < 0.5
+        )
     finally:
         await adapter.disconnect()
 

@@ -105,6 +105,7 @@ class LayeredTriggerState:
     llm_failures: int = 0
     last_candidate_type: str = ""
     dirty_revision: int | None = None
+    last_message_at: float | None = None
     _candidate_type: str = field(default="", repr=False)
     _judgement_generation: int = field(default=0, repr=False)
 
@@ -120,6 +121,11 @@ class LayeredTriggerState:
         last_trigger_at: float | None = None,
     ) -> TriggerAction:
         """观察一条已入队消息，返回直接触发或安排仲裁的动作。"""
+        # 记录本群消息间隔，用于自适应节流：距上一条消息超过 debounce
+        # 窗口视为群不活跃，候选立即判断；窗口内视为活跃，合并节流。
+        previous_at = self.last_message_at
+        self.last_message_at = now
+        gap = now - previous_at if previous_at is not None else None
         hard = should_trigger(
             chat_type=chat_type,
             text=text,
@@ -149,7 +155,7 @@ class LayeredTriggerState:
             elif self.arbitration_count >= self.config.engaged_max_arbitrations:
                 return TriggerAction("none", reason="arbitration_limit")
             else:
-                return self._schedule("engaged", revision, now)
+                return self._schedule("engaged", revision, now, gap=gap)
 
         if self.mode == "waiting":
             if self.direct_acknowledgement_allowed(text, now=now):
@@ -157,15 +163,20 @@ class LayeredTriggerState:
                 return TriggerAction("direct", reason="engaged_ack")
             if self.arbitration_count >= self.config.engaged_max_arbitrations:
                 return TriggerAction("none", reason="arbitration_limit")
-            return self._schedule("wait_followup", revision, now)
+            return self._schedule("wait_followup", revision, now, gap=gap)
 
         if self.mode == "debounce":
-            return self._schedule(self._candidate_type or "candidate", revision, now)
+            if self.direct_acknowledgement_allowed(text, now=now):
+                self._clear_pending_judgement()
+                return TriggerAction("direct", reason="engaged_ack")
+            return self._schedule(
+                self._candidate_type or "candidate", revision, now, gap=gap
+            )
 
         candidate_type = self._candidate_type_for(text, has_context)
         if not candidate_type:
             return TriggerAction("none", reason="non_candidate")
-        return self._schedule(candidate_type, revision, now)
+        return self._schedule(candidate_type, revision, now, gap=gap)
 
     def on_timer(self, *, now: float) -> TriggerAction:
         """处理 debounce、wait 和 engaged 的到期事件。"""
@@ -271,10 +282,16 @@ class LayeredTriggerState:
         self.llm_failures += 1
         if self.mode in {"judging", "debounce"}:
             if self.mode == "judging" and self.dirty_revision is not None and current_revision >= self.dirty_revision:
+                failure_gap = (
+                    now - self.last_message_at
+                    if self.last_message_at is not None
+                    else None
+                )
                 return self._schedule(
                     self._candidate_type or "candidate",
                     current_revision,
                     now,
+                    gap=failure_gap,
                 )
             self._return_to_engaged_or_idle(now)
             self.debounce_due = None
@@ -307,7 +324,9 @@ class LayeredTriggerState:
         """判断短确认词是否仍处于有效的连续对话窗口。"""
         if not is_engaged_acknowledgement(text):
             return False
-        if self.mode not in {"engaged", "waiting"}:
+        # debounce 表示候选正在等待判断；活跃窗口内到达的短确认词仍应
+        # 直接触发，而不是继续消耗 selector。
+        if self.mode not in {"engaged", "waiting", "debounce"}:
             return False
         return bool(
             self.engaged_until is not None
@@ -397,10 +416,21 @@ class LayeredTriggerState:
             return "memory"
         return ""
 
-    def _schedule(self, candidate_type: str, revision: int, now: float) -> TriggerAction:
-        """安排或重置 trailing debounce，不创建 lease。"""
+    def _schedule(
+        self,
+        candidate_type: str,
+        revision: int,
+        now: float,
+        *,
+        gap: float | None = None,
+    ) -> TriggerAction:
+        """安排或重置 trailing debounce；群不活跃时立即判断，不创建 lease。"""
+        if gap is None:
+            wait = 0.0  # 本群第一条消息：视为不活跃，立即进入判断
+        else:
+            wait = max(0.0, self.config.debounce_seconds - gap)
         self.mode = "debounce"
-        self.debounce_due = now + self.config.debounce_seconds
+        self.debounce_due = now + wait
         self.wait_until = None
         self._candidate_type = candidate_type
         self.last_candidate_type = candidate_type
