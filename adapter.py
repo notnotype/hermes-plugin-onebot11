@@ -412,6 +412,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._trigger_timer_tasks: dict[str, asyncio.Task[None]] = {}
         self._trigger_state_locks: dict[str, asyncio.Lock] = {}
         self._trigger_states: dict[str, LayeredTriggerState] = {}
+        self._selector_gave_up_chats: set[str] = set()
         self._llm_trigger_semaphore: asyncio.Semaphore | None = None
         self._llm_trigger_loop: asyncio.AbstractEventLoop | None = None
         self._channel_prompt_supported: bool | None = None
@@ -2365,6 +2366,58 @@ class OneBot11Adapter(BasePlatformAdapter):
             return "hard_trigger_already_pending"
         return None
 
+    async def _selector_give_up(
+        self,
+        chat_id: str,
+        *,
+        status: Mapping[str, Any],
+        candidate_type: str,
+        revision: int | None,
+        generation: int | None = None,
+    ) -> bool:
+        """selector 连续失败达到上限后放弃自动重试；返回是否应停止判断。
+
+        消息保留 pending，清理 👀 并审计一次；下一次新消息入队会重置
+        SQLite 失败计数，从而重新允许判断。
+        """
+        normalized = str(chat_id)
+        llm_failures = int(status.get("llm_failure_count", 0) or 0)
+        if llm_failures < self.trigger_config.llm_max_failures:
+            self._selector_gave_up_chats.discard(normalized)
+            return False
+        if normalized in self._selector_gave_up_chats:
+            return True
+        self._selector_gave_up_chats.add(normalized)
+        state = self._trigger_states.get(normalized)
+        if state is not None:
+            # 不能走 on_llm_failure：dirty_revision 存在时会重新安排判断，
+            # 违背 give_up 语义。直接失效 pending judgement 并保留 engaged
+            # 窗口本身。
+            state.invalidate_judgement()
+        self._schedule_clear_queued_reaction(normalized)
+        self._audit.record(
+            "llm_trigger",
+            {
+                "chat_id": normalized,
+                "candidate_type": candidate_type or "candidate",
+                "candidate_message_key": None,
+                "candidate_seq": None,
+                "queue_revision": int(revision or 0),
+                "pending": int(status.get("pending", 0)),
+                "input_bytes": 0,
+                "decision": "ignore",
+                "anchor_seq": None,
+                "duration_ms": 0,
+                "failure": "give_up",
+                "llm_failure_count": llm_failures,
+                "provider": self.trigger_config.llm_provider,
+                "model": self.trigger_config.llm_model,
+                "concurrency_waited": False,
+                "concurrency_wait_ms": 0,
+            },
+        )
+        return True
+
     def _schedule_trigger_timer(self, chat_id: str) -> None:
         """为一个群保留唯一 timer，负责 debounce、wait 和 engaged 到期。"""
         if self._closed or not self.trigger_config.llm_enabled:
@@ -2450,6 +2503,13 @@ class OneBot11Adapter(BasePlatformAdapter):
                 state.invalidate_judgement()
             return
         if action.kind == "schedule":
+            if await self._selector_give_up(
+                normalized,
+                status=status,
+                candidate_type=action.candidate_type,
+                revision=action.revision,
+            ):
+                return
             next_attempt_at = status.get("llm_next_attempt_at")
             if (
                 next_attempt_at is not None
@@ -2533,6 +2593,14 @@ class OneBot11Adapter(BasePlatformAdapter):
                 if state is not None:
                     block_reason = self._selector_block_reason(status)
                     state.pause() if block_reason == "paused" else state.invalidate_judgement()
+                return
+            if await self._selector_give_up(
+                normalized,
+                status=status,
+                candidate_type=action.candidate_type,
+                revision=action.revision,
+                generation=action.generation,
+            ):
                 return
             next_attempt_at = status.get("llm_next_attempt_at")
             if (
@@ -2906,9 +2974,19 @@ class OneBot11Adapter(BasePlatformAdapter):
                             due_at,
                         )
                         self._schedule_trigger_timer(normalized)
+                        self._schedule_queued_reaction(
+                            normalized,
+                            eligible_messages[-1],
+                        )
                     else:
                         await self._apply_trigger_action_locked(normalized, action)
-                    self._schedule_queued_reaction(normalized, eligible_messages[-1])
+                        # give_up 会把状态机恢复为 idle，此时不能再给候选添加
+                        # 👀，否则刚清理的 reaction 会被重新挂上。
+                        if state.mode == "debounce":
+                            self._schedule_queued_reaction(
+                                normalized,
+                                eligible_messages[-1],
+                            )
         if should_notify:
             await self._dispatcher.notify(normalized)
         return should_notify
@@ -3768,6 +3846,26 @@ class OneBot11Adapter(BasePlatformAdapter):
                 message_id,
                 exc,
             )
+            # 移除失败（例如 LLBot 瞬时错误）会留下远端 👀；短延迟后
+            # 重试一次，仍失败则记录并放弃，不阻塞队列或 Agent 状态。
+            if not (self._closed and not allow_shutdown):
+                await asyncio.sleep(2.0)
+                try:
+                    async with self._outbound_gate:
+                        if self._closed and not allow_shutdown:
+                            return
+                        await self._api.set_message_emoji_like(
+                            message_id,
+                            _QUEUED_REACTION_EMOJI_ID,
+                            enabled=False,
+                        )
+                except (OneBotApiError, OSError, ValueError) as retry_exc:
+                    logger.warning(
+                        "OneBot11 queued reaction 重试移除仍失败: chat=%s message=%s error=%s",
+                        normalized,
+                        message_id,
+                        retry_exc,
+                    )
         finally:
             if self._queued_reaction_message_ids.get(normalized) == entry:
                 self._queued_reaction_message_ids.pop(normalized, None)
@@ -6219,6 +6317,9 @@ class OneBot11Adapter(BasePlatformAdapter):
                         if value is not None
                         else None
                     )
+                trigger_snapshot["llm_max_failures"] = (
+                    self.trigger_config.llm_max_failures
+                )
                 status["trigger"] = trigger_snapshot
                 status["operations"] = [
                     self._queue.operation_summary(record)

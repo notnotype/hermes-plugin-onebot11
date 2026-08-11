@@ -1337,3 +1337,32 @@ def test_reset_conversation只清理命令前消息(tmp_path):
     assert [message.message_id for message in store.peek("888")] == ["reset-new"]
     assert store.status("888")["pending_trigger_requests"] == 1
     store.close()
+
+
+def test_enqueue重置selector失败计数(tmp_path):
+    """新消息是 selector give_up 后的显式唤醒信号，重置失败计数和退避。"""
+    store = QueueStore(tmp_path / "queue-llm-reset.sqlite3")
+    first = _message("llm-first")
+    store.enqueue(first, _trigger(first))
+    store.mark_llm_failure(
+        "888",
+        observed_seq=1,
+        error="timeout",
+        next_attempt_at=9999999999.0,
+    )
+    store.mark_llm_failure(
+        "888",
+        observed_seq=1,
+        error="timeout",
+        next_attempt_at=9999999999.0,
+    )
+    assert store.status("888")["llm_failure_count"] == 2
+    assert store.status("888")["llm_next_attempt_at"] is not None
+
+    second = _message("llm-second")
+    store.enqueue(second, _trigger(second))
+
+    status = store.status("888")
+    assert status["llm_failure_count"] == 0
+    assert status["llm_next_attempt_at"] is None
+    store.close()

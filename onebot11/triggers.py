@@ -47,9 +47,10 @@ class TriggerConfig:
     llm_model: str = ""
     llm_base_url: str = ""
     llm_api_key_env: str = ""
-    llm_timeout_seconds: float = 10.0
+    llm_timeout_seconds: float = 30.0
     llm_input_bytes: int = 12_000
     llm_concurrency: int = 2
+    llm_max_failures: int = 3
     llm_allowed_groups: frozenset[str] = frozenset()
     question_enabled: bool = True
     memory_enabled: bool = True
@@ -570,6 +571,18 @@ QUESTION_WORDS = (
     "可以吗",
     "请问",
     "帮我",
+    "几",
+    "多少",
+    "啥",
+    "谁",
+    "哪",
+    "是不是",
+    "能否",
+    "要不要",
+    "行不行",
+    "多久",
+    "几点",
+    "什么时候",
 )
 ENGLISH_QUESTION_RE = re.compile(
     r"\b(?:who|what|when|where|why|how|can|could|would|should|do|does|did|is|are|will)\b",
@@ -700,15 +713,21 @@ def build_trigger_config(extra: dict[str, Any]) -> TriggerConfig:
         _setting(extra, raw_llm, "llm_trigger_groups", raw_llm.get("groups"))
     )
     timeout = _bounded_float(
-        _setting(extra, raw_llm, "llm_trigger_timeout_seconds", raw_llm.get("timeout", 10)),
+        _setting(extra, raw_llm, "llm_trigger_timeout_seconds", raw_llm.get("timeout", 30)),
         name="llm_trigger_timeout_seconds",
         minimum=0.1,
         maximum=300.0,
     )
+    max_failures = _bounded_int(
+        _setting(extra, raw_llm, "llm_trigger_max_failures", raw_llm.get("max_failures", 3)),
+        name="llm_trigger_max_failures",
+        minimum=0,
+        maximum=32,
+    )
     input_bytes = _bounded_int(
         _setting(extra, raw_llm, "llm_trigger_input_bytes", raw_llm.get("input_bytes", 12_000)),
         name="llm_trigger_input_bytes",
-        minimum=512,
+        minimum=768,
         maximum=64_000,
     )
     concurrency = _bounded_int(
@@ -772,6 +791,7 @@ def build_trigger_config(extra: dict[str, Any]) -> TriggerConfig:
         llm_timeout_seconds=timeout,
         llm_input_bytes=input_bytes,
         llm_concurrency=concurrency,
+        llm_max_failures=max_failures,
         llm_allowed_groups=allowed_groups,
         question_enabled=question_enabled,
         memory_enabled=memory_enabled,
@@ -796,6 +816,7 @@ def build_llm_trigger_input(
     contract = "\n".join(
         (
             f"判断当前 OneBot11 群消息是否需要回复；候选类型：{candidate_type}。",
+            "规则：最新消息含问号或疑问词（什么/怎么/为什么/几/多少/谁/哪/啥/吗/呢）必须 trigger；无关闲聊才 ignore。",
             "只输出严格 JSON；trigger 只能选择当前队列中真实的 seq 作为 authority。",
             '{"decision":"trigger","anchor_seq":123}',
             '{"decision":"wait","anchor_seq":null}',
