@@ -127,9 +127,10 @@ platforms:
         base_url: ""
         api_key_env: OPENCODE_GO_API_KEY
         groups: []
-        timeout: 10
+        timeout: 30
         input_bytes: 12000
         concurrency: 2
+        max_failures: 3
         trigger_debounce_seconds: 5
         engaged_idle_seconds: 60
         engaged_max_seconds: 300

@@ -1031,12 +1031,13 @@ class QueueStore:
                     (next_seq + 1, now, message.chat_id),
                 )
                 # 新消息是 selector 失败后的显式唤醒信号；清除持久退避，
-                # 让当前群可以在本地 debounce 后重新判断，而不是等旧退避结束。
+                # 并重置失败计数，让当前群可以在本地 debounce 后重新判断，
+                # 而不是等旧退避结束或停留在 give_up 状态。
                 self._conn.execute(
                     """
                     UPDATE onebot_queue_chat
-                    SET llm_next_attempt_at=NULL, updated_at=?
-                    WHERE chat_id=? AND llm_next_attempt_at IS NOT NULL
+                    SET llm_next_attempt_at=NULL, llm_failure_count=0, updated_at=?
+                    WHERE chat_id=?
                     """,
                     (now, str(message.chat_id)),
                 )

@@ -130,6 +130,52 @@ def test_触发数值配置越界或非有限值必须拒绝():
             build_trigger_config(extra)
 
 
+def test_llm触发默认超时30秒且失败上限3次():
+    """selector 必须给慢模型留足超时，并在连续失败后停止自动重试。"""
+    config = build_trigger_config(
+        {"llm_trigger": {"enabled": True, "provider": "p", "model": "m"}}
+    )
+    assert config.llm_timeout_seconds == 30.0
+    assert config.llm_max_failures == 3
+
+
+def test_llm触发失败上限可配置且拒绝越界():
+    """max_failures 使用严格整数解析，拒绝布尔和越界值。"""
+    config = build_trigger_config(
+        {
+            "llm_trigger": {
+                "enabled": True,
+                "provider": "p",
+                "model": "m",
+                "max_failures": 5,
+            }
+        }
+    )
+    assert config.llm_max_failures == 5
+    with pytest.raises(ValueError):
+        build_trigger_config(
+            {
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "p",
+                    "model": "m",
+                    "max_failures": True,
+                }
+            }
+        )
+    with pytest.raises(ValueError):
+        build_trigger_config(
+            {
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "p",
+                    "model": "m",
+                    "max_failures": 99,
+                }
+            }
+        )
+
+
 def test_分层状态机只让候选消息进入仲裁():
     """普通闲聊不消耗旁路 LLM，问句和有上下文回指才安排 debounce。"""
     config = TriggerConfig(debounce_seconds=5)
@@ -694,7 +740,57 @@ def test_llm输入预算足够时保留完整JSON合同并裁剪最新正文():
         text="最新问题？" + ("很长" * 1000),
         seq=2,
     )
-    prompt = build_llm_trigger_input("", (message,), max_bytes=512)
-    assert len(prompt.encode("utf-8")) <= 512
+    # 预算需同时容纳触发规则 + 严格 JSON 合同 + 最新消息开头；512 是最低
+    # 配置值，正常配置预算取 768 以保留足够的最新正文预算。
+    prompt = build_llm_trigger_input("", (message,), max_bytes=768)
+    assert len(prompt.encode("utf-8")) <= 768
     assert '{"decision":"trigger","anchor_seq":123}' in prompt
     assert "最新问题？" in prompt
+
+
+def test_is_question词表覆盖常见中文问句():
+    """无问号问句也必须被本地启发式识别，避免 idle 状态漏唤醒。"""
+    assert is_question("今天星期几")
+    assert is_question("今天星期几啊")
+    assert is_question("为什么不回我？")
+    assert is_question("怎么这么拉")
+    assert is_question("现在几点了")
+    assert is_question("这个多少钱")
+    assert is_question("你是谁")
+    assert is_question("晚上要吃啥")
+    assert is_question("你吃饭了吗")
+    assert is_question("什么时候出发")
+    assert is_question("是不是该走了")
+    assert is_question("你能不能帮我")
+
+
+def test_is_question不误报非提问消息():
+    """闲聊、嘲讽和短确认词不应被识别成问句。"""
+    assert not is_question("你就是歌姬吧，所以它不回你")
+    assert not is_question("可以")
+    assert not is_question("好的")
+    assert not is_question("哈哈哈哈")
+    assert not is_question("今天天气不错")
+
+
+def test_selector提示词包含问句触发规则():
+    """合同必须显式说明问句触发规则，避免低价模型把无问号问句判成 ignore。"""
+    prompt = build_llm_trigger_input(
+        "",
+        (
+            QueueMessage(
+                chat_id="888",
+                chat_type="group",
+                message_id="1",
+                user_id="2",
+                user_name="用户",
+                text="今天星期几",
+                seq=1,
+            ),
+        ),
+        max_bytes=12_000,
+        candidate_type="question",
+    )
+    assert "必须 trigger" in prompt
+    assert "无关闲聊" in prompt
+    assert '{"decision":"trigger","anchor_seq":123}' in prompt

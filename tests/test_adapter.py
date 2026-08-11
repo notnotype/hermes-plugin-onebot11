@@ -5869,3 +5869,134 @@ def test_register缺少任一关键hook时拒绝启用(monkeypatch):
         )
         with pytest.raises(RuntimeError, match=missing):
             register(FakeCtx())
+
+
+async def test_selector连续失败达到上限后放弃自动重试(monkeypatch):
+    """llm_failure_count 达到上限后不再启动 judge task，清理 👀 并审计。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "groups": ["888"],
+                    "max_failures": 3,
+                },
+            },
+        )
+    )
+    calls: list[tuple[str, str, bool]] = []
+
+    async def fake_reaction(message_id: str, emoji_id: str, *, enabled: bool) -> None:
+        calls.append((message_id, emoji_id, enabled))
+
+    monkeypatch.setattr(adapter._api, "set_message_emoji_like", fake_reaction)
+    audit_records: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        adapter._audit,
+        "record",
+        lambda event, data: audit_records.append((event, data)),
+    )
+    try:
+        # 先登记一条候选消息，让 give_up 有可清理的 queued reaction。
+        message = QueueMessage(
+            chat_id="888",
+            chat_type="group",
+            message_id="1007",
+            user_id="123",
+            user_name="小明",
+            text="今天星期几",
+            message_key="group:1007",
+        )
+        caller = adapter_module.CallerContext(
+            user_id="123",
+            chat_type="group",
+            chat_id="888",
+            role="user",
+            allowed_tools=adapter_module.READ_ONLY_TOOLS,
+            self_id="1",
+        )
+        adapter._trigger_state_for("888").last_message_at = time.monotonic() - 1
+        await adapter._enqueue_group_message(
+            message,
+            mentioned_self=False,
+            caller=caller,
+            user_name="小明",
+        )
+        await asyncio.sleep(0.05)
+        # 连续 3 次失败达到上限（不经过 judge task，直接写持久状态）。
+        for _ in range(3):
+            await asyncio.to_thread(
+                adapter._queue.mark_llm_failure,
+                "888",
+                observed_seq=1,
+                error="timeout",
+                next_attempt_at=time.time() + 60,
+            )
+        state = adapter._trigger_states["888"]
+        state.mode = "judging"
+        state._judgement_generation = 1
+        action = adapter_module.TriggerAction(
+            "judge",
+            reason="debounce_due",
+            candidate_type="question",
+            revision=1,
+            generation=1,
+        )
+        await adapter._start_llm_judgement("888", action)
+        # 不再创建 judge task，也不再消耗模型。
+        assert "888" not in adapter._llm_trigger_tasks
+        assert any(
+            event == "llm_trigger" and data.get("failure") == "give_up"
+            for event, data in audit_records
+        )
+        # 👀 不残留：即使候选添加被抢先执行，最后也必须是移除调用。
+        await asyncio.sleep(0.1)
+        assert calls == [] or calls[-1] == ("1007", "128064", False)
+        # 消息保留 pending，不被 give_up 删除。
+        assert adapter._queue.status("888")["pending"] == 1
+    finally:
+        await adapter.disconnect()
+
+
+async def test_selector_queued_reaction_移除失败重试一次(monkeypatch):
+    """queued reaction 移除失败后短延迟重试一次，仍失败则放弃。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "groups": ["888"],
+                },
+            },
+        )
+    )
+    attempts: list[bool] = []
+
+    async def flaky_reaction(message_id: str, emoji_id: str, *, enabled: bool) -> None:
+        attempts.append(enabled)
+        if len(attempts) == 1:
+            raise adapter_module.OneBotApiError(
+                action="set_msg_emoji_like",
+                status="failed",
+                retcode=-1,
+            )
+
+    monkeypatch.setattr(adapter._api, "set_message_emoji_like", flaky_reaction)
+    try:
+        adapter._queued_reaction_message_ids["888"] = ("group:1008", "1008")
+        await adapter._unset_queued_reaction_entry("888", ("group:1008", "1008"))
+        # 第一次失败 + 2 秒后重试成功，共两次移除调用。
+        assert attempts == [False, False]
+        assert "888" not in adapter._queued_reaction_message_ids
+    finally:
+        await adapter.disconnect()
