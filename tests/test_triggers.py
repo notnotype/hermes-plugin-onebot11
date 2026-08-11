@@ -460,8 +460,8 @@ def test_完成时保留新消息建立的debounce状态():
     assert state.debounce_due == due_at
 
 
-def test_engaged短确认词直接触发且不消耗selector():
-    """活跃对话中的短确认词不能再交给低价模型决定是否唤醒。"""
+def test_engaged短确认词统一交给selector判断():
+    """活跃对话中的短确认词没有特例，统一进入 selector 决定是否唤醒。"""
     state = LayeredTriggerState(TriggerConfig(debounce_seconds=5))
     state.on_turn_complete(success=True, now=0)
 
@@ -474,14 +474,14 @@ def test_engaged短确认词直接触发且不消耗selector():
         now=1,
     )
 
-    assert action.kind == "direct"
-    assert action.reason == "engaged_ack"
+    assert action.kind == "schedule"
+    assert action.candidate_type == "engaged"
     assert state.llm_calls == 0
-    assert state.mode == "idle"
+    assert state.mode == "debounce"
 
 
-def test_waiting短确认词直接触发但真实问句仍进入selector():
-    """selector 的等待状态也允许短确认词直达，但不能吞掉真正的问题。"""
+def test_waiting短确认词和真实问句都进入selector():
+    """selector 的等待状态对短确认词没有特例，一律交给 selector。"""
     state = LayeredTriggerState(TriggerConfig(debounce_seconds=5))
     state.on_turn_complete(success=True, now=0)
     state.mode = "waiting"
@@ -495,8 +495,8 @@ def test_waiting短确认词直接触发但真实问句仍进入selector():
         revision=1,
         now=1,
     )
-    assert acknowledgement.kind == "direct"
-    assert acknowledgement.reason == "engaged_ack"
+    assert acknowledgement.kind == "schedule"
+    assert acknowledgement.candidate_type == "wait_followup"
     assert state.llm_calls == 0
 
     state = LayeredTriggerState(TriggerConfig(debounce_seconds=5))
@@ -554,8 +554,8 @@ def test_judging中短确认词不打断当前selector判断():
     assert state.llm_calls == 0
 
 
-def test_debounce中短确认词直接触发():
-    """debounce（候选等待）中活跃窗口内的短确认词直接触发，不再消耗 selector。"""
+def test_debounce中短确认词继续累积debounce():
+    """debounce（候选等待）中活跃窗口内的短确认词继续合并等待，不打断判断。"""
     state = LayeredTriggerState(TriggerConfig(debounce_seconds=5))
     state.on_turn_complete(success=True, now=0)
     state.mode = "debounce"
@@ -570,8 +570,7 @@ def test_debounce中短确认词直接触发():
         now=3,
     )
 
-    assert action.kind == "direct"
-    assert action.reason == "engaged_ack"
+    assert action.kind == "schedule"
     assert state.llm_calls == 0
 
 
@@ -792,5 +791,56 @@ def test_selector提示词包含问句触发规则():
         candidate_type="question",
     )
     assert "必须 trigger" in prompt
-    assert "无关闲聊" in prompt
+    assert "与当前对话无关的闲聊" in prompt
     assert '{"decision":"trigger","anchor_seq":123}' in prompt
+
+
+def test_selector_engaged提示词默认ignore成员互动():
+    """engaged 候选必须明确要求只对机器人提问/延续对话才 trigger。"""
+    prompt = build_llm_trigger_input(
+        "",
+        (
+            QueueMessage(
+                chat_id="888",
+                chat_type="group",
+                message_id="1",
+                user_id="2",
+                user_name="用户",
+                text="快去配置",
+                seq=1,
+            ),
+        ),
+        max_bytes=12_000,
+        candidate_type="engaged",
+    )
+    assert "候选类型：engaged" in prompt
+    assert "明确向机器人提问" in prompt
+    assert "默认 ignore" in prompt
+
+
+def test_纯图片消息不进selector():
+    """没有文本的图片/媒体消息不能成为 LLM 候选，但 @ 硬触发仍生效。"""
+    state = LayeredTriggerState(TriggerConfig(debounce_seconds=5))
+    state.on_turn_complete(success=True, now=0)
+
+    action = state.observe_message(
+        chat_type="group",
+        text="",
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=1,
+    )
+    assert action.kind == "none"
+    assert action.reason == "no_text"
+
+    mentioned = state.observe_message(
+        chat_type="group",
+        text="",
+        mentioned_self=True,
+        has_context=True,
+        revision=2,
+        now=2,
+    )
+    assert mentioned.kind == "direct"
+    assert mentioned.reason == "mention"

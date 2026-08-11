@@ -124,6 +124,38 @@ def test_未知工具默认拒绝():
     assert validate_tool_call("qq_unknown", {}, ctx, set()) is not None
 
 
+def test_超级管理员默认拥有Hermes通用工具():
+    """super_admin 即使未在 tools 中列出 terminal 等通用工具也应放行。"""
+    ctx = CallerContext(
+        user_id="2056963663",
+        chat_type="dm",
+        chat_id="2056963663",
+        role="super_admin",
+        allowed_tools=frozenset({"qq_get_message"}),
+        self_id="3101482118",
+    )
+    assert validate_tool_call("terminal", {}, ctx) is None
+    assert validate_tool_call("read_file", {}, ctx) is None
+    assert validate_tool_call("skill_view", {}, ctx) is None
+    # OneBot 工具仍必须出现在角色的工具集合中。
+    assert validate_tool_call("qq_set_group_ban", {}, ctx) is not None
+    # FORBIDDEN 工具对超级管理员也始终拒绝。
+    assert validate_tool_call("delegate_task", {}, ctx) is not None
+
+
+def test_普通用户无权调用Hermes通用工具():
+    """user 角色未显式配置的通用工具必须拒绝，不能因为非 qq_ 前缀自动放行。"""
+    ctx = CallerContext(
+        user_id="123",
+        chat_type="dm",
+        chat_id="123",
+        role="user",
+        allowed_tools=frozenset({"qq_get_message"}),
+        self_id="3101482118",
+    )
+    assert validate_tool_call("terminal", {}, ctx) is not None
+
+
 def test_role_prompt展示完整角色工具目录并强调锚点授权():
     """模型可以了解各角色能力，但不能把目录当作实际授权来源。"""
     context = CallerContext(

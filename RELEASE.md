@@ -16,9 +16,11 @@
 
 Task 7 在当前 `0.6.0` 版本上补充媒体同轮去重、默认纯文本、控制面状态提示、运行时策略 reload、
 generic Hermes 工具硬门禁、持久 selector/cooldown、`/context` 旁路、lease/reaction 收口、
-活跃窗口短确认词直触发（`engaged_ack`）、turn 收口补触发、自适应 debounce、selector 候选 👀
-查看提示和 ⌛ 正在回复提示（`processing_reaction_emoji_id` 默认改为 `8971`，`9203` 不被 QQ
-reaction API 支持）。
+自适应 debounce、selector 候选 👀 查看提示和 💬 正在回复提示（`processing_reaction_emoji_id`
+默认 `128172`；`9203`/`8971` 在 QQ reaction API 上显示异常）。活跃窗口不再保留短确认词
+特例，engaged 内普通消息统一交给旁路 selector；selector prompt 按候选类型区分，
+engaged 默认 ignore 成员互动，纯图片消息不进 selector，单窗口仲裁上限为 2 次；
+`super_admin` 默认拥有全部 Hermes 通用工具。
 这些变更仍需通过分支 PR、合并后复审和指定白名单范围内的 Arch 验收，尚未构成新的发布版本。
 
 ## 升级与迁移

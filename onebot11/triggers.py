@@ -16,23 +16,6 @@ from typing import Any
 from .permissions import parse_bool, parse_id_list
 from .queue import QueueMessage
 
-_ENGAGED_ACKNOWLEDGEMENTS = frozenset(
-    {
-        "可以",
-        "好的",
-        "好",
-        "行",
-        "嗯",
-        "嗯嗯",
-        "明白",
-        "收到",
-        "继续",
-        "接着",
-        "对",
-        "是的",
-    }
-)
-
 
 @dataclass(frozen=True)
 class TriggerConfig:
@@ -65,7 +48,7 @@ class TriggerConfig:
     debounce_seconds: float = 5.0
     engaged_idle_seconds: float = 60.0
     engaged_max_seconds: float = 300.0
-    engaged_max_arbitrations: int = 3
+    engaged_max_arbitrations: int = 2
 
 
 @dataclass(frozen=True)
@@ -142,6 +125,10 @@ class LayeredTriggerState:
             return TriggerAction("direct", reason=hard.reason)
         if chat_type != "group":
             return TriggerAction("none", reason=hard.reason)
+        if not (text or "").strip():
+            # 纯图片/媒体消息没有可判断的文本，不进入 selector；@ 机器人的
+            # 硬触发已经在上面提前返回。
+            return TriggerAction("none", reason="no_text")
 
         if self.mode == "judging":
             self.dirty_revision = revision
@@ -150,26 +137,17 @@ class LayeredTriggerState:
         if self.mode == "engaged":
             if self.engaged_until is not None and now >= self.engaged_until:
                 self._leave_engaged()
-            elif self.direct_acknowledgement_allowed(text, now=now):
-                self._clear_pending_judgement()
-                return TriggerAction("direct", reason="engaged_ack")
             elif self.arbitration_count >= self.config.engaged_max_arbitrations:
                 return TriggerAction("none", reason="arbitration_limit")
             else:
                 return self._schedule("engaged", revision, now, gap=gap)
 
         if self.mode == "waiting":
-            if self.direct_acknowledgement_allowed(text, now=now):
-                self._clear_pending_judgement()
-                return TriggerAction("direct", reason="engaged_ack")
             if self.arbitration_count >= self.config.engaged_max_arbitrations:
                 return TriggerAction("none", reason="arbitration_limit")
             return self._schedule("wait_followup", revision, now, gap=gap)
 
         if self.mode == "debounce":
-            if self.direct_acknowledgement_allowed(text, now=now):
-                self._clear_pending_judgement()
-                return TriggerAction("direct", reason="engaged_ack")
             return self._schedule(
                 self._candidate_type or "candidate", revision, now, gap=gap
             )
@@ -319,21 +297,6 @@ class LayeredTriggerState:
             generation is not None
             and self.mode == "judging"
             and generation == self._judgement_generation
-        )
-
-    def direct_acknowledgement_allowed(self, text: str, *, now: float) -> bool:
-        """判断短确认词是否仍处于有效的连续对话窗口。"""
-        if not is_engaged_acknowledgement(text):
-            return False
-        # debounce 表示候选正在等待判断；活跃窗口内到达的短确认词仍应
-        # 直接触发，而不是继续消耗 selector。
-        if self.mode not in {"engaged", "waiting", "debounce"}:
-            return False
-        return bool(
-            self.engaged_until is not None
-            and self.engaged_until > now
-            and self.engaged_max_until is not None
-            and self.engaged_max_until > now
         )
 
     def invalidate_judgement(self) -> None:
@@ -489,13 +452,6 @@ class LayeredTriggerState:
             self.mode = "engaged"
         else:
             self._leave_engaged()
-
-
-def is_engaged_acknowledgement(text: str) -> bool:
-    """判断活跃窗口内是否是一条短确认词，而不是新的实际问题。"""
-    normalized = re.sub(r"\s+", "", str(text or "").casefold())
-    normalized = normalized.strip("。！？!?，,、；;：:~～…")
-    return normalized in _ENGAGED_ACKNOWLEDGEMENTS
 
 
 def _parse_keywords(value: Any) -> tuple[str, ...]:
@@ -755,7 +711,7 @@ def build_trigger_config(extra: dict[str, Any]) -> TriggerConfig:
         maximum=86_400.0,
     )
     engaged_arbitrations = _bounded_int(
-        _setting(extra, raw_llm, "engaged_max_arbitrations", 3),
+        _setting(extra, raw_llm, "engaged_max_arbitrations", 2),
         name="engaged_max_arbitrations",
         minimum=0,
         maximum=32,
@@ -813,10 +769,21 @@ def build_llm_trigger_input(
     max_bytes = max(1, int(max_bytes))
     queued = tuple(messages)
     latest = queued[-1] if queued else None
+    if candidate_type == "engaged":
+        rules = (
+            "只有群成员明确向机器人提问、请求帮助或明显延续与机器人的对话才 trigger；",
+            "群成员之间的互动、评论、调侃、@其他人、陈述句和纯图片消息默认 ignore。",
+        )
+    else:
+        rules = (
+            "最新消息含问号或疑问词（什么/怎么/为什么/几/多少/谁/哪/啥/吗/呢）必须 trigger；",
+            "明显与当前对话无关的闲聊才 ignore。",
+        )
     contract = "\n".join(
         (
             f"判断当前 OneBot11 群消息是否需要回复；候选类型：{candidate_type}。",
-            "规则：最新消息含问号或疑问词（什么/怎么/为什么/几/多少/谁/哪/啥/吗/呢）必须 trigger；无关闲聊才 ignore。",
+            "规则：" + rules[0],
+            rules[1],
             "只输出严格 JSON；trigger 只能选择当前队列中真实的 seq 作为 authority。",
             '{"decision":"trigger","anchor_seq":123}',
             '{"decision":"wait","anchor_seq":null}',

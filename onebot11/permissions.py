@@ -398,7 +398,10 @@ def role_prompt(
     role_catalog: Mapping[str, Any] | None = None,
 ) -> str:
     """生成注入 Hermes 的角色、工具目录和作用域提示。"""
-    tools = ", ".join(sorted(context.allowed_tools)) or "无"
+    if context.role == "super_admin":
+        tools = "全部工具（除 delegate_task、tool_search；OneBot 群管理写工具仍需确认）"
+    else:
+        tools = ", ".join(sorted(context.allowed_tools)) or "无"
     target = "群" if context.chat_type == "group" else "私聊"
     catalog_lines: list[str] = []
     if isinstance(role_catalog, Mapping):
@@ -485,7 +488,10 @@ def validate_tool_call(
     if normalized_tool_name in FORBIDDEN_TOOL_NAMES:
         return f"OneBot11 当前禁止调用 {normalized_tool_name}"
     if normalized_tool_name not in ctx.allowed_tools:
-        return f"角色 {ctx.role} 无权调用 {tool_name}"
+        # 超级管理员默认拥有 Hermes 通用工具（terminal、read_file 等由
+        # Hermes 自己执行）；OneBot 工具仍必须出现在角色的工具集合中。
+        if ctx.role != "super_admin" or normalized_tool_name.startswith("qq_"):
+            return f"角色 {ctx.role} 无权调用 {tool_name}"
     if normalized_tool_name.startswith("qq_") and normalized_tool_name not in ALL_TOOLS:
         return "未知 OneBot11 工具（权限系统 fail-closed）"
     if normalized_tool_name not in ALL_TOOLS:

@@ -18,7 +18,7 @@
 
 群消息即使没有 @、关键词或 `always` trigger，也会先写入 SQLite 队列；这保证触发时能拿到上次触发以来的上下文。没有 trigger 不会启动 Agent turn。
 
-群 turn 认领后，插件默认使用 LLBot 的 `set_msg_emoji_like` 扩展给触发消息添加 `emoji_id=8971`（⌛，表示正在回复这一条），Hermes turn 收尾时发送 `set=false` 移除。问句/记忆候选进入旁路 selector 判断时，先给候选消息添加 `emoji_id=128064`（👀，表示 bot 正在看这条消息），判断结束（触发、忽略、超时或 wait 到期）后移除；硬触发和短确认词直接触发时跳过 👀 直接使用 ⌛。两个指示器都只作用于当前群的真实消息 ID；内部 hash、私聊消息或 lease 已失效时跳过。reaction 是 best-effort UI 提示，失败或结果未知不会阻断 Agent 回复、队列 ack，也不会重放 `set=true`。清理记录持久化在队列 SQLite 中，启动恢复最多有限次数地尝试 `unset`；达到上限后只在状态/审计中保留，不会无限刷屏。进程硬崩溃遗留的远端 ⌛/👀 不纳入清理承诺。emoji ID 说明：`9203`（⏳）不被 QQ reaction API 支持（返回 failed），因此 ⌛ 使用实测可用的 `8971`。
+群 turn 认领后，插件默认使用 LLBot 的 `set_msg_emoji_like` 扩展给触发消息添加 `emoji_id=128172`（💬，表示正在回复这一条，可通过 `processing_reaction_emoji_id` 配置），Hermes turn 收尾时发送 `set=false` 移除。问句/记忆候选进入旁路 selector 判断时，先给候选消息添加 `emoji_id=128064`（👀，表示 bot 正在看这条消息），判断结束（触发、忽略、超时或 wait 到期）后移除。两个指示器都只作用于当前群的真实消息 ID；内部 hash、私聊消息或 lease 已失效时跳过。reaction 是 best-effort UI 提示，失败或结果未知不会阻断 Agent 回复、队列 ack，也不会重放 `set=true`。清理记录持久化在队列 SQLite 中，启动恢复最多有限次数地尝试 `unset`；达到上限后只在状态/审计中保留，不会无限刷屏。进程硬崩溃遗留的远端 💬/👀 不纳入清理承诺。emoji ID 说明：`9203`（⏳）与 `8971` 在 QQ reaction API 上显示异常，因此回复阶段默认使用实测可用的 `128172`（💬）。
 
 ## 角色与工具
 
@@ -44,6 +44,15 @@ platforms:
 
 `ONEBOT11_SUPER_ADMINS` 优先，`ONEBOT11_ADMINS` 仅作为兼容旧名。超级管理员为空时没有任何 OneBot 群管理写权限；普通用户默认只有只读工具。`roles.trusted_user.users` 只定义 trusted_user 身份；trusted_user 不能配置 OneBot 群管理写工具，但可以按工具名逐项配置 Hermes generic 工具（例如网页、浏览器、终端或文件能力）。它不能修改权限、白名单或角色配置。可配置的角色工具集合会取所有角色许可工具的并集注册到 Hermes，再由当前 turn 的角色门禁限制实际执行。
 
+默认权限（未显式配置 `tools` 时）：
+
+- `super_admin`：全部 OneBot 工具 + 全部 Hermes 通用工具（`delegate_task`、`tool_search` 始终禁止；OneBot 群管理写工具仍需当前群 + 确认令牌）。
+- `user`：五个只读 OneBot 工具。
+- `trusted_user`：五个只读 OneBot 工具；需要 Hermes 通用能力时必须在 `tools` 中逐项显式配置。
+
+权限不是 Agent 工具：没有 `set_role`/`set_tools` 之类的运行时权限修改工具，角色和白名单只通过
+`config.yaml`（或环境变量）修改文件并 reload/重启生效。拥有 shell 权限即拥有改权限文件的权限。
+
 `pre_llm_call` 会把 `user`、`trusted_user`、`super_admin` 的当前工具目录写进
 提示词，帮助模型理解角色差异；这只是 role catalog，不是授权来源。真正授权仍来自
 当前锚点的不可变 authority 快照、`(session_id, turn_id)` binding、lease、adapter
@@ -55,10 +64,11 @@ OneBot 权限传给 Hermes 子代理；Hermes 的 tool-search/子代理 turn 传
 
 网页搜索、浏览器自动化、终端、文件读写等 Hermes 通用工具在 OneBot turn 中也会
 进入插件的 `pre_tool_call` 角色硬门禁；普通用户不会因为工具名不是 `qq_*` 就自动获得
-权限。要开放这类高风险能力，应只在 `trusted_user` 或 `super_admin` 的 `tools` 中逐项
-配置。`execute_code` 一旦显式授予，代表高风险本机代码执行能力。该门禁依赖 Hermes
-传递精确 `(session_id, turn_id)`；tool-search、delegation 或子代理缺少 turn 身份时
-fail-closed，不伪造权限继承。
+权限。`super_admin` 默认拥有全部 Hermes 通用工具（`delegate_task`、`tool_search`
+始终禁止），相当于配置文件中直接授予 shell/文件等本机能力；`trusted_user` 或
+`user` 要开放这类高风险能力，只能在 `tools` 中逐项配置。`execute_code` 一旦授予，
+代表高风险本机代码执行能力。该门禁依赖 Hermes 传递精确 `(session_id, turn_id)`；
+tool-search、delegation 或子代理缺少 turn 身份时 fail-closed，不伪造权限继承。
 
 默认只读工具：
 

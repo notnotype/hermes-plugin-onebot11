@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- **阶段**：`feat/i22-active-reaction-redesign` 已完成代码收口，待 PR/Arch 验证。shared session、schema 12、TurnAnchor、权限、Agent 最终回复图片、插件自有 pi-ai helper、`/context` 旁路、群级 `/new`、`/reset`、`/clear` 公共命令桥接、活跃窗口短确认词直触发（含 turn 收口补触发）、自适应 debounce、selector 👀 等待提示和 ⌛ 正在回复提示已在本 worktree 成立；本分支尚未合并或部署 Arch。
+- **阶段**：master 已合并 Task 7 之前的全部功能并部署 Arch（`0.6.0 / schema 12`）。当前本地收口：移除活跃窗口短确认词特例（统一走 selector）、selector 按候选类型分 prompt（engaged 默认 ignore 成员互动）、纯图片消息不进 selector、仲裁上限 3→2、旁路模型默认改用 DeepSeek 官方 API（pi-ai 内置 provider，思考关闭）、回复阶段 reaction 改用 💬（`128172`）、`super_admin` 默认拥有全部 Hermes 通用工具（私聊/群聊均可使用 terminal、read_file 等）。
 - **核心合同**：群固定一个共享 session；群消息持久入队；每个真实 TurnAnchor 固定 batch 和 authority，同群按序单 lease follow-up；非幂等出站结果未知时进入 `uncertain`，不自动重放。
 - **本地验证**：协议/状态机测试通过；使用本地 Hermes 源码与其 site-packages 运行 adapter 测试通过。最终门禁命令和环境见“验证证据”。
 
@@ -18,18 +18,18 @@
 | `onebot11/http_api.py` | 完成 | 查询有限重试；发送/管理/reaction 写永不自动重试；有符号 message_id；超时、429/5xx、非 JSON、超大响应分类；媒体 SSRF/类型/大小限制；文本/图片 segment 出站 |
 | `onebot11/queue.py` | 完成 | SQLite WAL、schema 12 迁移、持久 cooldown/LLM judged cursor/失败退避、消息/TurnAnchor 去重、固定 batch lease、heartbeat、摘要、tombstone、uncertain 人工 resolve、reaction cleanup、reopen 和管理动作 operation ledger |
 | `onebot11/dispatch.py` | 完成 | 每群最多一个活动 turn，恢复触发请求和 cooldown 到期恢复；LLM selector 开启时由 adapter 策略回调接管，不绕过 anchor 选择；暂停/恢复、失败状态转换和 reconnect reset |
-| `onebot11/triggers.py` | 完成 | @、关键词、always、问句/记忆候选、自适应 debounce（消息间隔超过窗口立即判断，活跃时 trailing 节流）、60 秒活跃窗口、只选择真实 `anchor_seq` 的严格 selector，以及 engaged/waiting/debounce 窗口内短确认词（如“可以”“好的”“继续”）的确定性直触发（`engaged_ack`） |
-| `onebot11/permissions.py` | 完成 | `CallerContext`、`ChatTarget`、精确 `(session_id, turn_id)` binding、user/trusted_user/super_admin 角色、只读边界和 fail-closed |
+| `onebot11/triggers.py` | 完成 | @、关键词、always、问句/记忆候选、自适应 debounce（消息间隔超过窗口立即判断，活跃时 trailing 节流）、60 秒活跃窗口（每窗口最多 2 次仲裁）、只选择真实 `anchor_seq` 的严格 selector；无短确认词特例，engaged 内所有普通消息统一交给 selector；纯图片消息不进 selector；prompt 按候选类型区分（engaged 默认 ignore 成员互动） |
+| `onebot11/permissions.py` | 完成 | `CallerContext`、`ChatTarget`、精确 `(session_id, turn_id)` binding、user/trusted_user/super_admin 角色、只读边界和 fail-closed；`super_admin` 默认拥有全部 Hermes 通用工具（`delegate_task`/`tool_search` 始终禁止） |
 | `onebot11/media.py` | 完成 | 当前 turn 内按规范化来源和内容 hash 做防御性媒体去重，不跨 turn/重启承诺 exactly-once |
 | `onebot11/formatting.py` | 完成 | OneBot 默认纯文本转换、Markdown image marker 清理和不可用 renderer 审计 |
 | `onebot11/tools.py` | 完成 | 当前群/私聊范围查询和群管理写工具；写操作必须确认 |
-| `adapter.py` | 完成代码收口 | Hermes glue、shared session、入站访问策略、generic/OneBot 工具 hooks、群级 slash/context command、工具 handler、群 turn ⌛ 正在回复指示器、selector 候选 👀 查看提示（含候选替换/清理）、turn 收口时短确认词补触发、一次性长时间提示、Agent 最终回复的文本/图片出站生命周期、base64 segment、同轮媒体去重、纯文本、显式控制面消息、运行时 policy snapshot/reload、媒体回收、统一配置解析、raw self_id、消息身份/上下文注入、operation resolve、pi-ai selector，以及按 event metadata 恢复 worker/async 之间的精确 binding；通用 `send_message`/cron plugin media 不是本轮可靠性合同 |
+| `adapter.py` | 完成代码收口 | Hermes glue、shared session、入站访问策略、generic/OneBot 工具 hooks、群级 slash/context command、工具 handler、群 turn 💬 正在回复指示器（默认 `128172`，可配置）、selector 候选 👀 查看提示（含候选替换/清理）、一次性长时间提示、Agent 最终回复的文本/图片出站生命周期、base64 segment、同轮媒体去重、纯文本、显式控制面消息、运行时 policy snapshot/reload、媒体回收、统一配置解析、raw self_id、消息身份/上下文注入、operation resolve、pi-ai selector，以及按 event metadata 恢复 worker/async 之间的精确 binding；通用 `send_message`/cron plugin media 不是本轮可靠性合同 |
 | `onebot11/pi_ai.py` + `scripts/onebot11-pi-trigger.mjs` | 完成 | 零 Hermes 依赖的 Python/Node 短生命周期旁路客户端，固定 pi-ai 版本、环境变量密钥、无语义重试和失败分类 |
 | 文档/ADR | 完成 | README、权限、状态、Task 2/3/5/6/7 walkthrough、pi-ai、reconnect、operation ledger、TurnAnchor、session command 和验收边界同步到当前合同 |
 
 ## 验证证据
 
-- 在本 worktree 设置 `PYTHONPATH=C:\Users\notnotype\AppData\Local\hermes\hermes-agent;C:\Users\notnotype\AppData\Local\hermes\hermes-agent\venv\Lib\site-packages` 后，`pytest -q`：`340 passed, 1 skipped`。唯一 skip 是 `tests/test_pi_ai.py` 缺少 pi-ai npm 依赖；adapter 集成测试没有因缺少 gateway 跳过。新增覆盖：engaged/waiting 短确认词直触发、selector 候选 ⏳ 添加/清理、dirty revision 迁移、硬触发/pause/clear/disconnect 清理和失败路径保留 pending。
+- 在本 worktree 设置 `PYTHONPATH=C:\Users\notnotype\AppData\Local\hermes\hermes-agent;C:\Users\notnotype\AppData\Local\hermes\hermes-agent\venv\Lib\site-packages` 后，`pytest -q`：`359 passed, 1 skipped`（纯插件环境 `214 passed, 1 skipped`）。唯一 skip 是 `tests/test_pi_ai.py` 缺少 pi-ai npm 依赖；adapter 集成测试没有因缺少 gateway 跳过。新增覆盖：engaged 短确认词统一走 selector、selector 分类型 prompt、纯图片不进 selector、`super_admin` 通用工具放行、💬（128172）reaction 生命周期。
 - focused 验证覆盖：媒体 scope、纯文本/marker、GatewayConfig reload、role catalog、hook capability gate、控制面通知去重、审计失败 fail-closed、shared session、queue recovery、权限和图片出站。
 - `ruff check .`、`node --check scripts/onebot11-pi-trigger.mjs` 和 `git diff --check`：通过。
 - `scripts/verify_hermes_integration.py` 在临时 `HERMES_HOME` 下通过：先运行 `341 passed`，随后输出 `tools=9 hooks=5 pi_ai_trigger=True reconnect=True slash_commands=True`；`node --check scripts/onebot11-pi-trigger.mjs` 也通过。本地 Hermes 集成 smoke 和 Node helper 仍是独立验收证据，不能由本地 pytest 自动推断。

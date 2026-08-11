@@ -29,7 +29,7 @@ from .permissions import (
 )
 from .triggers import TriggerConfig, build_trigger_config
 
-_PROCESSING_REACTION_EMOJI_ID = "8971"
+_PROCESSING_REACTION_EMOJI_ID = "128172"  # LLBot 的 QQ Emoji「💬」ID，表示正在回复
 
 
 @dataclass(frozen=True)

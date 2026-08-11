@@ -111,7 +111,7 @@ FormattedText = _proto.formatting.FormattedText
 
 logger = logging.getLogger(__name__)
 _PLATFORM_NAME = "onebot11"
-_PROCESSING_REACTION_EMOJI_ID = "8971"  # LLBot 的 QQ Emoji「⌛」ID，表示正在回复
+_PROCESSING_REACTION_EMOJI_ID = "128172"  # LLBot 的 QQ Emoji「💬」ID，表示正在回复
 _QUEUED_REACTION_EMOJI_ID = "128064"  # LLBot 的 QQ Emoji「👀」ID，表示 selector 正在查看
 _REQUIRED_HERMES_HOOKS = frozenset(
     {"pre_gateway_dispatch", "pre_llm_call", "pre_tool_call"}
@@ -2149,28 +2149,19 @@ class OneBot11Adapter(BasePlatformAdapter):
                 last_trigger_at=previous_trigger_at,
                 now=now,
             )
-            state = self._trigger_states.get(chat_id)
-            engaged_ack = bool(
-                not decision.triggered
-                and self.trigger_config.llm_enabled
-                and chat_id in self.trigger_config.llm_allowed_groups
-                and not bool(before.get("paused"))
-                and state is not None
-                and state.direct_acknowledgement_allowed(message.text, now=now)
-            )
             trigger = (
                 TriggerRequest.create(
                     chat_id,
                     str(message.message_key),
-                    decision.reason if decision.triggered else "engaged_ack",
+                    decision.reason,
                     caller.user_id,
                     user_name or caller.user_id,
-                    anchor_kind="hard" if decision.triggered else "engaged_ack",
+                    anchor_kind="hard",
                     authority_role=caller.role,
                     authority_tools=caller.allowed_tools,
                     authority_self_id=caller.self_id,
                 )
-                if decision.triggered or engaged_ack
+                if decision.triggered
                 else None
             )
             try:
@@ -2190,7 +2181,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                 # 只在释放群触发锁后通知 dispatcher。通知可能认领 lease 并
                 # 启动完整 Hermes turn，不能和入队状态机嵌套在同一把锁里。
                 should_notify = bool(result.trigger_request_id)
-                if (decision.triggered or engaged_ack) and result.trigger_request_id:
+                if decision.triggered and result.trigger_request_id:
                     state = self._trigger_states.get(chat_id)
                     if state is not None:
                         state.invalidate_judgement()
@@ -2226,9 +2217,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                         if state is not None:
                             state.invalidate_judgement()
                             cancel_judgement = True
-                    if action.reason == "engaged_ack":
-                        cancel_judgement = True
-                    if decision.triggered or action.reason == "engaged_ack":
+                    if decision.triggered:
                         clear_queued_reaction = True
                     should_notify = True
 
@@ -4484,7 +4473,6 @@ class OneBot11Adapter(BasePlatformAdapter):
                 and self.trigger_config.llm_enabled
             ):
                 async with self._trigger_lock_for(chat_id):
-                    followup_notify = False
                     status = await asyncio.to_thread(self._queue.status, chat_id)
                     state = self._trigger_state_for(chat_id)
                     previous_mode = state.mode
@@ -4536,42 +4524,17 @@ class OneBot11Adapter(BasePlatformAdapter):
                                     await self._apply_trigger_action_locked(
                                         chat_id, followup_action
                                     )
-                                elif followup_action.kind == "direct":
-                                    # 最新 pending 消息是短确认词：直接为它创建
-                                    # engaged_ack trigger，不能只让状态机改状态。
-                                    followup_authority = self._authority_for_queued_message(
-                                        latest
-                                    )
-                                    followup_request = await asyncio.to_thread(
-                                        self._queue.create_trigger,
-                                        chat_id,
-                                        "engaged_ack",
-                                        latest.user_id,
-                                        latest.user_name,
-                                        str(latest.message_key),
-                                        anchor_kind="engaged_ack",
-                                        authority_role=followup_authority.role,
-                                        authority_tools=followup_authority.allowed_tools,
-                                        authority_self_id=followup_authority.self_id,
-                                        triggered_at=time.time(),
-                                    )
-                                    if followup_request:
-                                        followup_notify = True
-                                        self._last_trigger_at[chat_id] = time.time()
                         should_schedule_timer = (
                             state.debounce_due is not None
                             or state.wait_until is not None
                             or state.engaged_until is not None
                         )
                     should_notify = (
-                        (
-                            completed
-                            and ack
-                            and not unknown
-                            and not status.get("paused")
-                            and has_hard_trigger
-                        )
-                        or followup_notify
+                        completed
+                        and ack
+                        and not unknown
+                        and not status.get("paused")
+                        and has_hard_trigger
                     )
             elif completion_error is None and not runtime_fenced:
                 should_notify = bool(completed and ack and not unknown)

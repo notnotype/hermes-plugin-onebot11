@@ -1388,8 +1388,8 @@ async def test_群turn给触发消息加眼睛并在收尾移除(monkeypatch):
         )
         await adapter._finish_queue_turn(event, ProcessingOutcome.SUCCESS)
         assert reaction_calls == [
-            ("-1001", "8971", True),
-            ("-1001", "8971", False),
+            ("-1001", "128172", True),
+            ("-1001", "128172", False),
         ]
         assert adapter._queue.status("888")["pending"] == 1
     finally:
@@ -1414,7 +1414,7 @@ async def test_fenced_reaction恢复只执行unset(monkeypatch):
     monkeypatch.setattr(adapter._api, "set_message_emoji_like", fake_reaction)
     try:
         await adapter._recover_processing_reactions_once()
-        assert calls == [("1001", "8971", False)]
+        assert calls == [("1001", "128172", False)]
         assert adapter._queue.reaction_for_lease("fenced-reaction") is None
     finally:
         await adapter.disconnect()
@@ -1726,8 +1726,8 @@ async def test_LLM候选入队不会在群触发锁上死锁(monkeypatch):
         await adapter.disconnect()
 
 
-async def test_engaged短确认词不调用selector并创建durable_trigger(monkeypatch):
-    """活跃窗口中的短确认词直接进入同一群的共享 session。"""
+async def test_engaged短确认词统一走selector不创建trigger(monkeypatch):
+    """活跃窗口中的短确认词没有特例，进入 selector 且不直接创建 trigger。"""
     adapter = OneBot11Adapter(
         PlatformConfig(
             enabled=True,
@@ -1746,15 +1746,21 @@ async def test_engaged短确认词不调用selector并创建durable_trigger(monk
     state = adapter._trigger_state_for("888")
     state.on_turn_complete(success=True, now=time.monotonic())
     notifications: list[str] = []
+    selector_calls: list[str] = []
 
-    def fail_selector(**_kwargs):
-        pytest.fail("engaged acknowledgement 不应调用 pi-ai selector")
+    def fake_client_factory():
+        class FakeClient:
+            async def complete(self, prompt: str, timeout_seconds: float = 30):
+                selector_calls.append(prompt)
+                return '{"decision":"ignore","anchor_seq":null}'
+
+        return FakeClient()
 
     async def fake_notify(chat_id: str) -> bool:
         notifications.append(str(chat_id))
         return True
 
-    monkeypatch.setattr(adapter_module, "PiAiTriggerClient", fail_selector)
+    monkeypatch.setattr(adapter, "_pi_ai_trigger_client", fake_client_factory)
     monkeypatch.setattr(adapter._dispatcher, "notify", fake_notify)
     message = QueueMessage(
         chat_id="888",
@@ -1782,12 +1788,10 @@ async def test_engaged短确认词不调用selector并创建durable_trigger(monk
         )
         status = adapter._queue.status("888")
         assert status["pending"] == 1
-        assert status["pending_trigger_requests"] == 1
-        assert notifications == ["888"]
-        requests = adapter._queue.recover_trigger_requests(["888"])
-        assert len(requests) == 1
-        assert requests[0].reason == "engaged_ack"
-        assert requests[0].message_key == "group:engaged-ack-1"
+        assert status["pending_trigger_requests"] == 0
+        assert notifications == []
+        assert adapter._trigger_states["888"].mode == "debounce"
+        assert selector_calls == []
     finally:
         await adapter.disconnect()
 
@@ -3461,8 +3465,8 @@ async def test_completion后普通消息进入engaged_debounce(monkeypatch):
         await adapter.disconnect()
 
 
-async def test_completion后短确认词followup创建engaged_ack_trigger(monkeypatch):
-    """turn 期间入队的短确认词在成功收口后直接创建 engaged_ack trigger。"""
+async def test_completion后短确认词followup进入selector不创建新lease(monkeypatch):
+    """turn 期间入队的短确认词在成功收口后走 selector，不直接创建 trigger。"""
     adapter = OneBot11Adapter(
         PlatformConfig(
             enabled=True,
@@ -3577,19 +3581,19 @@ async def test_completion后短确认词followup创建engaged_ack_trigger(monkey
             ),
             ProcessingOutcome.SUCCESS,
         )
-        # followup 的 engaged_ack trigger 应立即被 dispatcher 接管为新 lease。
+        # followup 没有硬触发，只能进入 debounce 等待 selector，不会创建新 lease。
         second_active = adapter._dispatcher.active("888")
-        assert second_active is not None
-        assert second_active.lease.lease_id != first_lease
+        assert second_active is None
         status = adapter._queue.status("888")
-        assert int(status.get("leased", 0)) == 1
-        assert int(status.get("pending", 0)) == 0
+        assert int(status.get("leased", 0)) == 0
+        assert int(status.get("pending", 0)) == 1
+        assert adapter._trigger_states["888"].mode == "debounce"
     finally:
         await adapter.disconnect()
 
 
-async def test_debounce中短确认词创建trigger不调用selector(monkeypatch):
-    """候选等待（debounce）期间活跃窗口内的短确认词直接创建 trigger。"""
+async def test_debounce中短确认词继续等待不创建trigger(monkeypatch):
+    """候选等待（debounce）期间活跃窗口内的短确认词继续合并等待，不创建 trigger。"""
     adapter = OneBot11Adapter(
         PlatformConfig(
             enabled=True,
@@ -3607,15 +3611,6 @@ async def test_debounce中短确认词创建trigger不调用selector(monkeypatch
     )
     adapter._processing_reaction_enabled = False
 
-    class FakeClient:
-        async def complete(self, prompt: str, timeout_seconds: float = 10):
-            pytest.fail("debounce 中的短确认词不应调用 pi-ai selector")
-
-    monkeypatch.setattr(
-        adapter,
-        "_pi_ai_trigger_client",
-        lambda: FakeClient(),
-    )
     notifications: list[str] = []
 
     async def fake_notify(chat_id: str) -> bool:
@@ -3667,12 +3662,9 @@ async def test_debounce中短确认词创建trigger不调用selector(monkeypatch
             user_name="小明",
         )
         status = adapter._queue.status("888")
-        assert status["pending_trigger_requests"] == 1
-        requests = adapter._queue.recover_trigger_requests(["888"])
-        assert len(requests) == 1
-        assert requests[0].reason == "engaged_ack"
-        assert requests[0].message_key == "group:debounce-ack-2"
-        assert notifications == ["888"]
+        assert status["pending_trigger_requests"] == 0
+        assert notifications == []
+        assert adapter._trigger_states["888"].mode == "debounce"
     finally:
         await adapter.disconnect()
 
