@@ -4,7 +4,7 @@
 
 ## 当前状态
 
-- **阶段**：master 已合并 Task 7 之前的全部功能并部署 Arch（`0.6.0 / schema 12`）。当前本地收口：移除活跃窗口短确认词特例（统一走 selector）、selector 按候选类型分 prompt（engaged 默认 ignore 成员互动）、纯图片消息不进 selector、仲裁上限 3→2、旁路模型默认改用 DeepSeek 官方 API（pi-ai 内置 provider，思考关闭）、回复阶段 reaction 改用 💬（`128172`）、`super_admin` 默认拥有全部 Hermes 通用工具（私聊/群聊均可使用 terminal、read_file 等）。
+- **阶段**：master 已合并 Task 7 之前的全部功能并部署 Arch（`0.6.0 / schema 12`）。当前本地收口：移除活跃窗口短确认词特例（统一走 selector）、selector 按候选类型分 prompt（engaged 默认 ignore 成员互动）、纯图片消息不进 selector、仲裁上限 3→2、旁路模型默认改用 DeepSeek 官方 API（pi-ai 内置 provider，思考关闭）、回复阶段 reaction 改用 💬（`128172`）、`super_admin` 默认拥有全部 Hermes 通用工具（私聊/群聊均可使用 terminal、read_file 等）、Hermes 中间正文按目标类型展示（群聊隐藏/私聊展示，`show_interim_group`/`show_interim_dm`）。
 - **核心合同**：群固定一个共享 session；群消息持久入队；每个真实 TurnAnchor 固定 batch 和 authority，同群按序单 lease follow-up；非幂等出站结果未知时进入 `uncertain`，不自动重放。
 - **本地验证**：协议/状态机测试通过；使用本地 Hermes 源码与其 site-packages 运行 adapter 测试通过。最终门禁命令和环境见“验证证据”。
 

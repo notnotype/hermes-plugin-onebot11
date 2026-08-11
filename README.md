@@ -9,6 +9,7 @@
 - **连续对话**：成功回复后进入最多 60 秒的活跃窗口；窗口内普通消息统一交给低成本旁路模型判断是否回复（没有特例词），单窗口最多仲裁 2 次。debounce 是自适应的：群消息间隔超过 5 秒（不活跃）时立即判断，间隔小于 5 秒（活跃）时按 trailing 节流合并。
 - **群级旁路命令**：`/context`、`/ctx` 在入队前返回有界队列/lease/policy 诊断；超级管理员可以发送 `/new [title]`、`/reset` 或 `/clear` 重置当前群的 shared session。它们都不会作为普通群消息交给 Agent。
 - **处理指示器**：问句/记忆候选进入 selector 判断时给候选消息添加 👀（表示“bot 正在看这条消息”），判断结束（触发、忽略、超时或 wait 到期）后移除；任何触发方式进入回复阶段后，给触发消息添加 💬（表示“正在回复这一条”），Hermes turn 收尾时自动移除。两种指示器都是 best-effort，失败或结果未知不影响回复、队列 ack 或 Agent 完成，也不重放设置请求；没有真实消息 ID 或 QQ 框架不支持该扩展时按 best-effort 跳过。
+- **中间正文**：Hermes ReAct 过程中产生的 AI 中间评论（commentary/工具进度/状态提示）默认在群聊隐藏、在私聊展示，可用 `show_interim_group` / `show_interim_dm` 配置。最终回复不受影响，永远发送。
 - **回复格式**：默认把 Markdown 转成 OneBot 可读的纯文本；同一 turn 内重复的本地图片/URL/相同内容只投递一次。Markdown 图片逃生口 `[[onebot11:markdown-image]]...[[/onebot11:markdown-image]]` 目前只去掉 marker 并按纯文本发送，不访问其中的外部 URL。
 - **运行时配置**：超级管理员可以发送 `/onebot reload` 热更新白名单、角色工具、trigger、cooldown、reaction、一次性长时间提示延迟和显示策略；HTTP/WS 地址、token、机器人 QQ 号、队列路径和 session 模式仍需重启。reload 后 active turn 保留创建时的权限快照，并清理旧确认令牌。
 - **上下文**：队列有条数、字节数和单条消息上限，确认后形成滚动摘要，并保留最近消息原文；每条消息还带 `seq`、真实 `message_id`、去重 `message_key`、用户、role、reply 和媒体标记。当前批次作为普通 user message，摘要优先通过 Hermes `channel_prompt` 临时注入，不重复写入 shared session transcript。旧 Hermes 不支持时退回有界文本模式并记录审计。
@@ -137,6 +138,8 @@ platforms:
         engaged_max_arbitrations: 2
       processing_reaction_enabled: true
       processing_reaction_emoji_id: "128172"  # LLBot 的 💬，表示正在回复
+      show_interim_group: false   # 群聊隐藏 Hermes 中间正文（commentary/进度）
+      show_interim_dm: true       # 私聊展示 Hermes 中间正文
       roles:
         user:
           tools: [qq_get_message, qq_get_group_msg_history, qq_get_friend_msg_history,

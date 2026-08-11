@@ -129,6 +129,9 @@ _CURRENT_EVENT: contextvars.ContextVar[Any | None] = contextvars.ContextVar(
 _CURRENT_RESET_MARKER: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "onebot11_current_reset_marker", default=None
 )
+_FINAL_DELIVERY: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "onebot11_final_delivery", default=False
+)
 
 _TOOL_HANDLERS: dict[str, Any] = {
     "qq_get_message": handle_get_message,
@@ -680,6 +683,32 @@ class OneBot11Adapter(BasePlatformAdapter):
     def plain_text_enabled(self) -> bool:
         """读取当前纯文本显示开关。"""
         return self._policy_snapshot.plain_text_enabled
+
+    @property
+    def show_interim_group(self) -> bool:
+        """读取群聊是否展示 Hermes 中间正文（commentary/progress）。"""
+        return self._policy_snapshot.show_interim_group
+
+    @show_interim_group.setter
+    def show_interim_group(self, value: Any) -> None:
+        """兼容热更新设置群聊中间正文开关。"""
+        self._replace_policy(show_interim_group=bool(value))
+
+    @property
+    def show_interim_dm(self) -> bool:
+        """读取私聊是否展示 Hermes 中间正文（commentary/progress）。"""
+        return self._policy_snapshot.show_interim_dm
+
+    @show_interim_dm.setter
+    def show_interim_dm(self, value: Any) -> None:
+        """兼容热更新设置私聊中间正文开关。"""
+        self._replace_policy(show_interim_dm=bool(value))
+
+    def _interim_allowed(self, target: ChatTarget) -> bool:
+        """按目标类型返回是否展示 Hermes 中间消息。"""
+        return bool(
+            self.show_interim_dm if target.chat_type == "dm" else self.show_interim_group
+        )
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """启动反向 WS，并恢复 SQLite 中未完成的群 turn。"""
@@ -4994,6 +5023,29 @@ class OneBot11Adapter(BasePlatformAdapter):
                 reply_to=reply_to,
                 metadata=metadata,
             )
+        if not _FINAL_DELIVERY.get():
+            # Hermes 的中间正文（commentary/工具进度/状态提示）直调
+            # adapter.send()，不走 _send_with_retry。按目标类型决定是否
+            # 展示：群聊默认隐藏（避免刷屏），私聊默认展示。
+            interim_target = self._resolve_target(
+                str(chat_id),
+                metadata if isinstance(metadata, Mapping) else None,
+            )
+            if interim_target is not None and not self._interim_allowed(interim_target):
+                self._audit.record(
+                    "interim_hidden",
+                    {
+                        "chat_type": interim_target.chat_type,
+                        "chat_id": interim_target.chat_id,
+                        "reason": "中间正文按配置隐藏",
+                    },
+                )
+                return SendResult(
+                    True,
+                    message_id=str(uuid.uuid4()),
+                    error="OneBot11 中间正文按配置隐藏",
+                    error_kind="interim_hidden",
+                )
         binding = self._binding_from_context(
             metadata if isinstance(metadata, Mapping) else None
         )
@@ -5651,7 +5703,18 @@ class OneBot11Adapter(BasePlatformAdapter):
     async def _send_with_retry(self, chat_id: str, content: str, reply_to: str | None = None, metadata: Any = None, **kwargs: Any) -> SendResult:
         """覆盖 Hermes 默认重试/fallback，避免未知出站重复发送。"""
         del kwargs
-        return await self.send(chat_id, content, reply_to=reply_to, metadata=metadata if isinstance(metadata, Mapping) else None)
+        # Hermes 最终回复统一走 _send_with_retry；标记当前调用是最终回复，
+        # send() 据此区分直调的中间正文（commentary/progress/status）。
+        token = _FINAL_DELIVERY.set(True)
+        try:
+            return await self.send(
+                chat_id,
+                content,
+                reply_to=reply_to,
+                metadata=metadata if isinstance(metadata, Mapping) else None,
+            )
+        finally:
+            _FINAL_DELIVERY.reset(token)
 
     async def send_typing(self, chat_id: str, metadata: dict | None = None) -> None:
         """OneBot 无 typing 指示器。"""

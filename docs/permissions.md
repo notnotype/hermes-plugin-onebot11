@@ -81,6 +81,14 @@ tool-search、delegation 或子代理缺少 turn 身份时 fail-closed，不伪�
 
 确认令牌仍只保存在当前 adapter 进程内存中，进程重启会让旧令牌失效；但管理动作台账持久化在同一个队列 SQLite 中。进程恢复会把遗留的 `started` 标记为 `unknown`，同一 fingerprint 在 `unknown` 状态下禁止重复调用。`/onebot resolve action retry OPERATION_ID` 只把动作置为 `retry_armed`，随后必须重新生成预览并再次确认；`discard` 只记录放弃，不访问 OneBot。审计只保留 operation id、fingerprint 摘要、工具、目标和结果，不记录 token、完整参数或媒体 URL。
 
+## 中间正文
+
+Hermes 在 ReAct 过程中产生的 AI 中间评论（commentary）、工具进度和状态提示会直调 adapter 的
+`send()`；OneBot 插件用 `_send_with_retry`（最终回复）与直调 `send()`（中间消息）区分二者。
+默认群聊隐藏中间正文（避免刷屏）、私聊展示中间正文（便于观察思考过程），可通过
+`show_interim_group` / `show_interim_dm` 配置（热更新生效）。最终回复始终发送，不受该配置影响；
+Hermes cron 或系统通知若直发到群，也会按群聊中间正文规则处理，请按需配置。
+
 ## 运行时 reload
 
 超级管理员可直接发送 `/onebot reload`。它通过 Hermes 的当前 gateway

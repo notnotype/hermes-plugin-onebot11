@@ -295,7 +295,7 @@ async def test_活动turn重连时旧heartbeat和managed_send被fence(monkeypatc
         assert heartbeat.done()
         assert adapter._dispatcher.active("888") is None
         assert adapter._queue.status("888")["pending"] == 1
-        result = await adapter.send(
+        result = await adapter._send_with_retry(
             "888",
             "旧 task 不得发送",
             metadata=old_event.metadata,
@@ -454,7 +454,7 @@ async def test_worker线程建立binding后async最终出站可恢复精确bindi
     adapter_module._CURRENT_BINDING.set(None)
 
     try:
-        result = await adapter.send(
+        result = await adapter._send_with_retry(
             "888",
             "最终回复",
             # Hermes final delivery 只传平台通用 metadata，不会复制
@@ -498,7 +498,7 @@ async def test出站binding缺失或session_turn不匹配时不访问OneBot(monk
     )
     event_token = adapter_module._CURRENT_EVENT.set(event)
     try:
-        result = await adapter.send("888", "不能发送", metadata=event.metadata)
+        result = await adapter._send_with_retry("888", "不能发送", metadata=event.metadata)
         assert not result.success
         assert result.error_kind == "fenced"
         assert calls == []
@@ -566,7 +566,7 @@ async def test_metadata_binding身份epoch或lease失效时不访问OneBot(
     )
     event_token = adapter_module._CURRENT_EVENT.set(event)
     try:
-        result = await adapter.send("888", "不能发送", metadata={"notify": True})
+        result = await adapter._send_with_retry("888", "不能发送", metadata={"notify": True})
         assert not result.success
         assert result.error_kind == "fenced"
         assert calls == []
@@ -4136,7 +4136,7 @@ async def test_send走HTTP并返回SendResult(monkeypatch, fake_http_server):
     await adapter.connect()
     try:
         adapter._chat_types["888"] = "group"
-        result = await adapter.send("888", "你好")
+        result = await adapter._send_with_retry("888", "你好")
         assert isinstance(result, SendResult)
         assert result.success
         assert calls[0]["path"] == "/send_group_msg"
@@ -4186,7 +4186,7 @@ async def test_send默认转换为纯文本并记录marker不可用(monkeypatch,
     )
     try:
         adapter._chat_types["888"] = "group"
-        result = await adapter.send(
+        result = await adapter._send_with_retry(
             "888",
             "# 标题\n**重点**\n[[onebot11:markdown-image]]![图](https://example.invalid/a.png)[[/onebot11:markdown-image]]",
         )
@@ -4651,7 +4651,7 @@ async def test_文本分块已成功一块后ValueError进入unknown(monkeypatch
     adapter_module._CURRENT_CALLER.set(caller)
     adapter_module._CURRENT_BINDING.set(binding)
     try:
-        result = await adapter.send("888", "ab")
+        result = await adapter._send_with_retry("888", "ab")
         assert not result.success
         assert result.error_kind == "unknown"
         assert lease.lease_id in adapter._unknown_leases
@@ -4836,7 +4836,7 @@ async def test_未开始OneBot请求的turn成功也release(monkeypatch):
 
     monkeypatch.setattr(adapter._dispatcher, "complete", fake_complete)
     try:
-        result = await adapter.send("888", "你好")
+        result = await adapter._send_with_retry("888", "你好")
         assert not result.success
         assert "lease-not-sent" in adapter._outbound_known_failure
         event = SimpleNamespace(
@@ -5078,6 +5078,59 @@ async def test_触发状态更新异常仍清理turn资源(monkeypatch):
         await adapter._finish_queue_turn(event, ProcessingOutcome.SUCCESS)
         assert adapter._bindings.get("session-trigger-error", "turn-trigger-error") is None
         assert not media_dir.exists()
+    finally:
+        await adapter.disconnect()
+
+
+async def test_群聊中间正文按配置隐藏但最终回复不受影响(monkeypatch, fake_http_server):
+    """Hermes 直调 send() 的中间正文在群聊默认隐藏；_send_with_retry 的最终回复始终发送。"""
+    base, calls = fake_http_server
+    adapter = _make_adapter(monkeypatch, ONEBOT11_HTTP_API=base, ONEBOT11_SELF_ID="1")
+    await adapter.connect()
+    try:
+        adapter._chat_types["888"] = "group"
+        interim = await adapter.send("888", "让我查一下群消息…")
+        assert interim.success
+        assert calls == []  # 群聊中间正文被隐藏，不访问 OneBot
+
+        final = await adapter._send_with_retry("888", "查到了，最近有 3 条消息")
+        assert final.success
+        assert calls and calls[0]["path"] == "/send_group_msg"
+    finally:
+        await adapter.disconnect()
+
+
+async def test_私聊中间正文默认展示(monkeypatch, fake_http_server):
+    """Hermes 直调 send() 的中间正文在私聊默认展示。"""
+    base, calls = fake_http_server
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API=base,
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_DM_POLICY="allowlist",
+        ONEBOT11_ALLOWED_USERS="1001",
+    )
+    await adapter.connect()
+    try:
+        adapter._chat_types["1001"] = "dm"
+        result = await adapter.send("1001", "好的，我来处理…")
+        assert result.success
+        assert calls and calls[0]["path"] == "/send_private_msg"
+    finally:
+        await adapter.disconnect()
+
+
+async def test_群聊中间正文可配置为展示(monkeypatch, fake_http_server):
+    """show_interim_group=true 时群聊中间正文正常发送。"""
+    base, calls = fake_http_server
+    adapter = _make_adapter(monkeypatch, ONEBOT11_HTTP_API=base, ONEBOT11_SELF_ID="1")
+    adapter.show_interim_group = True
+    await adapter.connect()
+    try:
+        adapter._chat_types["888"] = "group"
+        result = await adapter.send("888", "让我查一下…")
+        assert result.success
+        assert calls and calls[0]["path"] == "/send_group_msg"
     finally:
         await adapter.disconnect()
 
