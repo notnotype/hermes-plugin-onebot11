@@ -96,3 +96,19 @@ async def test_图片重定向不携带OneBot令牌(tmp_path):
     finally:
         await api.close()
         await runner.cleanup()
+
+
+async def test_get_image使用OneBot查询动作(monkeypatch):
+    """file 标识通过标准 get_image 解析，不把它当作外部 URL。"""
+    api = OneBotHttpApi(base_url="http://127.0.0.1:3000")
+
+    async def fake_call_action(action: str, params: dict, **_kwargs):
+        assert action == "get_image"
+        assert params == {"file": "file-id-1"}
+        return {"file": "C:/safe/image.png"}
+
+    monkeypatch.setattr(api, "call_action", fake_call_action)
+    try:
+        assert await api.get_image("file-id-1") == "C:/safe/image.png"
+    finally:
+        await api.close()

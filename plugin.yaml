@@ -11,6 +11,9 @@ description: >
   base64:// segments with same-turn defensive deduplication; unknown
   non-idempotent delivery is never retried. Text replies default to plain text,
   and policy/trigger permissions support runtime reload through /onebot reload.
+  LLM selector decisions choose a real pending message anchor and inherit its
+  authority; generic Hermes tools are hard-gated per OneBot turn, while
+  delegate_task and tool_search remain disabled.
   Optional layered LLM trigger uses the plugin's Node.js >=22.19/pi-ai helper,
   not Hermes auxiliary; install runtime dependencies with npm ci --omit=dev.
 author: notnotype

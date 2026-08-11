@@ -1,8 +1,11 @@
-# Task 5：OneBot 11 TurnAnchor 与 shared session 收口
+# Task 5：OneBot 11 TurnAnchor 与 shared session 收口（历史基线）
+
+> 本文保留 TurnAnchor 的设计和早期验收记录；当前 schema、generic 工具权限、
+> selector、reaction 恢复和显示合同以 Task 7、PROJECT-STATUS 和权限文档为准。
 
 - 关联需求：OneBot 11 原始需求中的“群一个 shared session + 队列上下文”
 - 状态：本地实现和 Hermes 媒体/unknown 组合验证完成；真实 OneBot adapter 图片/reaction smoke 已通过。Agent 最终回复是图片出站的主要支持场景；通用 `send_message`/cron plugin media 不在本任务可靠性合同内。真人并发、unknown resolve 和生产 Agent 图片 pipeline 仍未完成。
-- 当前收口分支：`feat/i16-onebot11-command-acceptance`
+- 历史收口分支：`feat/i16-onebot11-command-acceptance`
 
 ## 目标
 
@@ -15,7 +18,7 @@
 
 ## 已实现
 
-1. SQLite schema v11 保留消息、anchor、authority 快照、lease phase、出站 marker、失败退避、摘要和 operation ledger，并支持真实 v7/v8/v9/v10 表结构迁移。
+1. 历史实现使用 SQLite schema v11 保留消息、anchor、authority 快照、lease phase、出站 marker、失败退避、摘要和 operation ledger；当前 schema 12 合同以 Task 7 为准。
 2. hard trigger、selector、管理员 flush 和 recovery 都写入明确 anchor kind。
 3. claim 按 anchor 序号串行认领；后续消息不会被旧 turn 偷吃。
 4. selector 使用显式 message key；目标消息消失时丢弃旧判断，不静默改绑到最早消息。

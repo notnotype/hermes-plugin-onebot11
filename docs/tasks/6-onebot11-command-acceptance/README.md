@@ -1,4 +1,7 @@
-# Task 6：OneBot 11 群级命令与 Arch 验收收口
+# Task 6：OneBot 11 群级命令与 Arch 验收收口（历史基线）
+
+> 本文记录早期命令验收分支；当前分支的权限、binding、测试数字和 Arch 部署状态
+> 以 Task 7、PROJECT-STATUS 和 `docs/permissions.md` 为准。
 
 - 关联 Issue：[Issue #16：OneBot 11 Arch 验收收口](https://github.com/notnotype/hermes-plugin-onebot11/issues/16)
 - 前置修复：[Issue #13：OneBot 11 出站 Binding](https://github.com/notnotype/hermes-plugin-onebot11/issues/13)

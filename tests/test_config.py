@@ -1,5 +1,8 @@
 """OneBot 11 运行时配置解析合同测试。"""
 
+import os
+from pathlib import Path
+
 import pytest
 
 from onebot11.config import parse_runtime_config
@@ -108,6 +111,23 @@ def test媒体host使用字符串列表而ID列表保持纯数字():
         parse_runtime_config(_extra(media_allowed_hosts={"host": "cdn.example.com"}))
 
 
+def test媒体source_roots必须是绝对路径():
+    """get_image 返回的本地文件只能来自显式根目录。"""
+    roots = (
+        ["C:/OneBot/media", "D:/cache"]
+        if os.name == "nt"
+        else ["/tmp/onebot-media", "/var/cache"]
+    )
+    runtime = parse_runtime_config(
+        _extra(media_source_roots=roots)
+    )
+    assert runtime.media_source_roots == tuple(
+        str(Path(root).resolve(strict=False)) for root in roots
+    )
+    with pytest.raises(ValueError):
+        parse_runtime_config(_extra(media_source_roots=["relative/media"]))
+
+
 def test启用llm_trigger必须显式配置群allowlist():
     """旁路模型不能在未限制群范围时隐式接管所有群。"""
     with pytest.raises(ValueError):
@@ -122,11 +142,19 @@ def test启用llm_trigger必须显式配置群allowlist():
         )
 
 
-def test角色未知工具直接拒绝():
-    """角色配置不能通过静默取交集把拼写错误隐藏掉。"""
-    with pytest.raises(ValueError, match="未知工具"):
+def test角色工具名允许Hermes通用工具但禁止子代理绕过():
+    """角色可以精确授予 Hermes 工具名，但不能配置越权桥接工具。"""
+    runtime = parse_runtime_config(
+        _extra(roles={"trusted_user": {"tools": ["terminal", "browser"]}})
+    )
+    assert runtime.role_tools["trusted_user"] == frozenset({"terminal", "browser"})
+    with pytest.raises(ValueError, match="禁止"):
         parse_runtime_config(
-            _extra(roles={"user": {"tools": ["qq_not_a_real_tool"]}})
+            _extra(roles={"user": {"tools": ["delegate_task"]}})
+        )
+    with pytest.raises(ValueError, match="禁止"):
+        parse_runtime_config(
+            _extra(roles={"user": {"tools": ["tool_search"]}})
         )
 
 

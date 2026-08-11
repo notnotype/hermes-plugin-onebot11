@@ -5,8 +5,8 @@
 
 ## 决策
 
-OneBot 队列当前 schema 固定为 11，启动迁移按“删除旧索引 → 补列/重建旧表
-→ 丢弃旧 reaction 记录 → 创建新索引 → 更新版本并提交”的顺序执行。迁移只接受
+OneBot 队列当前 schema 固定为 12，启动迁移按“删除旧索引 → 补列/重建旧表
+→ 补齐 reaction 与 cooldown/selector 列 → 创建新索引 → 更新版本并提交”的顺序执行。迁移只接受
 已知的 v7、v8、v9、v10 表结构；更高版本或无法证明结构安全时拒绝启动，不通过修改
 `PRAGMA user_version` 假装兼容。迁移失败会 rollback、关闭连接并保持 `closed`。
 
@@ -24,7 +24,8 @@ SQLite 旧索引可能引用尚不存在的 anchor 列，先建索引会让真�
 
 ## 影响
 
-- 旧 reaction 记录只在本地迁移时丢弃，不承诺调用 OneBot 清理远端 reaction。
+- reaction 清理记录尽量在迁移中保留；远端 reaction 是否仍存在只能通过受限
+  `unset` 恢复确认，不承诺迁移时 exactly-once 清理。
 - 旧 anchor 缺少 authority 时会停在 `uncertain`，不会为了自动恢复而猜测身份。
-- schema 11 迁移支持现有已知版本，但真实生产 queue 仍需在备份后单独联调，不能把本地
+- schema 12 迁移支持现有已知版本，但真实生产 queue 仍需在备份后单独联调，不能把本地
   fixture 通过当成生产迁移已经完成。

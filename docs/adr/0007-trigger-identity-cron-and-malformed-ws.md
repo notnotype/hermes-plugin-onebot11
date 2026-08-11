@@ -11,7 +11,8 @@
 同一 batch 里其他用户的消息只是非可信上下文，不会改变角色、允许工具或出站目标。
 这样保持“群一个 shared session”不变，同时避免把普通用户消息混入后意外升级管理权限。
 
-`trusted_user` 只允许配置的只读工具，不能修改权限、白名单或角色；super_admin 仍由
+OneBot 群管理写工具只允许 `super_admin`；`trusted_user` 可按工具名显式配置
+Hermes generic 能力，但不能修改权限、白名单或角色。super_admin 仍由
 `super_admins`/兼容旧名 `ONEBOT11_ADMINS` 明确定义。
 
 ### Home Channel cron

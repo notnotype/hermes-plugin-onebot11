@@ -1,7 +1,7 @@
 # Task 7：OneBot 11 媒体投递、状态提示、纯文本与运行时策略
 
-- 日期：2026-08-10
-- 状态：实现中；本 worktree 尚未合并或部署 Arch
+- 日期：2026-08-11
+- 状态：代码收口完成，待 PR 验证/合并；本 worktree 尚未部署 Arch
 - 关联主线：shared session、TurnAnchor、authority 快照、OneBot 非幂等出站 unknown 合同
 
 ## 目标
@@ -24,6 +24,9 @@
 - 群 turn 使用 lease scope，私聊使用精确 session/turn，无法绑定时只使用当前消息 scope；
 - 去重不跨 turn、session 或重启，不承诺 exactly-once；
 - OneBot 图片继续使用受限 `base64://` segment；不向外部媒体 URL 发送 Bearer token。
+- 入站 image segment 优先选择 URL，否则保留 file 标识；非 URL file 只有在配置
+  `media_source_roots` 后才会通过 OneBot `get_image` 解析，并复制到受控 turn 目录；
+  不读取任意返回路径。
 
 ### 文本和控制面
 
@@ -46,27 +49,61 @@
 - 缺少 `pre_gateway_dispatch`、`pre_llm_call`、`pre_tool_call` 时，插件拒绝注册，避免安全 hook 缺失后静默 fail-open；
 - role prompt 展示三类角色工具目录，但明确 role catalog 不是硬授权来源；
 - 审计写失败只记录日志，不改变权限 hook 的 fail-closed 结果。
+- Hermes generic 工具也进入 OneBot turn 的 `pre_tool_call` 硬门禁；普通用户
+  不能因为工具不是 `qq_*` 就绕过角色工具快照。`delegate_task` 和 `tool_search`
+  仍在配置层、运行时双重禁止。
+
+### 触发、身份和上下文
+
+- cooldown、`llm_judged_seq`、LLM 失败退避和真正创建 trigger 的时间都持久化在 SQLite；
+  重复 WS 事件不会刷新 cooldown，新消息会清除 selector 失败退避。
+- LLM selector 开启时，恢复轮询只唤醒 adapter 的策略恢复路径，不直接创建
+  `cooldown_recovery` anchor；没有旁路 selector 时才使用 QueueStore 的直接 cooldown
+  recovery。provider/model 缺失也会记录持久化失败退避。
+- selector 只接受 `{"decision":"trigger","anchor_seq":123}`、
+  `{"decision":"wait","anchor_seq":null}` 或 `{"decision":"ignore","anchor_seq":null}`；
+  `anchor_seq` 必须是当前 pending 队列中真实存在的消息序号，authority 从该消息快照继承。
+- 每条上下文消息同时展示 `seq`、真实 `message_id`、去重用 `message_key`、QQ 号、
+  昵称、role、reply 和 segment/media markers。没有真实 ID 时 `message_id=""`，
+  `message_key="hash:<sha256>"`；hash key 不会进入 OneBot `get_msg` 或撤回 API。
+- 群 `/context` 和 `/ctx` 是入队前旁路诊断命令，不进入 shared session 或 Agent 队列。
+
+### 生命周期收口
+
+- lease 失效、adapter shutdown、epoch 变化后旧 turn 只清理内存，不访问 SQLite、
+  工具或 OneBot API；QueueStore 关闭会等待已经进入的同步操作后再关闭连接。
+- 文本/图片按 delivery unit 结算：全部明确成功才 ack；无出站的明确失败才 release；
+  部分成功、unknown 或 fencing 进入 uncertain。
+- 👀 reaction 状态持久化为 `pending -> maybe_set -> cleared`，恢复只执行有限次数
+  `unset`，绝不重放 `set=true`、Agent turn 或群管理动作。
+- 队列消息的 `resolve retry` 只对仍能证明原 authority、anchor 消息和 batch 边界的记录
+  创建新的 request_id；旧 trigger 缺失或 authority 不明时保持 hold，不由管理员身份或
+  后续 selector 接管。
 
 ## 计划出入
 
 - 本轮没有修改本地 Hermes，也没有实现 renderer、Docker 子代理、OneBot 12、原始 WS spool、
   语义摘要或通用媒体发送；
 - Hermes heartbeat 在上游提供明确 control-plane metadata 前不作为 OneBot 业务合同；
-- Hermes 通用 web/browser/terminal/file 工具不由本插件伪造 per-turn policy；它们仍须通过
-  Hermes platform toolset 和上游 turn 传递合同隔离。OneBot 角色目录只覆盖本插件注册的 OneBot 工具。
+- Hermes 通用 web/browser/terminal/file 工具在 OneBot turn 中由插件的
+  `pre_tool_call` 按角色快照硬拦截；tool-search/子代理若丢失 turn 身份则继续拒绝，
+  不在插件中伪造权限传递。
 
 ## 验证
 
 本 worktree 使用本地 Hermes 源码：
 
 ```text
-PYTHONPATH=C:\Users\notnotype\AppData\Local\hermes\hermes-agent pytest -q
-289 passed, 1 skipped
+PYTHONPATH=C:\Users\notnotype\AppData\Local\hermes\hermes-agent;C:\Users\notnotype\AppData\Local\hermes\hermes-agent\venv\Lib\site-packages pytest -q
+326 passed, 1 skipped
 ruff check .
 ```
 
-skip 只表示没有 Hermes gateway 的纯插件环境会跳过 `tests/test_adapter.py`；
-完整 adapter 测试必须使用上述 Hermes 源码路径，不能把 skip 当成通过。
+skip 是 `tests/test_pi_ai.py` 缺少 pi-ai npm 运行依赖；adapter 集成测试在上述
+Hermes 源码路径下实际运行，没有因缺 gateway 跳过。`scripts/verify_hermes_integration.py`
+在临时 `HERMES_HOME` 下也通过，输出
+`Hermes integration smoke passed: tools=9 hooks=5 pi_ai_trigger=True reconnect=True slash_commands=True`；
+`node --check scripts/onebot11-pi-trigger.mjs` 也通过；测试数字必须以实际命令结果为准。
 
 Arch 联调仍严格限制为群 `1072992996`、私聊用户 `2056963663`；
 本任务未在该 worktree 部署或发送未经授权的管理动作。合成 WS payload
@@ -77,5 +114,6 @@ Arch 联调仍严格限制为群 `1072992996`、私聊用户 `2056963663`；
 - Hermes 上游增加明确的 long-running/system-error control-plane metadata 后，再开启
   OneBot 控制面通知的真实 heartbeat 联调；
 - renderer 任务另行定义 PNG 字体、尺寸、临时文件和外部 URL allowlist；
-- Hermes 上游完成 per-turn tool policy、tool-search `turn_id` 和 delegation 继承后，
-  再评估把通用高风险工具纳入 OneBot role snapshot。
+- Hermes 上游完成 tool-search `turn_id` 和 delegation 继承后，再评估是否解除
+  `delegate_task`/`tool_search` 的 OneBot 禁止；当前 generic 工具本身已经由
+  OneBot `pre_tool_call` 按 role snapshot 硬门禁。

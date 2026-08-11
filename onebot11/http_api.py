@@ -26,6 +26,7 @@ QUERY_ACTIONS = frozenset(
         "get_group_info",
         "get_group_member_info",
         "get_group_list",
+        "get_image",
     }
 )
 WRITE_ACTIONS = frozenset(
@@ -259,7 +260,20 @@ class OneBotHttpApi:
         url = f"{self._base}/{action}?echo={uuid.uuid4().hex}"
         for attempt in range(attempts + 1):
             try:
-                async with session.post(url, json=params, headers=self._headers()) as resp:
+                async with session.post(
+                    url,
+                    json=params,
+                    headers=self._headers(),
+                    allow_redirects=False,
+                ) as resp:
+                    if 300 <= resp.status < 400:
+                        raise OneBotApiError(
+                            action,
+                            f"http_{resp.status}_redirect",
+                            -1,
+                            unknown_outcome=action in WRITE_ACTIONS,
+                            error_kind="unknown" if action in WRITE_ACTIONS else "protocol",
+                        )
                     try:
                         body = await self._read_response_bytes(resp, limit=self.max_response_bytes)
                     except OneBotApiError as exc:
@@ -451,6 +465,14 @@ class OneBotHttpApi:
             return None
         except (TimeoutError, aiohttp.ClientError, OSError, ValueError):
             return None
+
+    async def get_image(self, file_id: str) -> str:
+        """通过 OneBot 标准 get_image 解析收到的 file 标识。"""
+        normalized = str(file_id or "").strip()
+        if not normalized:
+            raise ValueError("图片 file 不能为空")
+        data = await self.call_action("get_image", {"file": normalized})
+        return str(data.get("file") or "")
 
     def _validate_media_url(self, url: str) -> None:
         """校验图片 URL 协议、host、端口和 IP，阻断 SSRF。"""

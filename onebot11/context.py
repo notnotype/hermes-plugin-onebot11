@@ -31,11 +31,28 @@ def _message_line(message: QueueMessage, *, include_original: bool) -> str:
     markers = " ".join(
         str(item)[:128] for item in (message.metadata.get("onebot11_markers") or [])
     )
-    line = f"#{message.seq or '?'} [{message.user_name}] {message.text}"
+    authority = message.metadata.get("onebot11_authority")
+    role = (
+        str(authority.get("role") or "unknown")
+        if isinstance(authority, dict)
+        else "unknown"
+    )
+    reply_to = str(message.metadata.get("onebot11_reply_to") or "none")
+    message_id = str(message.message_id or "")
+    message_key = str(message.message_key or "")
+    line = (
+        f"#{message.seq or '?'} "
+        f"message_id={message_id or 'none'} "
+        f"message_key={message_key or 'none'} "
+        f"user_id={message.user_id or 'unknown'} "
+        f"user_name={message.user_name or 'unknown'} "
+        f"role={role} "
+        f"reply_to={reply_to} "
+        f"segments={markers or 'none'} "
+        f"text={message.text}"
+    )
     if include_original and message.raw_text and message.raw_text != message.text:
         line += f" [原文: {message.raw_text}]"
-    if markers:
-        line += f" {markers}"
     return line
 
 

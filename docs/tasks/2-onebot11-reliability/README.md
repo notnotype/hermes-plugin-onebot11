@@ -1,7 +1,11 @@
-# OneBot 11 可靠性与安全完善
+# OneBot 11 可靠性与安全完善（历史基线）
+
+> 本文记录早期 PR/Task 的状态机和验证证据；当前 schema、selector、权限和显示合同
+> 以仓库根目录 README、PROJECT-STATUS 和 Task 7 为准。文中 `schema 11` 等数字
+> 不代表当前分支实现版本。
 
 - 关联需求：OneBot 11 插件整体完善计划
-- 状态：PR #8 基线上的 TurnAnchor、schema 11、Agent 最终回复出站图片和插件自有 pi-ai 触发已完成本地实现。Hermes strict auxiliary/media 合同不再是插件依赖；通用 `send_message`/cron plugin media、真实 Agent 图片 pipeline、真人并发、unknown 出站和 resolve 仍有外部边界。
+- 状态：历史 Task 2 基线；后续 Task 5/7 已将队列升级到 schema 12，并补齐 TurnAnchor、generic 工具门禁、运行时策略、Agent 最终回复出站图片和插件自有 pi-ai 触发。本文保留当时的设计与验收记录，不作为当前 schema 或显示合同。
 - 开始日期：2026-08-05
 
 ## 目标

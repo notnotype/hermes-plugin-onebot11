@@ -7,11 +7,11 @@
 - **私聊**：和机器人一对一聊天,每条消息都会回复。
 - **群聊**：整群共享一个 Hermes session；允许的消息先进入持久 SQLite 队列。每个 durable TurnAnchor 只消费自己边界内的批次，同群仍保持单活动 turn 并按 anchor 顺序串行处理；@、关键词、`always` 或分层 LLM trigger 才会创建 anchor。
 - **连续对话**：成功回复后进入最多 60 秒的活跃窗口；窗口内普通消息经过 5 秒 trailing debounce，再交给低成本旁路模型判断是否回复，单窗口最多仲裁 3 次。
-- **群级会话命令**：超级管理员可以发送 `/new [title]`、`/reset` 或 `/clear` 重置当前群的 shared session；命令在入队前处理，不会作为普通群消息交给 Agent。重置通过 Hermes 公共命令入口完成，成功后才清理该群的队列和摘要。
+- **群级旁路命令**：`/context`、`/ctx` 在入队前返回有界队列/lease/policy 诊断；超级管理员可以发送 `/new [title]`、`/reset` 或 `/clear` 重置当前群的 shared session。它们都不会作为普通群消息交给 Agent。
 - **处理指示器**：群 turn 认领后给触发消息添加 👀，Hermes turn 收尾时自动移除；没有真实消息 ID 或 QQ 框架不支持该扩展时按 best-effort 跳过，不影响回复。
 - **回复格式**：默认把 Markdown 转成 OneBot 可读的纯文本；同一 turn 内重复的本地图片/URL/相同内容只投递一次。Markdown 图片逃生口 `[[onebot11:markdown-image]]...[[/onebot11:markdown-image]]` 目前只去掉 marker 并按纯文本发送，不访问其中的外部 URL。
-- **运行时配置**：超级管理员可以发送 `/onebot reload` 热更新白名单、角色工具、trigger、reaction 和显示策略；HTTP/WS 地址、token、机器人 QQ 号、队列路径和 session 模式仍需重启。reload 后 active turn 保留创建时的权限快照，并清理旧确认令牌。
-- **上下文**：队列有条数、字节数和单条消息上限，确认后形成滚动摘要，并保留最近消息原文；当前批次作为普通 user message，摘要优先通过 Hermes `channel_prompt` 临时注入，不重复写入 shared session transcript。旧 Hermes 不支持时退回有界文本模式并记录审计。
+- **运行时配置**：超级管理员可以发送 `/onebot reload` 热更新白名单、角色工具、trigger、cooldown、reaction、一次性长时间提示延迟和显示策略；HTTP/WS 地址、token、机器人 QQ 号、队列路径和 session 模式仍需重启。reload 后 active turn 保留创建时的权限快照，并清理旧确认令牌。
+- **上下文**：队列有条数、字节数和单条消息上限，确认后形成滚动摘要，并保留最近消息原文；每条消息还带 `seq`、真实 `message_id`、去重 `message_key`、用户、role、reply 和媒体标记。当前批次作为普通 user message，摘要优先通过 Hermes `channel_prompt` 临时注入，不重复写入 shared session transcript。旧 Hermes 不支持时退回有界文本模式并记录审计。
 - **图片与消息段**：兼容 array/CQ 字符串，支持图片、reply、文件、语音、视频、转发和未知段标记；入站图片下载有 host、端口、类型、魔数和大小限制，出站图片使用受限 `base64://` segment，适配 Hermes 宿主机与 LLBot 容器路径隔离。
 - **工具与管理**：提供当前群/私聊范围内的查询工具，以及撤回、禁言、踢人、全员禁言工具。写操作只生成预览，必须由同一超级管理员在同一目标群发送短期确认命令。
 - **可靠性**：队列支持崩溃恢复、去重、lease heartbeat 和人工处理 `uncertain` 出站结果。OneBot 非幂等请求不自动重试、unknown 不走 plain-text 或 cron standalone fallback，不承诺 exactly-once。
@@ -119,6 +119,7 @@ platforms:
       max_images_per_message: 4
       media_allowed_hosts: []   # 图片 URL 必须命中此列表；默认还允许 HTTP API host
       media_allowed_ports: []   # 为空时使用 HTTP API 的端口
+      media_source_roots: []    # get_image 返回的本地路径只允许来自这些绝对路径
       llm_trigger:
         enabled: false
         provider: ""
@@ -152,7 +153,7 @@ platforms:
 未开始出站的 lease 回到 pending 且不消耗失败预算；只有过期的明确 `agent_running` lease
 才按最多 3 次的 2/4/8 秒退避恢复，达到上限进入 `failed`。出站已开始、阶段未知或租约阶段缺失进入 `uncertain`。
 LLM trigger 默认关闭，启用时必须同时配置明确的 `provider`、`model` 和群 allowlist；每群最多一个判断任务，使用 5 秒 debounce 和全局并发上限。判断由插件自有 Node helper 通过固定版本 `@earendil-works/pi-ai` 发起，不经过 Hermes auxiliary，不回退 Hermes 主 Agent，也不主动切换 provider。`api_key_env` 只保存环境变量名，密钥值不会进入 YAML、命令行、日志或 SQLite。Node、依赖缺失、超时、非法 JSON 或模型失败都按不触发处理，消息继续留在 pending。
-旁路模型只接受 `{"decision":"trigger|wait|ignore","wait_seconds":0}`；`wait` 时 `wait_seconds` 只能是 `5/10/30/60`，`trigger` 和 `ignore` 必须使用 `0`。非法结果保留队列消息，不创建 lease。
+旁路模型只接受 `{"decision":"trigger","anchor_seq":123}`、`{"decision":"wait","anchor_seq":null}` 或 `{"decision":"ignore","anchor_seq":null}`；`trigger` 必须选择真实 pending 消息的 seq，权限完全继承该消息。非法结果、超时或模型失败按不触发处理，并按持久化退避等待后续判断。
 `media_orphan_ttl_seconds` 到期后由下一次 adapter 启动或 turn 收尾清理遗留媒体目录。
 `processing_reaction_enabled` 默认开启；它使用 LLBot 的 `set_msg_emoji_like` 扩展，只作用于群聊真实消息 ID。添加或移除 reaction 的未知结果不会重放 Agent turn，也不会阻断队列 ack。
 
@@ -175,14 +176,16 @@ segment，并可带 caption/reply。Hermes 是否提供媒体结果聚合不影�
 群聊是 OneBot 11 的主要使用场景,权限分三层（详见 [docs/permissions.md](docs/permissions.md)）：
 
 1. **谁能入队**：群消息先按 `allowed_groups` 判断；私聊必须满足 `allowlist`，或在 `open` 策略下显式配置 allow-all。
-2. **谁能用工具**：`super_admins` 对应超级管理员；`roles.trusted_user.users` 可把指定 QQ 号标记为 trusted_user，但它和普通用户一样只能使用只读工具。
+2. **谁能用工具**：`super_admins` 对应超级管理员；`roles.trusted_user.users` 可把指定 QQ 号标记为 trusted_user。trusted_user 不能使用 OneBot 群管理写工具，但可按工具名显式获得 Hermes generic 能力。
 3. **会话范围**：工具和出站目标都绑定当前 `(session_id, turn_id)`，群里只能查/操作本群。
 4. **写操作**：模型第一次调用只返回 `/onebot confirm TOKEN`；确认命令在入站层执行，不进入 session 或队列。
 
 同一 anchor 批次可能来自多个用户，但权限主体始终是该 anchor 对应真实消息的触发用户；
 其他用户消息只作为不可信上下文，不会把普通用户升级为超级管理员，也不会改变当前群目标。
+OneBot turn 的 generic Hermes 工具同样经过 `pre_tool_call` 硬门禁；普通用户不能因为
+工具名不是 `qq_*` 就绕过角色配置，`delegate_task` 和 `tool_search` 当前始终拒绝。
 
-群级运维命令由超级管理员直接发送：`/onebot status`、`queue`、`flush`、`clear`、`pause`、`resume`、`resolve retry|discard`、`resolve action retry|discard OPERATION_ID` 和 `confirm TOKEN`。`clear` 不删除 Hermes session 历史，但会同时失效当前群旧的 debounce/活跃触发状态；`uncertain` 和 `failed` 都不会自动重试，必须明确 resolve。管理动作 `unknown` 的 `retry` 只解除重复执行阻断，之后仍需重新生成预览并确认，不会直接重放。
+群级运维命令由超级管理员直接发送：`/onebot status`、`queue`、`flush`、`clear`、`pause`、`resume`、`resolve retry|discard`、`resolve action retry|discard OPERATION_ID` 和 `confirm TOKEN`。`clear` 不删除 Hermes session 历史，但会同时失效当前群旧的 debounce/活跃触发状态；`uncertain` 和 `failed` 都不会自动重试，必须明确 resolve。队列消息的 `resolve retry` 只在旧 anchor 的 authority、真实消息和 batch 仍可证明时生成新的 request_id，并保留原权限；无法证明的旧记录保持 hold，不能由管理员身份或后续 selector 猜测接管。管理动作 `unknown` 的 `retry` 只解除重复执行阻断，之后仍需重新生成预览并确认，不会直接重放。
 
 ## 开发
 

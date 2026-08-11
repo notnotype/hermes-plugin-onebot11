@@ -159,3 +159,71 @@ async def test_reopen会取消旧heartbeat和恢复任务(tmp_path):
     assert not dispatcher._closed
     await dispatcher.close()
     store.close()
+
+
+async def test_cooldown恢复交给策略回调避免绕过selector(tmp_path, monkeypatch):
+    """启用策略回调时，dispatcher 不应直接创建 cooldown recovery anchor。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    message = _message("selector-recovery")
+    store.enqueue(message)
+    store._conn.execute(
+        "UPDATE onebot_queue_chat SET last_trigger_at=1 WHERE chat_id='888'"
+    )
+    store._conn.commit()
+    callback_calls: list[str] = []
+
+    async def recover_policy() -> bool:
+        """模拟 adapter 的 selector-aware recovery。"""
+        callback_calls.append("called")
+        return True
+
+    def fail_direct_recovery(*_args, **_kwargs):
+        """selector 路径不应调用 QueueStore 的 direct recovery。"""
+        raise AssertionError("cooldown recovery bypassed selector")
+
+    monkeypatch.setattr(store, "recover_due_triggers", fail_direct_recovery)
+    dispatcher = GroupDispatcher(
+        store,
+        lambda _lease: asyncio.sleep(0),
+        recovery_cooldown_seconds=5,
+        on_recovery_wakeup=recover_policy,
+    )
+    try:
+        assert await dispatcher.recover() == []
+        assert callback_calls == ["called"]
+        assert store.status("888")["pending_trigger_requests"] == 0
+    finally:
+        await dispatcher.close()
+        store.close()
+
+
+async def test_恢复策略异常时不回退direct_anchor(tmp_path, monkeypatch):
+    """selector-aware recovery 失败时只能保留 pending，不能 fail-open。"""
+    store = QueueStore(tmp_path / "queue.sqlite3")
+    store.enqueue(_message("selector-error"))
+    store._conn.execute(
+        "UPDATE onebot_queue_chat SET last_trigger_at=1 WHERE chat_id='888'"
+    )
+    store._conn.commit()
+
+    async def broken_policy() -> bool:
+        """模拟 adapter 恢复策略内部异常。"""
+        raise RuntimeError("selector state unavailable")
+
+    def fail_direct_recovery(*_args, **_kwargs):
+        """异常策略不能调用 direct cooldown recovery。"""
+        raise AssertionError("recovery fell back to direct anchor")
+
+    monkeypatch.setattr(store, "recover_due_triggers", fail_direct_recovery)
+    dispatcher = GroupDispatcher(
+        store,
+        lambda _lease: asyncio.sleep(0),
+        recovery_cooldown_seconds=5,
+        on_recovery_wakeup=broken_policy,
+    )
+    try:
+        assert await dispatcher.recover() == []
+        assert store.status("888")["pending_trigger_requests"] == 0
+    finally:
+        await dispatcher.close()
+        store.close()

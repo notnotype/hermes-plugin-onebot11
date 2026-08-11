@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .http_api import OneBotHttpApi
+from .http_api import OneBotHttpApi, is_numeric_message_id
 from .permissions import (
     CallerContext,
     parse_bool,
@@ -73,6 +73,18 @@ READ_TOOL_NAMES = frozenset(
 WRITE_TOOL_NAMES = frozenset(set(TOOL_SCHEMAS) - set(READ_TOOL_NAMES))
 
 
+def _require_real_message_id(value: Any) -> tuple[str | None, dict[str, Any] | None]:
+    """拒绝 hash message_key 进入只接受真实 OneBot 数字 ID 的 API。"""
+    normalized = str(value or "").strip()
+    if is_numeric_message_id(normalized):
+        return normalized, None
+    return None, {
+        "status": "invalid_message_id",
+        "error": "该消息只有本地 message_key，没有可查询的真实 OneBot message_id",
+        "message_key": normalized[:256],
+    }
+
+
 def _count(params: dict[str, Any]) -> int:
     """规范化查询条数。"""
     try:
@@ -84,7 +96,10 @@ def _count(params: dict[str, Any]) -> int:
 
 async def handle_get_message(api: OneBotHttpApi, params: dict[str, Any], ctx: CallerContext) -> dict[str, Any]:
     """查询当前群或当前私聊中的单条消息。"""
-    message = await api.get_message(str(params["message_id"]))
+    message_id, error_result = _require_real_message_id(params.get("message_id"))
+    if error_result is not None:
+        return error_result
+    message = await api.get_message(str(message_id))
     error = validate_message_scope(message, ctx)
     if error:
         return {"status": "permission_error", "error": error}
@@ -138,11 +153,14 @@ async def handle_write_action(api: OneBotHttpApi, tool_name: str, params: dict[s
     if ctx.chat_type != "group":
         return {"status": "permission_error", "error": "只能作用于当前群"}
     if tool_name == "qq_delete_message":
-        target = await api.get_message(str(params["message_id"]))
+        message_id, error_result = _require_real_message_id(params.get("message_id"))
+        if error_result is not None:
+            return error_result
+        target = await api.get_message(str(message_id))
         error = validate_message_scope(target, ctx)
         if error:
             return {"status": "permission_error", "error": error}
-        data = await api.call_action("delete_msg", {"message_id": int(str(params["message_id"]))}, retryable=False)
+        data = await api.call_action("delete_msg", {"message_id": int(str(message_id))}, retryable=False)
     elif tool_name == "qq_set_group_ban":
         data = await api.call_action(
             "set_group_ban",

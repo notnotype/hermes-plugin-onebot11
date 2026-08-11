@@ -20,6 +20,8 @@ class ParsedMessage:
 
     text: str = ""
     images: list[str] = field(default_factory=list)
+    image_urls: list[str] = field(default_factory=list)
+    image_files: list[str] = field(default_factory=list)
     mentioned_qq: list[str] = field(default_factory=list)
     mentioned_self: bool = False
     reply_to_message_id: str | None = None
@@ -82,17 +84,21 @@ def parse_message_segments(segments: list[dict[str, Any]] | str, self_id: str | 
             elif qq:
                 result.mentioned_qq.append(qq)
         elif seg_type == "image":
-            # NapCat/LLBot 可能同时提供 file 和 url；只有可直接下载的
-            # URL 才优先，否则回退到 file 标识，避免丢掉可用媒体引用。
+            # NapCat/LLBot 可能同时提供 file 和 url；每个 segment 只选一个
+            # 实际来源，但保留两类字段供 adapter 诊断。
             url_value = str(data.get("url") or "").strip()
             file_value = str(data.get("file") or "").strip()
-            file_id = (
-                url_value
-                if url_value.startswith(("http://", "https://"))
-                else file_value or url_value
-            )
-            if file_id:
-                result.images.append(str(file_id))
+            if file_value:
+                result.image_files.append(file_value)
+            if url_value.startswith(("http://", "https://")):
+                result.image_urls.append(url_value)
+                selected_source = url_value
+            else:
+                selected_source = file_value or url_value
+                if selected_source and selected_source != file_value:
+                    result.image_files.append(selected_source)
+            if selected_source:
+                result.images.append(selected_source)
                 result.markers.append("[image]")
         elif seg_type == "reply":
             reply_id = str(data.get("id") or "")

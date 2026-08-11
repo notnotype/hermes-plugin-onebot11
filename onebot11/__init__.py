@@ -37,10 +37,12 @@ from .permissions import CallerContext, ChatTarget, TurnBinding, TurnBindingStor
 from .queue import (
     OperationRecord,
     OperationStart,
+    QueueError,
     QueueLease,
     QueueMessage,
     QueueResetResult,
     QueueStore,
+    ReactionRecord,
     TriggerRequest,
 )
 
@@ -79,6 +81,8 @@ __all__ = [
     "QueueLease",
     "QueueMessage",
     "QueueResetResult",
+    "QueueError",
+    "ReactionRecord",
     "QueueStore",
     "TriggerRequest",
     "OperationRecord",

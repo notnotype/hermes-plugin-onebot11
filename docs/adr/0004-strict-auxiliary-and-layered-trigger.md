@@ -4,6 +4,8 @@
 - 日期：2026-08-06
 
 > 当前生产实现已改为插件自有 pi-ai helper；见 [ADR-0013](0013-plugin-owned-pi-ai-trigger-and-media-scope.md)。
+> 当前 selector 输出合同也已由 ADR-0013 更新为真实 `anchor_seq`，以下 JSON 仅保留历史
+> auxiliary 方案，不再是当前实现合同。
 
 ## 历史决策
 

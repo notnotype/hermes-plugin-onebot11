@@ -20,11 +20,15 @@ Hermes auxiliary，并要求 Hermes 暴露额外的 no-fallback 参数。这个�
    prompt、超时和密钥环境变量名；密钥值只从进程环境读取。
 3. 不使用 Hermes auxiliary、Hermes 主 Agent fallback 或插件侧语义重试。Node、
    依赖、provider/model、超时和非法结果都按 `ignore`，消息留在 pending。
-4. 内置 provider/model 使用 pi-ai catalog；自定义 provider 只允许
+4. selector 输出固定为 `trigger|wait|ignore` 加 `anchor_seq`：只有
+   `{"decision":"trigger","anchor_seq":N}` 能触发，且 N 必须是当前 pending
+   队列中真实消息的 seq；authority、role 和工具快照完全从该消息继承，模型不能
+   创建或修改权限。`wait`/`ignore` 使用 `anchor_seq:null`。
+5. 内置 provider/model 使用 pi-ai catalog；自定义 provider 只允许
    `http`/`https` OpenAI-compatible `base_url` 和合法 `api_key_env`。
-5. Agent 最终回复图片继续由 OneBot adapter 编码为受限 `base64://` segment，
+6. Agent 最终回复图片继续由 OneBot adapter 编码为受限 `base64://` segment，
    采用 best-effort。图片数量、单图/总量、魔数、临时目录和 lease fencing 仍由插件负责。
-6. 不扩展通用 `send_message`、cron/standalone sender 的 plugin media，也不修改
+7. 不扩展通用 `send_message`、cron/standalone sender 的 plugin media，也不修改
    Hermes 的全局媒体结果合同。
 
 ## 后果
