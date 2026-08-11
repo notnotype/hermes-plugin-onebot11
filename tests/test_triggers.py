@@ -486,6 +486,49 @@ def test_idle短确认词不直接唤醒():
     assert state.llm_calls == 0
 
 
+def test_judging中短确认词不打断当前selector判断():
+    """selector 正在判断时短确认词只标记 dirty，等待当前结果后再仲裁。"""
+    state = LayeredTriggerState(TriggerConfig(debounce_seconds=5))
+    state.on_turn_complete(success=True, now=0)
+    state.mode = "judging"
+    state.dirty_revision = 1
+
+    action = state.observe_message(
+        chat_type="group",
+        text="可以",
+        mentioned_self=False,
+        has_context=True,
+        revision=2,
+        now=1,
+    )
+
+    assert action.kind == "none"
+    assert action.reason == "judging_dirty"
+    assert state.dirty_revision == 2
+    assert state.llm_calls == 0
+
+
+def test_debounce中短确认词保持原有debounce():
+    """debounce 中短确认词按 trailing 语义延长窗口，不直接触发。"""
+    state = LayeredTriggerState(TriggerConfig(debounce_seconds=5))
+    state.on_turn_complete(success=True, now=0)
+    state.mode = "debounce"
+    state.debounce_due = 6
+
+    action = state.observe_message(
+        chat_type="group",
+        text="好的",
+        mentioned_self=False,
+        has_context=True,
+        revision=2,
+        now=3,
+    )
+
+    assert action.kind == "schedule"
+    assert state.mode == "debounce"
+    assert state.llm_calls == 0
+
+
 def test_失败turn即使保留pending也退出engaged():
     """失败、取消或 unknown 不能把下一条普通消息误当连续对话。"""
     state = LayeredTriggerState(TriggerConfig(debounce_seconds=5))
