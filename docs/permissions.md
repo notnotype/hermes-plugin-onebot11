@@ -85,8 +85,9 @@ tool-search、delegation 或子代理缺少 turn 身份时 fail-closed，不伪�
 
 Hermes 在 ReAct 过程中产生的 AI 中间评论（commentary）、工具进度和状态提示会直调 adapter 的
 `send()`；OneBot 插件用 `_send_with_retry`（最终回复）与直调 `send()`（中间消息）区分二者。
-默认群聊隐藏中间正文（避免刷屏）、私聊展示中间正文（便于观察思考过程），可通过
-`show_interim_group` / `show_interim_dm` 配置（热更新生效）。最终回复始终发送，不受该配置影响；
+默认私聊展示中间正文；群聊默认隐藏（避免刷屏），但可设置 `show_interim_group: true`
+开启（长任务如"生成一张图片"时能实时看到进度）。`show_interim_group` / `show_interim_dm`
+配置热更新生效。最终回复始终发送，不受该配置影响；
 Hermes cron 或系统通知若直发到群，也会按群聊中间正文规则处理，请按需配置。
 
 ## 运行时 reload
@@ -163,7 +164,12 @@ cron 和 standalone sender 的 plugin media 不在本轮可靠性合同内。
 - 旁路模型必须显式配置 provider、model 和群 allowlist。判断由插件自有 Node/pi-ai helper 发起，不经过 Hermes auxiliary，不调用主 Agent 作为隐式 fallback，也不主动切换 provider。`api_key_env` 只保存环境变量名，密钥值只从进程环境读取。
 - 启用旁路判断需要 Node.js ≥22.19 和插件目录中的 `npm ci --omit=dev`；Node、依赖、provider/model、超时或模型结果异常时按 `ignore`，消息保留在 pending。
 - 模型只能返回 `{"decision":"trigger","anchor_seq":123}`、`{"decision":"wait","anchor_seq":null}` 或 `{"decision":"ignore","anchor_seq":null}`。`trigger` 的序号必须真实存在于本次 pending 队列；非法 anchor、非法 JSON、超时或模型错误均不创建 trigger，消息留在 pending，并按 2/4/8 秒、最大 60 秒退避。新消息会提前唤醒判断。
-- 成功 turn 后进入最多 60 秒 idle 活跃窗口，最长连续活跃时间 300 秒，最多 3 次 LLM 仲裁；重启后 active/engaged 状态回到 idle，只恢复 SQLite 消息和显式 durable trigger。
+- 成功 turn 后进入最多 60 秒 idle 活跃窗口，最长连续活跃时间 300 秒；重启后 active/engaged 状态回到 idle，只恢复 SQLite 消息和显式 durable trigger。
+- **engage 三档预算**（只影响 debounce/窗口/仲裁次数/超时/输入大小，三态合同不变）：
+  - `deep`：bot 上轮回复以问句或请求短语收尾（`bot_asked`，只检查尾部 80 字）且同用户回复、消息引用 bot 上一条回复、或命中任务词（报错/复现/日志等）。同用户 follow-up 免 debounce 立即判断；窗口 180s/900s、最多 4 次仲裁、超时 45s、输入 20KB；`wait` 状态攒满 2 条新消息立即判。
+  - `normal`（默认）：60s/300s、2 次仲裁、超时 30s、输入 12KB。
+  - `shallow`：连续 2 次 ignore 后降级，窗口 30s/120s、1 次仲裁、超时 12s、输入 6KB；开启 `short_rule_max_chars` 后，无信号短消息本地 ignore 不进 selector。
+  - 他人插话不享受 deep；任何硬触发或新成功 turn 都回到 normal；重启后回 idle/normal。
 - status 中的 debounce/wait/engaged 时间以剩余秒数展示；LLM 审计区分实际 semaphore 等待时长、模型失败和结果未知。
 
 群历史摘要通过 Hermes 支持的 `channel_prompt` 临时注入，当前批次才写入普通 user transcript；摘要被标记为“不可信群消息数据”，其中的指令不能覆盖系统规则。上下文每条消息同时展示 `seq`、真实 `message_id`、`message_key`、用户、role、reply 和媒体标记。无真实 ID 时使用 `message_id=""` 与 `message_key="hash:<sha256>"` 分离保存；`qq_get_message` 和撤回工具会结构化拒绝 hash key。旧 Hermes 没有 `channel_prompt` 时退回有界单文本模式，并写入审计。群 `/context`、`/ctx` 是入队前旁路诊断，不进入 session 或队列。

@@ -49,6 +49,93 @@ class TriggerConfig:
     engaged_idle_seconds: float = 60.0
     engaged_max_seconds: float = 300.0
     engaged_max_arbitrations: int = 2
+    # 三档 engage 预算：shallow（省 token）/ normal（默认）/ deep（重要任务）。
+    # 只有预算不同，不改变 trigger/wait/ignore 三态合同。
+    shallow_engaged_idle_seconds: float = 30.0
+    shallow_engaged_max_seconds: float = 120.0
+    shallow_max_arbitrations: int = 1
+    shallow_timeout_seconds: float = 12.0
+    shallow_input_bytes: int = 6_000
+    deep_engaged_idle_seconds: float = 180.0
+    deep_engaged_max_seconds: float = 900.0
+    deep_max_arbitrations: int = 4
+    deep_timeout_seconds: float = 45.0
+    deep_input_bytes: int = 20_000
+    # deep 档 waiting 攒满 N 条新消息立即判，不等到期。
+    deep_wait_messages: int = 2
+    # bot 上轮回复以这些请求短语收尾时视为"正在等待用户提供信息"；
+    # 只放明确的动词短语，避免"日志/截图"等名词单独出现造成误判。
+    bot_asked_words: tuple[str, ...] = (
+        "复现一下",
+        "请复现",
+        "发我",
+        "发给我",
+        "发一下",
+        "贴一下",
+        "提供一下",
+        "请提供",
+        "发个日志",
+        "贴个日志",
+        "发个截图",
+        "截图给我",
+        "发下日志",
+        "发下截图",
+        "告诉",
+    )
+    # 任务词命中时升级 deep 预算（只升预算，仍走 selector）。
+    task_words: tuple[str, ...] = (
+        "报错",
+        "错误",
+        "坏了",
+        "崩溃",
+        "复现",
+        "日志",
+        "截图",
+        "帮忙",
+        "帮我看看",
+    )
+    # engaged 中短消息（≤ 该字数）且 bot 未提问、非问句、无回指、未引用
+    # bot 时本地判 ignore，不进 selector，省成本并让群聊更安静。
+    # 默认 0 = 关闭：短确认词仍统一交给 selector（既有合同），需要更安静
+    # 的群可按需开启。
+    short_rule_max_chars: int = 0
+
+    def tier_for(self, level: str) -> EngagementTier:
+        """按 level 返回对应预算档，normal 使用现有顶层参数。"""
+        if level == "shallow":
+            return EngagementTier(
+                idle_seconds=self.shallow_engaged_idle_seconds,
+                max_seconds=self.shallow_engaged_max_seconds,
+                max_arbitrations=self.shallow_max_arbitrations,
+                timeout_seconds=self.shallow_timeout_seconds,
+                input_bytes=self.shallow_input_bytes,
+            )
+        if level == "deep":
+            return EngagementTier(
+                idle_seconds=self.deep_engaged_idle_seconds,
+                max_seconds=self.deep_engaged_max_seconds,
+                max_arbitrations=self.deep_max_arbitrations,
+                timeout_seconds=self.deep_timeout_seconds,
+                input_bytes=self.deep_input_bytes,
+            )
+        return EngagementTier(
+            idle_seconds=self.engaged_idle_seconds,
+            max_seconds=self.engaged_max_seconds,
+            max_arbitrations=self.engaged_max_arbitrations,
+            timeout_seconds=self.llm_timeout_seconds,
+            input_bytes=self.llm_input_bytes,
+        )
+
+
+@dataclass(frozen=True)
+class EngagementTier:
+    """一个 engage 预算档的解析结果。"""
+
+    idle_seconds: float
+    max_seconds: float
+    max_arbitrations: int
+    timeout_seconds: float
+    input_bytes: int
 
 
 @dataclass(frozen=True)
@@ -78,6 +165,7 @@ class LayeredTriggerState:
 
     config: TriggerConfig
     mode: str = "idle"
+    level: str = "normal"
     debounce_due: float | None = None
     wait_until: float | None = None
     engaged_until: float | None = None
@@ -90,8 +178,13 @@ class LayeredTriggerState:
     last_candidate_type: str = ""
     dirty_revision: int | None = None
     last_message_at: float | None = None
+    last_user_id: str = ""
+    bot_asked: bool = False
+    ignore_streak: int = 0
+    wait_message_count: int = 0
     _candidate_type: str = field(default="", repr=False)
     _judgement_generation: int = field(default=0, repr=False)
+    _window_arbitration_limit: int = field(default=0, repr=False)
 
     def observe_message(
         self,
@@ -103,6 +196,8 @@ class LayeredTriggerState:
         revision: int,
         now: float,
         last_trigger_at: float | None = None,
+        user_id: str = "",
+        reply_to_bot: bool = False,
     ) -> TriggerAction:
         """观察一条已入队消息，返回直接触发或安排仲裁的动作。"""
         # 记录本群消息间隔，用于自适应节流：距上一条消息超过 debounce
@@ -130,6 +225,12 @@ class LayeredTriggerState:
             # 硬触发已经在上面提前返回。
             return TriggerAction("none", reason="no_text")
 
+        normalized_user_id = str(user_id or "").strip()
+        same_user = bool(
+            normalized_user_id and normalized_user_id == self.last_user_id
+        )
+        self.last_user_id = normalized_user_id
+
         if self.mode == "judging":
             self.dirty_revision = revision
             return TriggerAction("none", reason="judging_dirty")
@@ -137,19 +238,48 @@ class LayeredTriggerState:
         if self.mode == "engaged":
             if self.engaged_until is not None and now >= self.engaged_until:
                 self._leave_engaged()
-            elif self.arbitration_count >= self.config.engaged_max_arbitrations:
-                return TriggerAction("none", reason="arbitration_limit")
-            elif self.config.question_enabled and is_question(text):
-                # 连续对话中的问句仍按 question 候选处理：本地词表能识别
-                # 不带问号的问句（如"你吃饭了吗"），避免低价模型在 engaged
-                # 提示词里漏判。
-                return self._schedule("question", revision, now, gap=gap)
             else:
+                # 先做分级升级/降级，再按对应档位预算安排仲裁。
+                level = self._level_for_engaged(
+                    text,
+                    same_user=same_user,
+                    reply_to_bot=reply_to_bot,
+                )
+                self.level = level
+                if self.arbitration_count >= self._window_arbitration_limit:
+                    return TriggerAction("none", reason="arbitration_limit")
+                if self.config.question_enabled and is_question(text):
+                    # 连续对话中的问句仍按 question 候选处理：本地词表能识别
+                    # 不带问号的问句（如"你吃饭了吗"），避免低价模型在 engaged
+                    # 提示词里漏判。
+                    return self._schedule("question", revision, now, gap=gap)
+                if self._short_rule_ignore(text):
+                    return TriggerAction("none", reason="short_rule_ignore")
+                # deep 档同用户 follow-up 立即判，不等 trailing debounce。
+                if level == "deep" and same_user:
+                    return self._schedule(
+                        "engaged",
+                        revision,
+                        now,
+                        gap=None,
+                    )
                 return self._schedule("engaged", revision, now, gap=gap)
 
         if self.mode == "waiting":
-            if self.arbitration_count >= self.config.engaged_max_arbitrations:
+            if self.arbitration_count >= self._window_arbitration_limit:
                 return TriggerAction("none", reason="arbitration_limit")
+            # deep 档按"新增消息数"判定：攒满 N 条新消息立即仲裁，不等到期。
+            if self.level == "deep" and self.config.deep_wait_messages > 0:
+                self.wait_message_count += 1
+                if self.wait_message_count >= self.config.deep_wait_messages:
+                    return self._schedule(
+                        "wait_followup",
+                        revision,
+                        now,
+                        gap=None,
+                    )
+                # 尚未攒满：消息继续留在 pending，等待后续新消息或 wait 到期。
+                return TriggerAction("none", reason="wait_collecting")
             return self._schedule("wait_followup", revision, now, gap=gap)
 
         if self.mode == "debounce":
@@ -225,6 +355,9 @@ class LayeredTriggerState:
             self.mode = "idle"
             self._candidate_type = ""
             self.dirty_revision = None
+            self.level = "normal"
+            self.ignore_streak = 0
+            self.wait_message_count = 0
             return TriggerAction(
                 "direct",
                 reason="llm",
@@ -240,6 +373,14 @@ class LayeredTriggerState:
             self.dirty_revision = None
             return TriggerAction("wait", reason="llm_wait", due_at=self.wait_until)
         if decision == "ignore" and anchor_seq is None:
+            self.ignore_streak += 1
+            self.wait_message_count = 0
+            # 连续 ignore 使预算降档，避免同一窗口反复消耗 selector。
+            if self.ignore_streak >= 2 and self.level != "shallow":
+                if self.level == "deep":
+                    self.level = "normal"
+                else:
+                    self.level = "shallow"
             self._return_to_engaged_or_idle(now)
             self.wait_until = None
             self._candidate_type = ""
@@ -288,13 +429,18 @@ class LayeredTriggerState:
         """暂停群级自动触发，并让未完成旁路判断失效。"""
         self._judgement_generation += 1
         self.mode = "idle"
+        self.level = "normal"
         self.debounce_due = None
         self.wait_until = None
         self.engaged_until = None
         self.engaged_max_until = None
         self.arbitration_count = 0
+        self._window_arbitration_limit = 0
         self._candidate_type = ""
         self.dirty_revision = None
+        self.bot_asked = False
+        self.ignore_streak = 0
+        self.wait_message_count = 0
 
     def judgement_is_current(self, generation: int | None) -> bool:
         """判断旁路结果是否仍属于当前群的这次仲裁。"""
@@ -308,10 +454,15 @@ class LayeredTriggerState:
         """使已经离开当前状态机的旁路结果永久失效并回到 idle。"""
         self._judgement_generation += 1
         self.mode = "idle"
+        self.level = "normal"
         self.debounce_due = None
         self.wait_until = None
         self._candidate_type = ""
         self.dirty_revision = None
+        self._window_arbitration_limit = 0
+        self.bot_asked = False
+        self.ignore_streak = 0
+        self.wait_message_count = 0
 
     def generation_matches(self, generation: int | None) -> bool:
         """只校验 generation 坐标，不要求状态仍处于 judging。"""
@@ -324,6 +475,8 @@ class LayeredTriggerState:
         now: float,
         preserve_pending: bool = False,
         has_hard_trigger: bool = False,
+        bot_asked: bool = False,
+        anchor_user_id: str = "",
     ) -> None:
         """成功 Agent turn 进入 engaged；有新消息时不覆盖其待处理状态。"""
         if preserve_pending and not success:
@@ -348,12 +501,26 @@ class LayeredTriggerState:
         self.dirty_revision = None
         if not success:
             self._leave_engaged()
+            self.bot_asked = False
+            self.level = "normal"
+            self.ignore_streak = 0
+            self.wait_message_count = 0
             return
+        # 只有成功回复才更新 bot_asked：bot 以问句/请求收尾时，用户下一条
+        # 消息应得到大预算（deep），这是"重要消息"最确定的本地信号。
+        self.bot_asked = bool(bot_asked)
+        self.level = "deep" if self.bot_asked else "normal"
+        self.ignore_streak = 0
+        self.wait_message_count = 0
+        if anchor_user_id:
+            self.last_user_id = str(anchor_user_id)
+        tier = self.config.tier_for(self.level)
         if self.engaged_max_until is None or self.engaged_max_until <= now:
-            self.engaged_max_until = now + self.config.engaged_max_seconds
+            self.engaged_max_until = now + tier.max_seconds
             self.arbitration_count = 0
+            self._window_arbitration_limit = tier.max_arbitrations
         self.engaged_until = min(
-            now + self.config.engaged_idle_seconds,
+            now + tier.idle_seconds,
             self.engaged_max_until,
         )
         self.mode = "engaged"
@@ -373,7 +540,55 @@ class LayeredTriggerState:
             "model_failures": self.model_failures,
             "llm_failures": self.llm_failures,
             "last_candidate_type": self.last_candidate_type,
+            "level": self.level,
+            "bot_asked": self.bot_asked,
+            "ignore_streak": self.ignore_streak,
+            "wait_message_count": self.wait_message_count,
         }
+
+    def _level_for_engaged(
+        self,
+        text: str,
+        *,
+        same_user: bool,
+        reply_to_bot: bool,
+    ) -> str:
+        """按本地信号决定 engaged 消息的预算档，只升级预算不直接触发。"""
+        if reply_to_bot:
+            # 引用 bot 上一条回复是最强的继续对话信号。
+            return "deep"
+        if self.bot_asked:
+            if same_user:
+                # bot 上轮问了用户、用户回复：最重要的大预算场景。
+                return "deep"
+            # 他人插话不享受 deep，回落 normal 预算。
+            return "normal"
+        if self.config.task_words and any(
+            word in (text or "") for word in self.config.task_words
+        ):
+            return "deep"
+        if self.ignore_streak >= 2:
+            return "shallow"
+        return self.level
+
+    def _short_rule_ignore(self, text: str) -> bool:
+        """shallow 档的短消息且无任何信号时本地判 ignore，不进 selector。
+
+        只在连续 ignore 降级到 shallow 后生效，避免破坏正常 engaged 中
+        短确认词统一交给 selector 的合同。
+        """
+        if self.level != "shallow":
+            return False
+        limit = self.config.short_rule_max_chars
+        if limit <= 0 or len((text or "").strip()) > limit:
+            return False
+        if self.bot_asked:
+            return False
+        if is_question(text):
+            return False
+        if memory_matches(text, self.config.memory_words):
+            return False
+        return True
 
     def _candidate_type_for(self, text: str, has_context: bool) -> str:
         """按 balanced 策略识别问句和有上下文的记忆回指。"""
@@ -442,9 +657,14 @@ class LayeredTriggerState:
     def _leave_engaged(self) -> None:
         """离开活跃窗口并重置其仲裁预算。"""
         self.mode = "idle"
+        self.level = "normal"
         self.engaged_until = None
         self.engaged_max_until = None
         self.arbitration_count = 0
+        self._window_arbitration_limit = 0
+        self.bot_asked = False
+        self.ignore_streak = 0
+        self.wait_message_count = 0
 
     def _return_to_engaged_or_idle(self, now: float) -> None:
         """仲裁不触发时保留尚未到期的活跃窗口。"""
@@ -721,6 +941,197 @@ def build_trigger_config(extra: dict[str, Any]) -> TriggerConfig:
         minimum=0,
         maximum=32,
     )
+    # 三档 engage 预算：shallow / normal / deep。normal 复用顶层参数；
+    # 分档键名统一为 {档位}_{字段}，可放在 llm_trigger 顶层或嵌套 tiers。
+    raw_tiers = raw_llm.get("tiers")
+    if raw_tiers is None:
+        raw_tiers = {}
+    if not isinstance(raw_tiers, Mapping):
+        raise ValueError("llm_trigger.tiers 必须是 YAML mapping")
+    shallow_tier = raw_tiers.get("shallow") if isinstance(
+        raw_tiers.get("shallow"), Mapping
+    ) else {}
+    deep_tier = raw_tiers.get("deep") if isinstance(
+        raw_tiers.get("deep"), Mapping
+    ) else {}
+    if raw_tiers.get("shallow") is not None and not isinstance(
+        raw_tiers.get("shallow"), Mapping
+    ):
+        raise ValueError("llm_trigger.tiers.shallow 必须是 YAML mapping")
+    if raw_tiers.get("deep") is not None and not isinstance(
+        raw_tiers.get("deep"), Mapping
+    ):
+        raise ValueError("llm_trigger.tiers.deep 必须是 YAML mapping")
+
+    shallow_idle = _bounded_float(
+        _setting(
+            extra,
+            shallow_tier,
+            "shallow_engaged_idle_seconds",
+            shallow_tier.get("engaged_idle_seconds", 30),
+        ),
+        name="shallow_engaged_idle_seconds",
+        minimum=1.0,
+        maximum=3600.0,
+    )
+    shallow_max = _bounded_float(
+        _setting(
+            extra,
+            shallow_tier,
+            "shallow_engaged_max_seconds",
+            shallow_tier.get("max_seconds", 120),
+        ),
+        name="shallow_engaged_max_seconds",
+        minimum=shallow_idle,
+        maximum=86_400.0,
+    )
+    shallow_arbitrations = _bounded_int(
+        _setting(
+            extra,
+            shallow_tier,
+            "shallow_max_arbitrations",
+            shallow_tier.get("max_arbitrations", 1),
+        ),
+        name="shallow_max_arbitrations",
+        minimum=0,
+        maximum=32,
+    )
+    shallow_timeout = _bounded_float(
+        _setting(
+            extra,
+            shallow_tier,
+            "shallow_timeout_seconds",
+            shallow_tier.get("timeout_seconds", 12),
+        ),
+        name="shallow_timeout_seconds",
+        minimum=0.1,
+        maximum=300.0,
+    )
+    shallow_input = _bounded_int(
+        _setting(
+            extra,
+            shallow_tier,
+            "shallow_input_bytes",
+            shallow_tier.get("input_bytes", 6_000),
+        ),
+        name="shallow_input_bytes",
+        minimum=768,
+        maximum=64_000,
+    )
+    deep_idle = _bounded_float(
+        _setting(
+            extra,
+            deep_tier,
+            "deep_engaged_idle_seconds",
+            deep_tier.get("engaged_idle_seconds", 180),
+        ),
+        name="deep_engaged_idle_seconds",
+        minimum=1.0,
+        maximum=86_400.0,
+    )
+    deep_max = _bounded_float(
+        _setting(
+            extra,
+            deep_tier,
+            "deep_engaged_max_seconds",
+            deep_tier.get("max_seconds", 900),
+        ),
+        name="deep_engaged_max_seconds",
+        minimum=deep_idle,
+        maximum=86_400.0,
+    )
+    deep_arbitrations = _bounded_int(
+        _setting(
+            extra,
+            deep_tier,
+            "deep_max_arbitrations",
+            deep_tier.get("max_arbitrations", 4),
+        ),
+        name="deep_max_arbitrations",
+        minimum=0,
+        maximum=32,
+    )
+    deep_timeout = _bounded_float(
+        _setting(
+            extra,
+            deep_tier,
+            "deep_timeout_seconds",
+            deep_tier.get("timeout_seconds", 45),
+        ),
+        name="deep_timeout_seconds",
+        minimum=0.1,
+        maximum=300.0,
+    )
+    deep_input = _bounded_int(
+        _setting(
+            extra,
+            deep_tier,
+            "deep_input_bytes",
+            deep_tier.get("input_bytes", 20_000),
+        ),
+        name="deep_input_bytes",
+        minimum=768,
+        maximum=64_000,
+    )
+    deep_wait_messages = _bounded_int(
+        _setting(
+            extra,
+            deep_tier,
+            "deep_wait_messages",
+            deep_tier.get("wait_messages", 2),
+        ),
+        name="deep_wait_messages",
+        minimum=0,
+        maximum=32,
+    )
+    bot_asked_words = _parse_keywords(
+        _setting(
+            extra,
+            raw_llm,
+            "bot_asked_words",
+            (
+                "复现一下",
+                "请复现",
+                "发我",
+                "发给我",
+                "发一下",
+                "贴一下",
+                "提供一下",
+                "请提供",
+                "发个日志",
+                "贴个日志",
+                "发个截图",
+                "截图给我",
+                "发下日志",
+                "发下截图",
+                "告诉",
+            ),
+        )
+    )
+    task_words = _parse_keywords(
+        _setting(
+            extra,
+            raw_llm,
+            "task_words",
+            (
+                "报错",
+                "错误",
+                "坏了",
+                "崩溃",
+                "复现",
+                "日志",
+                "截图",
+                "帮忙",
+                "帮我看看",
+            ),
+        )
+    )
+    short_rule_chars = _bounded_int(
+        _setting(extra, raw_llm, "short_rule_max_chars", 0),
+        name="short_rule_max_chars",
+        minimum=0,
+        maximum=200,
+    )
     question_enabled = parse_bool(
         _setting(extra, raw_llm, "question_trigger_enabled", True),
         default=True,
@@ -761,6 +1172,20 @@ def build_trigger_config(extra: dict[str, Any]) -> TriggerConfig:
         engaged_idle_seconds=engaged_idle,
         engaged_max_seconds=engaged_max,
         engaged_max_arbitrations=engaged_arbitrations,
+        shallow_engaged_idle_seconds=shallow_idle,
+        shallow_engaged_max_seconds=shallow_max,
+        shallow_max_arbitrations=shallow_arbitrations,
+        shallow_timeout_seconds=shallow_timeout,
+        shallow_input_bytes=shallow_input,
+        deep_engaged_idle_seconds=deep_idle,
+        deep_engaged_max_seconds=deep_max,
+        deep_max_arbitrations=deep_arbitrations,
+        deep_timeout_seconds=deep_timeout,
+        deep_input_bytes=deep_input,
+        deep_wait_messages=deep_wait_messages,
+        bot_asked_words=bot_asked_words,
+        task_words=task_words,
+        short_rule_max_chars=short_rule_chars,
     )
 
 

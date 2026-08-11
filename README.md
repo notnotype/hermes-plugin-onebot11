@@ -136,9 +136,25 @@ platforms:
         engaged_idle_seconds: 60
         engaged_max_seconds: 300
         engaged_max_arbitrations: 2
+        # 三档 engage 预算（可选，默认值如下；只有预算不同，判断仍走 selector）
+        tiers:
+          shallow:                       # 普通闲聊：省 token、更快
+            engaged_idle_seconds: 30
+            max_seconds: 120
+            max_arbitrations: 1
+            timeout_seconds: 12
+            input_bytes: 6000
+          deep:                          # 重要任务：大预算
+            engaged_idle_seconds: 180
+            max_seconds: 900
+            max_arbitrations: 4
+            timeout_seconds: 45
+            input_bytes: 20000
+            wait_messages: 2             # waiting 攒满 2 条新消息立即判
+        short_rule_max_chars: 0          # 0=关闭；>0 时 shallow 档短消息本地 ignore
       processing_reaction_enabled: true
       processing_reaction_emoji_id: "128172"  # LLBot 的 💬，表示正在回复
-      show_interim_group: false   # 群聊隐藏 Hermes 中间正文（commentary/进度）
+      show_interim_group: true    # 群聊展示 Hermes 中间正文（commentary/进度）
       show_interim_dm: true       # 私聊展示 Hermes 中间正文
       roles:
         user:
@@ -158,6 +174,16 @@ platforms:
 才按最多 3 次的 2/4/8 秒退避恢复，达到上限进入 `failed`。出站已开始、阶段未知或租约阶段缺失进入 `uncertain`。
 LLM trigger 默认关闭，启用时必须同时配置明确的 `provider`、`model` 和群 allowlist；每群最多一个判断任务，使用 5 秒 debounce 和全局并发上限。判断由插件自有 Node helper 通过固定版本 `@earendil-works/pi-ai` 发起，不经过 Hermes auxiliary，不回退 Hermes 主 Agent，也不主动切换 provider。`api_key_env` 只保存环境变量名，密钥值不会进入 YAML、命令行、日志或 SQLite。Node、依赖缺失、超时、非法 JSON 或模型失败都按不触发处理，消息继续留在 pending。
 旁路模型只接受 `{"decision":"trigger","anchor_seq":123}`、`{"decision":"wait","anchor_seq":null}` 或 `{"decision":"ignore","anchor_seq":null}`；`trigger` 必须选择真实 pending 消息的 seq，权限完全继承该消息。非法结果、超时或模型失败按不触发处理，并按持久化退避等待后续判断。
+
+#### Engage 分级预算
+
+成功回复后进入 engaged 时，插件会按上下文选择三档预算（只影响 debounce/窗口/仲裁次数/超时/输入大小，`trigger/wait/ignore` 三态合同不变）：
+
+- `deep`（重要任务）：bot 上轮回复以问句/请求收尾且同用户回复、消息引用 bot 上一条回复、或命中任务词（报错/复现/日志等）。同用户 follow-up 免 debounce 立即判断；窗口 180s/900s、最多 4 次仲裁、超时 45s、输入 20KB；`wait` 状态下攒满 2 条新消息立即判，不等窗口到期。
+- `normal`（默认）：现状 60s/300s、2 次仲裁、超时 30s、输入 12KB。
+- `shallow`（省 token）：连续 2 次 ignore 后降级。窗口 30s/120s、1 次仲裁、超时 12s、输入 6KB。开启 `short_rule_max_chars` 后，shallow 档无信号的短消息（≤ N 字、非问句、无回指、未引用 bot、bot 未提问）本地判 ignore，不进 selector。
+
+`bot_asked` 只由成功回复文本决定：回复以问句或明确的请求短语（"复现一下/发我/贴一下"等，只检查尾部 80 字）收尾时，bot 下一条同用户消息获得 deep 预算。他人插话不享受 deep，回落 normal。重启后所有档位回到 idle/normal，不持久化。
 `media_orphan_ttl_seconds` 到期后由下一次 adapter 启动或 turn 收尾清理遗留媒体目录。
 `processing_reaction_enabled` 默认开启；它使用 LLBot 的 `set_msg_emoji_like` 扩展，只作用于群聊真实消息 ID。回复阶段的 💬 使用 `processing_reaction_emoji_id`（默认 `128172`）；selector 判断阶段的 👀 使用固定 ID `128064`（LLBot/QQ 已验证支持；`9203` 即 ⏳ 与 `8971` 在 QQ reaction API 上显示异常）。添加或移除 reaction 的未知结果不会重放 Agent turn，也不会阻断队列 ack。
 

@@ -4299,7 +4299,7 @@ async def test_长时间运行提示只发送一次且不污染业务marker(
         await asyncio.sleep(0)
         assert len(calls) == 1
         assert calls[0]["params"]["message"][1]["data"]["text"] == (
-            "⏳ 仍在处理中，请稍候。"
+            "仍在处理中，请稍候…"
         )
         assert adapter._outbound_started == set()
         assert adapter.SUPPORTS_MESSAGE_EDITING is False
@@ -5131,6 +5131,36 @@ async def test_群聊中间正文可配置为展示(monkeypatch, fake_http_serve
         result = await adapter.send("888", "让我查一下…")
         assert result.success
         assert calls and calls[0]["path"] == "/send_group_msg"
+    finally:
+        await adapter.disconnect()
+
+
+async def test_回复以问句或请求收尾时标记bot_asked(monkeypatch, fake_http_server):
+    """bot 回复问句/请求信息时，完成 turn 应进入 deep engaged 预算。"""
+    base, calls = fake_http_server
+    adapter = _make_adapter(monkeypatch, ONEBOT11_HTTP_API=base, ONEBOT11_SELF_ID="1")
+    await adapter.connect()
+    try:
+        assert adapter._reply_asks_user("请把报错日志发我") is True
+        assert adapter._reply_asks_user("你能复现一下吗？") is True
+        assert adapter._reply_asks_user("这是日志内容") is False
+        assert adapter._reply_asks_user("好的，马上处理") is False
+        assert adapter._reply_asks_user("") is False
+    finally:
+        await adapter.disconnect()
+
+
+async def test_消息回复bot最后一条消息时识别为回复bot(monkeypatch, fake_http_server):
+    """reply 目标等于 bot 最后发送的消息 ID 时视为引用 bot。"""
+    base, calls = fake_http_server
+    adapter = _make_adapter(monkeypatch, ONEBOT11_HTTP_API=base, ONEBOT11_SELF_ID="1")
+    await adapter.connect()
+    try:
+        adapter._last_bot_message_ids["888"] = "10086"
+        assert adapter._message_replies_to_bot("888", "10086") is True
+        assert adapter._message_replies_to_bot("888", "10087") is False
+        assert adapter._message_replies_to_bot("888", "") is False
+        assert adapter._message_replies_to_bot("999", "10086") is False
     finally:
         await adapter.disconnect()
 

@@ -101,7 +101,7 @@ class RuntimePolicySnapshot:
     processing_reaction_enabled: bool
     processing_reaction_emoji_id: str
     plain_text_enabled: bool = True
-    long_running_notice_seconds: float = 180.0
+    long_running_notice_seconds: float = 60.0
     show_interim_group: bool = False
     show_interim_dm: bool = True
 
@@ -423,7 +423,7 @@ def parse_runtime_config(
     long_running_notice_seconds = _float(
         effective.get("long_running_notice_seconds"),
         name="long_running_notice_seconds",
-        default=180.0,
+        default=60.0,
         minimum=0.0,
         maximum=86_400.0,
     )

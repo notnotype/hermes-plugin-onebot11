@@ -90,6 +90,7 @@ READ_TOOL_NAMES = _proto.tools.READ_TOOL_NAMES
 TOOL_SCHEMAS = _proto.tools.TOOL_SCHEMAS
 WRITE_TOOL_NAMES = _proto.tools.WRITE_TOOL_NAMES
 build_llm_trigger_input = _proto.triggers.build_llm_trigger_input
+is_question = _proto.triggers.is_question
 PiAiTriggerClient = _proto.pi_ai.PiAiTriggerClient
 PiAiTriggerError = _proto.pi_ai.PiAiTriggerError
 ConversationCommand = _proto.commands.ConversationCommand
@@ -164,6 +165,7 @@ class DeliverySummary:
     known_failed: int = 0
     unknown: int = 0
     fenced: int = 0
+    last_text: str = ""
 
     @property
     def all_successful(self) -> bool:
@@ -503,6 +505,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._outbound_successful: set[str] = set()
         self._outbound_known_failure: set[str] = set()
         self._delivery_summaries: dict[str, DeliverySummary] = {}
+        self._last_bot_message_ids: dict[str, str] = {}
         self._processing_reaction_message_ids: dict[str, str] = {}
         self._queued_reaction_message_ids: dict[str, tuple[str, str]] = {}
         self._queued_reaction_tasks: dict[str, asyncio.Task[None]] = {}
@@ -786,6 +789,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._outbound_successful.clear()
         self._outbound_known_failure.clear()
         self._delivery_summaries.clear()
+        self._last_bot_message_ids.clear()
         self._lease_session_keys.clear()
         self._pending_completions.clear()
         self._processing_reaction_message_ids.clear()
@@ -1950,19 +1954,37 @@ class OneBot11Adapter(BasePlatformAdapter):
             chat_id = str(target.get("chat_id") or "")
             if not chat_id or not self._chat_access_allowed("group", chat_id):
                 return
-            metadata["hermes_control_plane"] = True
-            metadata["hermes_control_kind"] = "long_running"
-            result = await self._send_control_plane(
+            # 控制面通知不需要 Hermes turn binding：lease 与访问策略已在
+            # 上方校验，直接走 OneBot API 发送，避免 worker 线程 binding
+            # 恢复失败导致提示永远发不出去。
+            result = await self._send_notice_message(
                 chat_id,
-                "⏳ 仍在处理中，请稍候。",
+                "仍在处理中，请稍候…",
                 reply_to=str(metadata.get("onebot11_anchor_message_id") or "") or None,
-                metadata=metadata,
             )
             if not result.success:
                 logger.info(
                     "OneBot11 长时间处理提示未发送: lease=%s error=%s",
                     lease_id,
                     result.error,
+                )
+                self._audit.record(
+                    "long_running_notice",
+                    {
+                        "chat_id": chat_id,
+                        "lease_id": lease_id,
+                        "sent": False,
+                        "error": str(result.error or "")[:200],
+                    },
+                )
+            else:
+                self._audit.record(
+                    "long_running_notice",
+                    {
+                        "chat_id": chat_id,
+                        "lease_id": lease_id,
+                        "sent": True,
+                    },
                 )
         except asyncio.CancelledError:
             return
@@ -1976,6 +1998,40 @@ class OneBot11Adapter(BasePlatformAdapter):
             current = self._long_running_notice_tasks.get(lease_id)
             if current is asyncio.current_task():
                 self._long_running_notice_tasks.pop(lease_id, None)
+
+    async def _send_notice_message(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        reply_to: str | None = None,
+    ) -> SendResult:
+        """发送一条不带 Hermes turn 身份的控制面提示消息。"""
+        if self._closed or self._ws is None:
+            return SendResult(False, error="OneBot11 adapter is closed", error_kind="not_found")
+        try:
+            async with self._outbound_gate:
+                if self._closed:
+                    return SendResult(False, error="OneBot11 adapter is closed", error_kind="not_found")
+                sent_id = await self._api.send_message(
+                    chat_id,
+                    content,
+                    chat_type="group",
+                    reply_to=reply_to,
+                )
+                if not sent_id:
+                    return SendResult(
+                        False,
+                        error="OneBot 成功响应缺少 message_id，出站结果未知",
+                        error_kind="unknown",
+                    )
+                return SendResult(True, message_id=str(sent_id))
+        except Exception as exc:
+            return SendResult(
+                False,
+                error=f"OneBot 控制面提示发送失败: {exc}",
+                error_kind="unknown",
+            )
 
     async def _cancel_long_running_notice(self, lease_id: str) -> None:
         """取消一个 turn 的一次性长时间提示。"""
@@ -2234,6 +2290,11 @@ class OneBot11Adapter(BasePlatformAdapter):
                         revision=int(status.get("revision", 0)),
                         now=now,
                         last_trigger_at=previous_trigger_at,
+                        user_id=str(message.user_id or ""),
+                        reply_to_bot=self._message_replies_to_bot(
+                            chat_id,
+                            str(message.metadata.get("onebot11_reply_to") or ""),
+                        ),
                     )
                     if action.kind == "schedule":
                         await self._apply_trigger_action_locked(chat_id, action)
@@ -2959,6 +3020,11 @@ class OneBot11Adapter(BasePlatformAdapter):
                         revision=revision,
                         now=time.monotonic(),
                         last_trigger_at=last_trigger_at,
+                        user_id=str(message.user_id or ""),
+                        reply_to_bot=self._message_replies_to_bot(
+                            normalized,
+                            str(message.metadata.get("onebot11_reply_to") or ""),
+                        ),
                     )
                     if action.kind == "direct":
                         hard_reason = action.reason if action.reason in {
@@ -3269,10 +3335,17 @@ class OneBot11Adapter(BasePlatformAdapter):
                                 )
                                 if not observed_revision:
                                     observed_revision = int(status.get("revision", 0))
+                                # 按当前 engage 预算档选择输入预算和超时。
+                                trigger_state = self._trigger_states.get(normalized)
+                                tier = (
+                                    trigger_state.config.tier_for(trigger_state.level)
+                                    if trigger_state is not None
+                                    else self.trigger_config.tier_for("normal")
+                                )
                                 prompt = build_llm_trigger_input(
                                     str(status.get("summary") or ""),
                                     messages,
-                                    self.trigger_config.llm_input_bytes,
+                                    tier.input_bytes,
                                     candidate_type=candidate_type,
                                 )
                                 input_bytes = len(prompt.encode("utf-8"))
@@ -3288,7 +3361,12 @@ class OneBot11Adapter(BasePlatformAdapter):
                 return
             client, prompt, semaphore = request
             semaphore_wait_started = time.monotonic()
-            timeout_seconds = self.trigger_config.llm_timeout_seconds
+            trigger_state = self._trigger_states.get(normalized)
+            timeout_seconds = (
+                trigger_state.config.tier_for(trigger_state.level).timeout_seconds
+                if trigger_state is not None
+                else self.trigger_config.llm_timeout_seconds
+            )
             remaining = timeout_seconds - (time.monotonic() - started_at)
             if remaining <= 0:
                 raise TimeoutError("OneBot11 LLM trigger 总超时")
@@ -4515,11 +4593,22 @@ class OneBot11Adapter(BasePlatformAdapter):
                     if status.get("paused"):
                         state.pause()
                     else:
+                        summary = self._delivery_summaries.get(lease_id)
+                        last_reply_text = (
+                            str(summary.last_text or "")
+                            if summary is not None
+                            else ""
+                        )
+                        anchor_user_id = str(
+                            metadata.get("onebot11_anchor_user_id") or ""
+                        )
                         state.on_turn_complete(
                             success=successful_turn,
                             now=time.monotonic(),
                             preserve_pending=preserve_pending,
                             has_hard_trigger=has_hard_trigger,
+                            bot_asked=self._reply_asks_user(last_reply_text),
+                            anchor_user_id=anchor_user_id,
                         )
                         # Agent turn 期间收到的普通消息当时处于 idle，不会在入队时
                         # 创建候选 timer。旧 turn 成功收口后，它们应被视为 engaged
@@ -4548,6 +4637,16 @@ class OneBot11Adapter(BasePlatformAdapter):
                                     revision=int(status.get("revision", 0)),
                                     now=time.monotonic(),
                                     last_trigger_at=status.get("last_trigger_at"),
+                                    user_id=str(latest.user_id or ""),
+                                    reply_to_bot=self._message_replies_to_bot(
+                                        chat_id,
+                                        str(
+                                            latest.metadata.get(
+                                                "onebot11_reply_to"
+                                            )
+                                            or ""
+                                        ),
+                                    ),
                                 )
                                 if followup_action.kind == "schedule":
                                     await self._apply_trigger_action_locked(
@@ -4776,6 +4875,28 @@ class OneBot11Adapter(BasePlatformAdapter):
         if not normalized:
             return None
         return self._delivery_summaries.setdefault(normalized, DeliverySummary())
+
+    def _message_replies_to_bot(self, chat_id: str, reply_to: str) -> bool:
+        """判断回复目标是否是 bot 在该群最后发送的消息。"""
+        normalized = str(chat_id or "").strip()
+        raw_reply = str(reply_to or "").strip()
+        if not normalized or not raw_reply:
+            return False
+        return raw_reply == str(self._last_bot_message_ids.get(normalized) or "")
+
+    def _reply_asks_user(self, text: str) -> bool:
+        """判断 bot 回复是否以问句或请求用户提供信息收尾。"""
+        content = str(text or "").strip()
+        if not content:
+            return False
+        if is_question(content):
+            return True
+        # 请求词只检查回复尾部，避免"这是日志"这类陈述误判成提问。
+        tail = content[-80:].casefold()
+        return any(
+            str(word).casefold() in tail
+            for word in self.trigger_config.bot_asked_words
+        )
 
     async def _prepare_business_delivery(
         self,
@@ -5192,6 +5313,9 @@ class OneBot11Adapter(BasePlatformAdapter):
                         self._outbound_successful.add(lease_id)
                     if summary is not None:
                         summary.successful += 1
+                        summary.last_text = piece
+                    if sent_id:
+                        self._last_bot_message_ids[target.chat_id] = str(sent_id)
                     sent.append(sent_id)
                 except OneBotApiError as exc:
                     if lease_id:

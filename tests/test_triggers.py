@@ -867,3 +867,210 @@ def test_纯图片消息不进selector():
     )
     assert mentioned.kind == "direct"
     assert mentioned.reason == "mention"
+
+
+def test_bot提问后同用户回复进入deep并立即仲裁():
+    """bot 上轮以问句收尾时，同用户下一条消息升 deep 且免 debounce。"""
+    config = TriggerConfig(
+        debounce_seconds=5,
+        engaged_idle_seconds=60,
+        engaged_max_arbitrations=2,
+    )
+    state = LayeredTriggerState(config)
+    state.on_turn_complete(
+        success=True,
+        now=0,
+        bot_asked=True,
+        anchor_user_id="2056963663",
+    )
+    assert state.mode == "engaged"
+    assert state.level == "deep"
+    assert state.bot_asked is True
+
+    action = state.observe_message(
+        chat_type="group",
+        text="可以",
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=1,
+        user_id="2056963663",
+    )
+    assert action.kind == "schedule"
+    assert state.mode == "debounce"
+    assert state.debounce_due is not None and state.debounce_due <= 1.0
+
+
+def test_bot提问后他人消息不享受deep立即仲裁():
+    """deep 预算绑定同用户，避免一人提问全群升级。"""
+    config = TriggerConfig(debounce_seconds=5, engaged_idle_seconds=60)
+    state = LayeredTriggerState(config)
+    state.on_turn_complete(
+        success=True,
+        now=0,
+        bot_asked=True,
+        anchor_user_id="2056963663",
+    )
+    action = state.observe_message(
+        chat_type="group",
+        text="可以",
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=1,
+        user_id="1259901822",
+    )
+    assert action.kind == "schedule"
+    # 他人插话回落 normal 预算，不享受 deep 档。
+    assert state.level == "normal"
+
+
+def test_任务词升级deep但同用户消息立即判():
+    """报错/复现等任务词只升预算，仍走 selector，不直接触发。"""
+    config = TriggerConfig(
+        debounce_seconds=5,
+        engaged_idle_seconds=60,
+        task_words=("报错", "复现"),
+    )
+    state = LayeredTriggerState(config)
+    state.on_turn_complete(success=True, now=0, anchor_user_id="2056963663")
+    action = state.observe_message(
+        chat_type="group",
+        text="还是报错",
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=1,
+        user_id="2056963663",
+    )
+    assert action.kind == "schedule"
+    assert state.level == "deep"
+    assert state.debounce_due is not None and state.debounce_due <= 1.0
+
+
+def test_连续ignore降级到shallow():
+    """连续两次 ignore 使预算降档，第三次同类消息进入 shallow 预算。"""
+    config = TriggerConfig(
+        debounce_seconds=1,
+        engaged_max_arbitrations=3,
+        shallow_engaged_idle_seconds=30,
+        shallow_max_arbitrations=1,
+    )
+    state = LayeredTriggerState(config)
+    state.on_turn_complete(success=True, now=0)
+    for index in range(2):
+        action = state.observe_message(
+            chat_type="group",
+            text=f"普通消息 {index}",
+            mentioned_self=False,
+            has_context=True,
+            revision=index + 1,
+            now=index + 1,
+        )
+        assert action.kind == "schedule"
+        state.on_timer(now=index + 2)
+        state.on_llm_result(
+            decision="ignore",
+            anchor_seq=None,
+            observed_revision=index + 1,
+            current_revision=index + 1,
+            now=index + 2,
+        )
+    assert state.level == "shallow"
+    assert state.ignore_streak == 2
+
+
+def test_short_rule默认关闭短确认词仍进selector():
+    """short_rule 默认关闭，engaged 短确认词仍统一交给 selector。"""
+    state = LayeredTriggerState(TriggerConfig(debounce_seconds=5))
+    state.on_turn_complete(success=True, now=0)
+    action = state.observe_message(
+        chat_type="group",
+        text="好的",
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=1,
+    )
+    assert action.kind == "schedule"
+    assert action.candidate_type == "engaged"
+
+
+def test_short_rule开启时shallow短消息本地ignore():
+    """short_rule 开启后，shallow 档无信号短消息不进 selector。"""
+    config = TriggerConfig(
+        debounce_seconds=5,
+        short_rule_max_chars=20,
+    )
+    state = LayeredTriggerState(config)
+    state.on_turn_complete(success=True, now=0)
+    state.level = "shallow"
+    action = state.observe_message(
+        chat_type="group",
+        text="哈哈",
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=1,
+    )
+    assert action.kind == "none"
+    assert action.reason == "short_rule_ignore"
+
+
+def test_deep_waiting攒满消息数立即仲裁():
+    """deep 档 waiting 攒满 N 条新消息立即判，不等到期。"""
+    config = TriggerConfig(
+        debounce_seconds=5,
+        deep_wait_messages=2,
+    )
+    state = LayeredTriggerState(config)
+    state.on_turn_complete(success=True, now=0)
+    state.mode = "waiting"
+    state.wait_until = 100
+    state.level = "deep"
+    first = state.observe_message(
+        chat_type="group",
+        text="第一条",
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=1,
+    )
+    assert first.kind == "none"
+    assert first.reason == "wait_collecting"
+    assert state.wait_message_count == 1
+    second = state.observe_message(
+        chat_type="group",
+        text="第二条",
+        mentioned_self=False,
+        has_context=True,
+        revision=2,
+        now=2,
+    )
+    assert second.kind == "schedule"
+    assert state.debounce_due is not None and state.debounce_due <= 2.0
+
+
+def test_reply_asks_user与消息回复bot信号():
+    """bot 回复以问句/请求收尾时标记 bot_asked；回复 bot 消息升级 deep。"""
+    from onebot11.triggers import TriggerConfig
+
+    config = TriggerConfig(debounce_seconds=5, bot_asked_words=("发我", "提供"))
+    state = LayeredTriggerState(config)
+    # 模拟 adapter 通过 _reply_asks_user 传入 bot_asked=True。
+    state.on_turn_complete(success=True, now=0, bot_asked=True)
+    assert state.bot_asked is True
+    assert state.level == "deep"
+
+    reply_action = state.observe_message(
+        chat_type="group",
+        text="好的，马上",
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=1,
+        user_id="2056963663",
+        reply_to_bot=True,
+    )
+    assert reply_action.kind == "schedule"
+    assert state.level == "deep"
