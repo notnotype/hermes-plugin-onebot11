@@ -24,6 +24,8 @@ def parse_conversation_command(text: str) -> ConversationCommand | None:
     if name == "new":
         title = parts[1].strip() if len(parts) > 1 else ""
         return ConversationCommand(name, title or None)
+    if name in {"context", "ctx"} and len(parts) == 1:
+        return ConversationCommand("context")
     if name in {"reset", "clear"} and len(parts) == 1:
         return ConversationCommand(name)
     return None

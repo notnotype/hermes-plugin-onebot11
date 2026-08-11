@@ -12,6 +12,7 @@
 - [3-onebot11-trigger-spike](3-onebot11-trigger-spike/README.md)：分层触发与活跃窗口 spike
 - [5-onebot11-turn-anchor](5-onebot11-turn-anchor/README.md)：shared session 下的 TurnAnchor、authority 和 batch 边界
 - [6-onebot11-command-acceptance](6-onebot11-command-acceptance/README.md)：群级 slash command、连续对话和 Arch 验收收口
+- [7-onebot11-media-runtime-policy](7-onebot11-media-runtime-policy/README.md)：媒体投递去重、纯文本回复、控制面通知和运行时策略 reload
 
 ## 历史任务
 

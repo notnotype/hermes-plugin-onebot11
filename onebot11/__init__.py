@@ -8,7 +8,9 @@ from . import (
     context,
     dispatch,
     events,
+    formatting,
     http_api,
+    media,
     message,
     permissions,
     pi_ai,
@@ -17,17 +19,30 @@ from . import (
     triggers,
     ws_server,
 )
+from .config import (
+    RuntimePolicySnapshot,
+    build_policy_snapshot,
+    runtime_static_fingerprint,
+)
 from .context import AgentContextParts, build_agent_context, build_agent_context_parts
 from .dispatch import ActiveTurn, GroupDispatcher
+from .formatting import (
+    FormattedText,
+    format_onebot_text,
+    unwrap_markdown_image_markers,
+)
+from .media import MediaDeliveryScope, normalize_media_source
 from .message import ParsedMessage, parse_message_segments
 from .permissions import CallerContext, ChatTarget, TurnBinding, TurnBindingStore
 from .queue import (
     OperationRecord,
     OperationStart,
+    QueueError,
     QueueLease,
     QueueMessage,
     QueueResetResult,
     QueueStore,
+    ReactionRecord,
     TriggerRequest,
 )
 
@@ -35,6 +50,8 @@ __all__ = [
     "events",
     "commands",
     "http_api",
+    "formatting",
+    "media",
     "message",
     "pi_ai",
     "permissions",
@@ -49,6 +66,14 @@ __all__ = [
     "ws_server",
     "ParsedMessage",
     "parse_message_segments",
+    "FormattedText",
+    "format_onebot_text",
+    "unwrap_markdown_image_markers",
+    "MediaDeliveryScope",
+    "normalize_media_source",
+    "RuntimePolicySnapshot",
+    "build_policy_snapshot",
+    "runtime_static_fingerprint",
     "CallerContext",
     "ChatTarget",
     "TurnBinding",
@@ -56,6 +81,8 @@ __all__ = [
     "QueueLease",
     "QueueMessage",
     "QueueResetResult",
+    "QueueError",
+    "ReactionRecord",
     "QueueStore",
     "TriggerRequest",
     "OperationRecord",

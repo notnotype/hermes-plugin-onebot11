@@ -1,6 +1,8 @@
 """SQLite 队列的租约、恢复和去重合同测试。"""
 
+import asyncio
 import sqlite3
+import threading
 
 import pytest
 
@@ -35,6 +37,40 @@ def _trigger(message: QueueMessage, reason: str = "mention") -> TriggerRequest:
         reason,
         message.user_id,
         message.user_name,
+    )
+
+
+def _authorized_message(message_id: str, *, chat_id: str = "888", text: str = "消息") -> QueueMessage:
+    """构造带有可验证 authority 快照的群消息。"""
+    return QueueMessage(
+        chat_id=chat_id,
+        chat_type="group",
+        message_id=message_id,
+        user_id="123",
+        user_name="小明",
+        text=text,
+        metadata={
+            "onebot11_authority": {
+                "role": "user",
+                "allowed_tools": [],
+                "self_id": "1",
+            }
+        },
+        message_key=f"group:{message_id}",
+    )
+
+
+def _authorized_trigger(message: QueueMessage, reason: str = "mention") -> TriggerRequest:
+    """构造带有与消息快照一致 authority 的触发请求。"""
+    return TriggerRequest.create(
+        message.chat_id,
+        str(message.message_key),
+        reason,
+        message.user_id,
+        message.user_name,
+        authority_role="user",
+        authority_tools=(),
+        authority_self_id="1",
     )
 
 
@@ -436,7 +472,14 @@ def test_v7到v10真实表结构迁移到schema11(tmp_path, version):
     assert migrated._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
     assert migrated._conn.execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='onebot_queue_reaction'"
-    ).fetchone()[0] == 0
+    ).fetchone()[0] == 1
+    reaction_columns = {
+        str(row[1])
+        for row in migrated._conn.execute(
+            "PRAGMA table_info(onebot_queue_reaction)"
+        ).fetchall()
+    }
+    assert {"attempts", "next_attempt_at", "last_error"} <= reaction_columns
     assert migrated.status("888")["pending"] == (1 if version == 10 else 0)
     assert migrated.status("888")["uncertain"] == (0 if version == 10 else 1)
     if version == 10:
@@ -444,6 +487,153 @@ def test_v7到v10真实表结构迁移到schema11(tmp_path, version):
     else:
         assert migrated.recover_trigger_requests() == ()
     migrated.close()
+
+
+def test_v11迁移到schema12保留持久触发状态(tmp_path):
+    """旧 v11 队列升级后必须补齐 cooldown 和 selector 游标。"""
+    path = tmp_path / "queue-v11.sqlite3"
+    _write_legacy_queue_schema(path, 11)
+
+    migrated = QueueStore(path)
+    columns = {
+        str(row[1])
+        for row in migrated._conn.execute(
+            "PRAGMA table_info(onebot_queue_chat)"
+        ).fetchall()
+    }
+
+    assert migrated._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+    assert {
+        "last_trigger_at",
+        "llm_judged_seq",
+        "llm_next_attempt_at",
+        "llm_failure_count",
+        "llm_last_error",
+    } <= columns
+    assert migrated.status("888")["last_trigger_at"] is None
+    assert migrated.status("888")["llm_judged_seq"] == 0
+    migrated.close()
+
+
+def test_llm游标和cooldown只在真正创建anchor时推进(tmp_path):
+    """selector 的失败/忽略/触发状态必须可恢复，重复 trigger 不刷新 cooldown。"""
+    store = QueueStore(tmp_path / "queue-trigger-state.sqlite3")
+    first = _message("state-first")
+    second = _message("state-second")
+    store.enqueue(first)
+    store.enqueue(second)
+
+    assert store.mark_llm_failure(
+        "888",
+        observed_seq=1,
+        error="timeout",
+        next_attempt_at=1002.0,
+    )
+    state = store.llm_state("888")
+    assert state == {
+        "last_trigger_at": None,
+        "llm_judged_seq": 0,
+        "llm_next_attempt_at": 1002.0,
+        "llm_failure_count": 1,
+        "llm_last_error": "timeout",
+    }
+
+    assert store.mark_llm_judged("888", 1)
+    assert store.llm_state("888") == {
+        "last_trigger_at": None,
+        "llm_judged_seq": 1,
+        "llm_next_attempt_at": None,
+        "llm_failure_count": 0,
+        "llm_last_error": None,
+    }
+
+    request_id = store.create_message_anchor(
+        "888",
+        2,
+        "llm",
+        triggered_at=2000.0,
+        llm_observed_seq=2,
+    )
+    assert request_id is not None
+    assert store.last_trigger_at("888") == 2000.0
+    assert store.llm_state("888")["llm_judged_seq"] == 2
+
+    duplicate = store.create_message_anchor(
+        "888",
+        2,
+        "llm",
+        triggered_at=3000.0,
+        llm_observed_seq=2,
+    )
+    assert duplicate == request_id
+    assert store.last_trigger_at("888") == 2000.0
+    store.close()
+
+
+def test_cooldown到期只为未判断最早消息创建恢复anchor(tmp_path):
+    """持久恢复不能重复判断已 ignore 的消息，也不能越过未授权群范围。"""
+    store = QueueStore(tmp_path / "queue-due-trigger.sqlite3")
+    authority = {
+        "onebot11_authority": {
+            "role": "trusted_user",
+            "allowed_tools": ["qq_get_message"],
+            "self_id": "1",
+        }
+    }
+    store.enqueue(
+        QueueMessage(
+            chat_id="888",
+            chat_type="group",
+            message_id="1001",
+            user_id="123",
+            user_name="小明",
+            text="第一条",
+            metadata=authority,
+            message_key="group:1001",
+        )
+    )
+    store.enqueue(
+        QueueMessage(
+            chat_id="888",
+            chat_type="group",
+            message_id="1002",
+            user_id="456",
+            user_name="小红",
+            text="第二条",
+            metadata=authority,
+            message_key="group:1002",
+        )
+    )
+    store._conn.execute(
+        """
+        UPDATE onebot_queue_chat
+        SET last_trigger_at=90, llm_judged_seq=1
+        WHERE chat_id='888'
+        """
+    )
+    store._conn.commit()
+
+    assert store.recover_due_triggers(
+        now=100,
+        cooldown_seconds=5,
+        allowed_chat_ids={"999"},
+    ) == ()
+    recovered = store.recover_due_triggers(
+        now=100,
+        cooldown_seconds=5,
+        allowed_chat_ids={"888"},
+    )
+    assert len(recovered) == 1
+    assert recovered[0].anchor_seq == 2
+    assert recovered[0].reason == "cooldown_recovery"
+    assert recovered[0].authority_role == "trusted_user"
+    assert store.status("888")["pending_trigger_requests"] == 1
+    assert store.recover_due_triggers(
+        now=100,
+        cooldown_seconds=5,
+        allowed_chat_ids={"888"},
+    ) == ()
+    store.close()
 
 
 def test_v10有完整authority和phase的活动lease不被误标unknown(tmp_path):
@@ -553,6 +743,32 @@ def test_未知更高schema版本拒绝启动(tmp_path):
         QueueStore(path)
 
 
+async def test_close等待已进入的to_thread操作且关闭后fail_closed(tmp_path):
+    """关闭竞态不能让已进入 SQLite 的线程触碰 closed connection。"""
+    store = QueueStore(tmp_path / "queue-close-race.sqlite3")
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_operation() -> None:
+        """持有 QueueStore 锁模拟已经进入的同步 SQLite 操作。"""
+        with store._lock:
+            entered.set()
+            release.wait(timeout=2)
+            store._conn.execute("SELECT 1")
+
+    operation = asyncio.create_task(asyncio.to_thread(slow_operation))
+    await asyncio.to_thread(entered.wait, 1)
+    closing = asyncio.create_task(asyncio.to_thread(store.close))
+    await asyncio.sleep(0.02)
+    assert not closing.done()
+    release.set()
+    await operation
+    await closing
+    assert store.closed
+    with pytest.raises(QueueError):
+        store.status("888")
+
+
 def test_pending_chat_ids只返回待处理群(tmp_path):
     """启动时可以发现没有 durable trigger 的遗留消息。"""
     store = QueueStore(tmp_path / "queue.sqlite3")
@@ -619,6 +835,39 @@ def test_同实例close后reopen可以继续读写(tmp_path):
     store.reopen()
     assert store.peek("888")[0].message_id == "reopen-1"
     assert store.enqueue(_message("reopen-2")).inserted
+    store.close()
+
+
+def test_reaction目标迁移保留maybe_set且不重复创建(tmp_path):
+    """重新生成 anchor 时 reaction 只迁移记录，不能再次 set。"""
+    store = QueueStore(tmp_path / "reaction.sqlite3")
+    first = store.record_reaction("lease-1", "888", "1001")
+    assert first.state == "pending"
+    assert store.mark_reaction_set("lease-1")
+
+    migrated = store.record_reaction("lease-2", "888", "1001")
+
+    assert migrated.lease_id == "lease-2"
+    assert migrated.state == "maybe_set"
+    assert store.reaction_for_lease("lease-1") is None
+    assert store.reaction_for_target("888", "1001") == migrated
+    store.close()
+
+
+def test_reaction清理失败达到上限后退出自动候选(tmp_path):
+    """unset 连续失败三次后不再被恢复轮询无限调用。"""
+    store = QueueStore(tmp_path / "reaction-backoff.sqlite3")
+    store.record_reaction("lease-1", "888", "1001")
+    store.mark_reaction_set("lease-1")
+
+    for _ in range(3):
+        record = store.mark_reaction_cleanup_failure("lease-1", "OneBot 不可用")
+        assert record is not None
+
+    assert store.pending_reaction_cleanups() == ()
+    status = store.status("888")
+    assert status["reaction_cleanup_exhausted"] == 1
+    assert status["reaction_errors"] == ["OneBot 不可用"]
     store.close()
 
 
@@ -761,18 +1010,30 @@ def test_abandon与已有pending_trigger合并(tmp_path):
 
 
 def test_resolve_retry与已有pending_trigger合并(tmp_path):
-    """管理员 retry uncertain 消息时，旧 trigger 与新 trigger 必须合并。"""
+    """管理员 retry uncertain 消息时，新 anchor 不得撞上后续 pending trigger。"""
     store = QueueStore(tmp_path / "queue.sqlite3")
-    first = _message("merge-resolve")
-    store.enqueue(first, _trigger(first))
+    first = _authorized_message("merge-resolve")
+    store.enqueue(first, _authorized_trigger(first))
     lease = store.claim("888")
     assert lease is not None
     assert store.mark_uncertain(lease, "unknown")
-    later = _message("merge-resolve-later")
+    old_request_id = lease.trigger.request_id
+    later = _authorized_message("merge-resolve-later")
     store.enqueue(later, _trigger(later))
 
     assert store.resolve_uncertain("888", "retry") == 1
     assert store.status("888")["pending_trigger_requests"] == 2
+    retried = store._conn.execute(
+        """
+        SELECT request_id, reason
+        FROM onebot_queue_trigger
+        WHERE chat_id=? AND message_key=?
+        """,
+        ("888", first.message_key),
+    ).fetchone()
+    assert retried is not None
+    assert retried["request_id"] != old_request_id
+    assert retried["reason"] == "admin_resolve_retry"
     store.close()
 
 
@@ -899,8 +1160,8 @@ def test_unknown_phase的release和恢复都进入uncertain(tmp_path, monkeypatc
     reopened.close()
 
 
-def test_resolve_retry没有旧trigger时补建恢复入口(tmp_path):
-    """旧文件只有 uncertain 消息时，人工 retry 仍能恢复 durable trigger。"""
+def test_resolve_retry没有旧trigger时保持hold(tmp_path):
+    """无法证明原 anchor 的旧文件只能 hold，不能猜测权限创建新 trigger。"""
     store = QueueStore(tmp_path / "queue.sqlite3")
     message = _message("retry-without-trigger")
     store.enqueue(message, _trigger(message))
@@ -909,20 +1170,22 @@ def test_resolve_retry没有旧trigger时补建恢复入口(tmp_path):
     assert store.mark_uncertain(lease, "unknown")
     store._conn.execute("DELETE FROM onebot_queue_trigger WHERE chat_id=?", ("888",))
     store._conn.commit()
-    assert store.resolve_uncertain("888", "retry") == 1
-    assert store.status("888")["pending_trigger_requests"] == 1
+    assert store.resolve_uncertain("888", "retry") == 0
+    assert store.status("888")["pending_trigger_requests"] == 0
+    assert store.status("888")["uncertain"] == 1
     store.close()
 
 
 def test_resolve_retry只清理被阻塞anchor(tmp_path):
-    """恢复一个 blocked anchor 时不能抹掉同群其他 pending anchor。"""
+    """恢复一个 blocked anchor 时只迁移它自己的新 request_id。"""
     store = QueueStore(tmp_path / "queue-resolve-scope.sqlite3")
-    blocked = _message("blocked")
-    later = _message("later")
-    store.enqueue(blocked, _trigger(blocked))
+    blocked = _authorized_message("blocked")
+    later = _authorized_message("later")
+    store.enqueue(blocked, _authorized_trigger(blocked))
     lease = store.claim("888")
     assert lease is not None
     assert store.mark_uncertain(lease, "unknown")
+    old_request_id = lease.trigger.request_id
     store._conn.execute(
         "DELETE FROM onebot_queue_trigger WHERE message_key=?",
         (blocked.message_key,),
@@ -930,7 +1193,7 @@ def test_resolve_retry只清理被阻塞anchor(tmp_path):
     store._conn.commit()
     store.enqueue(later, _trigger(later))
 
-    assert store.resolve_uncertain("888", "retry") == 1
+    assert store.resolve_uncertain("888", "retry") == 0
     blocked_anchor = store._conn.execute(
         "SELECT anchor_id FROM onebot_queue_message WHERE message_key=?",
         (blocked.message_key,),
@@ -939,7 +1202,7 @@ def test_resolve_retry只清理被阻塞anchor(tmp_path):
         "SELECT anchor_id FROM onebot_queue_message WHERE message_key=?",
         (later.message_key,),
     ).fetchone()[0]
-    assert blocked_anchor is None
+    assert blocked_anchor == old_request_id
     assert later_anchor is not None
     store.close()
 

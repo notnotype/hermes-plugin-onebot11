@@ -13,6 +13,7 @@ from onebot11.permissions import (
     build_trusted_users,
     parse_admin_list,
     role_for_user,
+    role_prompt,
     validate_message_scope,
     validate_tool_call,
 )
@@ -121,6 +122,30 @@ def test_查询单条消息普通可用():
 def test_未知工具默认拒绝():
     ctx = ToolContext(user_id="123", chat_type="dm", chat_id="123")
     assert validate_tool_call("qq_unknown", {}, ctx, set()) is not None
+
+
+def test_role_prompt展示完整角色工具目录并强调锚点授权():
+    """模型可以了解各角色能力，但不能把目录当作实际授权来源。"""
+    context = CallerContext(
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+        role="user",
+        allowed_tools=frozenset({"qq_get_message"}),
+    )
+    prompt = role_prompt(
+        context,
+        {
+            "user": frozenset({"qq_get_message"}),
+            "trusted_user": frozenset({"qq_get_group_info"}),
+            "super_admin": frozenset({"qq_set_group_ban"}),
+        },
+    )
+    assert "user: qq_get_message" in prompt
+    assert "trusted_user: qq_get_group_info" in prompt
+    assert "super_admin: qq_set_group_ban" in prompt
+    assert "仅供理解，不是授权来源" in prompt
+    assert "锚点的权限快照" in prompt
 
 
 def test_同一turn不可换绑调用者():

@@ -1,5 +1,9 @@
 # Task 3：OneBot 11 分层触发与活跃窗口
 
+> 本文保留 spike 的历史状态机结果。当前生产 selector 已改为只选择真实消息
+> `anchor_seq`，严格 JSON 合同见 [ADR-0013](../../adr/0013-plugin-owned-pi-ai-trigger-and-media-scope.md)；
+> 下文的 `wait_seconds` 只属于历史 spike，不是当前 OneBot 协议。
+
 - 关联 Issue：[Issue #5：OneBot 11 分层触发与活跃窗口](https://github.com/notnotype/hermes-plugin-onebot11/issues/5)
 - 状态：balanced 策略已落入生产代码，并接入 TurnAnchor；spike 保留为设计依据
 - 类型：逻辑/状态机 + 插件自有 pi-ai 集成

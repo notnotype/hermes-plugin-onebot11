@@ -21,7 +21,10 @@ class InboundEvent:
     user_id: str
     user_name: str
     message_id: str
+    message_key: str = ""
     images: list[str] = field(default_factory=list)
+    image_urls: list[str] = field(default_factory=list)
+    image_files: list[str] = field(default_factory=list)
     reply_to_message_id: str | None = None
     mentioned_self: bool = False
     markers: list[str] = field(default_factory=list)
@@ -117,7 +120,8 @@ def build_inbound_event(raw: Mapping[str, Any], self_id: str | None) -> InboundE
     ):
         return None
     message_type = raw.get("message_type")
-    message_id = str(raw.get("message_id") or "")
+    message_id = str(raw.get("message_id") or "").strip()
+    message_key = ""
     if not message_id:
         canonical = _normalized_event_for_hash(raw)
         encoded = json.dumps(
@@ -127,7 +131,7 @@ def build_inbound_event(raw: Mapping[str, Any], self_id: str | None) -> InboundE
             default=str,
             separators=(",", ":"),
         ).encode("utf-8")
-        message_id = "hash:" + hashlib.sha256(encoded).hexdigest()
+        message_key = "hash:" + hashlib.sha256(encoded).hexdigest()
     user_id = str(raw.get("user_id") or "")
     if self_id and user_id == str(self_id):
         return None
@@ -137,7 +141,15 @@ def build_inbound_event(raw: Mapping[str, Any], self_id: str | None) -> InboundE
     message_segments = raw.get("message")
     if message_segments is None:
         return None
-    parsed: ParsedMessage = parse_message_segments(message_segments, self_id=self_id)
+    try:
+        parsed: ParsedMessage = parse_message_segments(
+            message_segments,
+            self_id=self_id,
+        )
+    except (TypeError, ValueError):
+        # malformed message 只丢弃当前事件；WS 连接和后续消息不应因
+        # 一条非法 segment 被迫重连。
+        return None
     if message_type == "group":
         chat_id = str(raw.get("group_id") or "")
         chat_type = "group"
@@ -148,6 +160,8 @@ def build_inbound_event(raw: Mapping[str, Any], self_id: str | None) -> InboundE
         user_name = str(sender.get("nickname") or user_id)
     else:
         return None
+    if message_id:
+        message_key = f"{chat_type}:{message_id}"
     if not user_id or not chat_id:
         return None
     return InboundEvent(
@@ -157,7 +171,10 @@ def build_inbound_event(raw: Mapping[str, Any], self_id: str | None) -> InboundE
         user_id=user_id,
         user_name=user_name,
         message_id=message_id,
+        message_key=message_key,
         images=parsed.images,
+        image_urls=parsed.image_urls,
+        image_files=parsed.image_files,
         reply_to_message_id=parsed.reply_to_message_id,
         mentioned_self=parsed.mentioned_self,
         markers=parsed.markers,

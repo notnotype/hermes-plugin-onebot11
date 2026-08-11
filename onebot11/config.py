@@ -11,7 +11,9 @@ import math
 import os
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 from .http_api import is_loopback_http_url, parse_http_base_url
@@ -47,8 +49,11 @@ class RuntimeConfig:
     trigger_config: TriggerConfig
     processing_reaction_enabled: bool
     processing_reaction_emoji_id: str
+    plain_text_enabled: bool
+    long_running_notice_seconds: float
     media_allowed_hosts: frozenset[str]
     media_allowed_ports: frozenset[int]
+    media_source_roots: tuple[str, ...]
     http_timeout_seconds: float
     query_max_retries: int
     http_max_response_bytes: int
@@ -80,6 +85,79 @@ class RuntimeConfig:
     home_channel_type: str | None
 
 
+@dataclass(frozen=True)
+class RuntimePolicySnapshot:
+    """运行时可热替换的 OneBot 权限、触发和显示策略。"""
+
+    version: int
+    loaded_at: float
+    access_policy: AccessPolicy
+    super_admins: frozenset[str]
+    trusted_users: frozenset[str]
+    role_tools: Mapping[str, frozenset[str]]
+    trigger_config: TriggerConfig
+    processing_reaction_enabled: bool
+    processing_reaction_emoji_id: str
+    plain_text_enabled: bool = True
+    long_running_notice_seconds: float = 180.0
+
+    def __post_init__(self) -> None:
+        """冻结角色工具 mapping，避免调用方绕过 snapshot 修改权限。"""
+        object.__setattr__(
+            self,
+            "role_tools",
+            MappingProxyType(
+                {
+                    str(role): frozenset(tools)
+                    for role, tools in self.role_tools.items()
+                }
+            ),
+        )
+
+
+def build_policy_snapshot(
+    runtime: RuntimeConfig,
+    *,
+    version: int,
+    loaded_at: float,
+) -> RuntimePolicySnapshot:
+    """从已校验 RuntimeConfig 构造不可变热更新 snapshot。"""
+    return RuntimePolicySnapshot(
+        version=int(version),
+        loaded_at=float(loaded_at),
+        access_policy=runtime.access_policy,
+        super_admins=frozenset(runtime.super_admins),
+        trusted_users=frozenset(runtime.trusted_users),
+        role_tools=runtime.role_tools,
+        trigger_config=runtime.trigger_config,
+        processing_reaction_enabled=runtime.processing_reaction_enabled,
+        processing_reaction_emoji_id=runtime.processing_reaction_emoji_id,
+        plain_text_enabled=runtime.plain_text_enabled,
+        long_running_notice_seconds=runtime.long_running_notice_seconds,
+    )
+
+
+def runtime_static_fingerprint(runtime: RuntimeConfig) -> tuple[tuple[str, str], ...]:
+    """返回 reload 不允许改变的连接、队列和协议配置摘要。"""
+    hot_fields = {
+        "access_policy",
+        "super_admins",
+        "trusted_users",
+        "role_tools",
+        "trigger_config",
+        "processing_reaction_enabled",
+        "processing_reaction_emoji_id",
+        "plain_text_enabled",
+        "long_running_notice_seconds",
+        "extra",
+    }
+    return tuple(
+        (field.name, repr(getattr(runtime, field.name)))
+        for field in fields(RuntimeConfig)
+        if field.name not in hot_fields
+    )
+
+
 def effective_extra(
     extra: Mapping[str, Any],
     environ: Mapping[str, Any] | None = None,
@@ -107,6 +185,8 @@ def effective_extra(
         "HOME_CHANNEL_TYPE": "home_channel_type",
         "PROCESSING_REACTION_ENABLED": "processing_reaction_enabled",
         "PROCESSING_REACTION_EMOJI_ID": "processing_reaction_emoji_id",
+        "PLAIN_TEXT_ENABLED": "plain_text_enabled",
+        "LONG_RUNNING_NOTICE_SECONDS": "long_running_notice_seconds",
         "HTTP_TIMEOUT_SECONDS": "http_timeout_seconds",
         "QUERY_MAX_RETRIES": "query_max_retries",
         "HTTP_MAX_RESPONSE_BYTES": "http_max_response_bytes",
@@ -114,6 +194,7 @@ def effective_extra(
         "MAX_IMAGE_REDIRECTS": "max_image_redirects",
         "MAX_IMAGE_TOTAL_BYTES": "max_image_total_bytes",
         "MAX_IMAGES_PER_MESSAGE": "max_images_per_message",
+        "MEDIA_SOURCE_ROOTS": "media_source_roots",
         "QUEUE_MAX_MESSAGES": "queue_max_messages",
         "QUEUE_MAX_BYTES": "queue_max_bytes",
         "QUEUE_MAX_MESSAGE_BYTES": "queue_max_message_bytes",
@@ -326,6 +407,18 @@ def parse_runtime_config(
     )
     if not reaction_emoji:
         raise ValueError("processing_reaction_emoji_id 不能为空")
+    plain_text_enabled = parse_bool(
+        effective.get("plain_text_enabled"),
+        default=True,
+        name="plain_text_enabled",
+    )
+    long_running_notice_seconds = _float(
+        effective.get("long_running_notice_seconds"),
+        name="long_running_notice_seconds",
+        default=180.0,
+        minimum=0.0,
+        maximum=86_400.0,
+    )
 
     media_hosts = frozenset(
         host.casefold().rstrip(".")
@@ -339,6 +432,15 @@ def parse_runtime_config(
         _int(port, name="media_allowed_ports", default=0, minimum=1, maximum=65535)
         for port in media_port_values
     )
+    media_source_roots: list[str] = []
+    for raw_root in parse_string_list(
+        effective.get("media_source_roots"),
+        name="media_source_roots",
+    ):
+        root = Path(raw_root).expanduser()
+        if not root.is_absolute():
+            raise ValueError("media_source_roots 必须使用绝对路径")
+        media_source_roots.append(str(root.resolve(strict=False)))
     queue_lease_seconds = _float(
         effective.get("queue_lease_seconds"),
         name="queue_lease_seconds",
@@ -372,8 +474,11 @@ def parse_runtime_config(
         trigger_config=trigger_config,
         processing_reaction_enabled=reaction_enabled,
         processing_reaction_emoji_id=reaction_emoji,
+        plain_text_enabled=plain_text_enabled,
+        long_running_notice_seconds=long_running_notice_seconds,
         media_allowed_hosts=media_hosts,
         media_allowed_ports=media_ports,
+        media_source_roots=tuple(dict.fromkeys(media_source_roots)),
         http_timeout_seconds=_float(
             effective.get("http_timeout_seconds"),
             name="http_timeout_seconds",

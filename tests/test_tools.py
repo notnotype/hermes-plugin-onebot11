@@ -58,6 +58,40 @@ async def test_查单条消息(fake_server):
     await api.close()
 
 
+async def test_hash_message_key不会进入get_msg():
+    """没有真实 OneBot message_id 时返回结构化错误，不调用远端查询。"""
+    calls: list[str] = []
+
+    class StubApi:
+        """记录是否错误访问了 OneBot。"""
+
+        async def get_message(self, _message_id: str) -> dict:
+            calls.append("get_msg")
+            return {}
+
+    result = await handle_get_message(
+        StubApi(),
+        {"message_id": "hash:abc"},
+        ToolContext(user_id="123", chat_type="group", chat_id="888"),
+    )
+    assert result["status"] == "invalid_message_id"
+    assert calls == []
+
+
+async def test_负数真实message_id可以进入get_msg(fake_server):
+    """真实 OneBot 有符号 message_id 不能被误判成 hash key。"""
+    base, calls = fake_server
+    api = OneBotHttpApi(base_url=base)
+    result = await handle_get_message(
+        api,
+        {"message_id": "-1001"},
+        ToolContext(user_id="123", chat_type="group", chat_id="888"),
+    )
+    assert result["status"] == "ok"
+    assert calls[0]["params"]["message_id"] == -1001
+    await api.close()
+
+
 async def test_群历史群号从会话注入(fake_server):
     """group_id 取自会话,LLM 传了也会被忽略。"""
     base, calls = fake_server

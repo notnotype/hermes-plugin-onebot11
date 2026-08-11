@@ -18,12 +18,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_BACKOFF_SECONDS = (2.0, 4.0, 8.0)
 MAX_BACKOFF_SECONDS = 60.0
 _HARD_TRIGGER_REASONS = frozenset({"mention", "keyword", "always", "admin_flush"})
 _AUTHORITY_ROLES = frozenset({"user", "trusted_user", "super_admin"})
+_FORBIDDEN_AUTHORITY_TOOLS = frozenset({"delegate_task", "tool_search"})
 logger = logging.getLogger(__name__)
 
 
@@ -207,6 +208,21 @@ class OperationStart:
     operation: OperationRecord
 
 
+@dataclass(frozen=True)
+class ReactionRecord:
+    """一个可恢复的 OneBot reaction 清理记录。"""
+
+    lease_id: str
+    chat_id: str
+    message_id: str
+    state: str
+    attempts: int
+    next_attempt_at: float | None
+    last_error: str | None
+    created_at: float
+    updated_at: float
+
+
 class QueueStore:
     """基于 SQLite WAL 的持久队列存储。"""
 
@@ -251,6 +267,18 @@ class QueueStore:
             self._close_after_migration_failure()
             raise
 
+    @property
+    def _conn(self) -> sqlite3.Connection:
+        """返回当前连接；关闭后先抛 QueueError，避免触碰 SQLite。"""
+        if getattr(self, "_closed", True):
+            raise QueueError("OneBot11 QueueStore 已关闭")
+        return self._connection
+
+    @_conn.setter
+    def _conn(self, value: sqlite3.Connection) -> None:
+        """在初始化和 reconnect 时替换底层连接。"""
+        self._connection = value
+
     def _close_after_migration_failure(self) -> None:
         """在初始化或 reopen 迁移失败后关闭连接并保留 closed 状态。"""
         try:
@@ -285,7 +313,7 @@ class QueueStore:
                 self._drop_migration_indexes()
                 self._create_tables()
                 self._migrate_columns(version)
-                self._drop_legacy_reaction_table()
+                self._ensure_reaction_table()
                 self._create_indexes()
                 self._recover_started_operations()
                 self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -316,20 +344,51 @@ class QueueStore:
                 continue
             self._conn.execute(f'DROP INDEX IF EXISTS "{name.replace(chr(34), chr(34) * 2)}"')
 
-    def _drop_legacy_reaction_table(self) -> None:
-        """丢弃旧版 reaction 持久记录；远端 reaction 不承诺回收。"""
-        row = self._conn.execute(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='onebot_queue_reaction'"
-        ).fetchone()
-        if row and int(row[0]) > 0:
-            count = int(
-                self._conn.execute("SELECT COUNT(*) FROM onebot_queue_reaction").fetchone()[0]
+    def _ensure_reaction_table(self) -> None:
+        """保留并补齐 reaction 清理状态，避免重启后遗留 👀 无法回收。"""
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS onebot_queue_reaction (
+                lease_id TEXT PRIMARY KEY,
+                chat_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL,
+                last_error TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
             )
-            self._conn.execute("DROP TABLE onebot_queue_reaction")
-            logger.info(
-                "OneBot11 丢弃 %s 条旧 reaction 记录；不尝试清理远端 reaction",
-                count,
-            )
+            """
+        )
+        columns = {
+            str(row[1])
+            for row in self._conn.execute(
+                "PRAGMA table_info(onebot_queue_reaction)"
+            ).fetchall()
+        }
+        additions = (
+            ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("next_attempt_at", "REAL"),
+            ("last_error", "TEXT"),
+        )
+        for name, definition in additions:
+            if name not in columns:
+                self._conn.execute(
+                    f"ALTER TABLE onebot_queue_reaction ADD COLUMN {name} {definition}"
+                )
+        self._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_onebot_queue_reaction_target
+            ON onebot_queue_reaction(chat_id, message_id, updated_at)
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_onebot_queue_reaction_cleanup
+            ON onebot_queue_reaction(state, next_attempt_at, updated_at)
+            """
+        )
 
     def _migrate_columns(self, version: int) -> None:
         """为已存在的队列文件补充增量列；未知结构直接拒绝启动。"""
@@ -363,6 +422,11 @@ class QueueStore:
             raise QueueError("OneBot11 queue schema 缺少必需列，无法安全迁移")
         additions = (
             ("onebot_queue_chat", chat_columns, "revision", "INTEGER NOT NULL DEFAULT 0"),
+            ("onebot_queue_chat", chat_columns, "last_trigger_at", "REAL"),
+            ("onebot_queue_chat", chat_columns, "llm_judged_seq", "INTEGER NOT NULL DEFAULT 0"),
+            ("onebot_queue_chat", chat_columns, "llm_next_attempt_at", "REAL"),
+            ("onebot_queue_chat", chat_columns, "llm_failure_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("onebot_queue_chat", chat_columns, "llm_last_error", "TEXT"),
             ("onebot_queue_message", message_columns, "message_id", "TEXT NOT NULL DEFAULT ''"),
             ("onebot_queue_message", message_columns, "lease_owner", "TEXT"),
             ("onebot_queue_message", message_columns, "uncertain_reason", "TEXT"),
@@ -704,6 +768,11 @@ class QueueStore:
                 summary TEXT NOT NULL DEFAULT '',
                 paused INTEGER NOT NULL DEFAULT 0,
                 revision INTEGER NOT NULL DEFAULT 0,
+                last_trigger_at REAL,
+                llm_judged_seq INTEGER NOT NULL DEFAULT 0,
+                llm_next_attempt_at REAL,
+                llm_failure_count INTEGER NOT NULL DEFAULT 0,
+                llm_last_error TEXT,
                 updated_at REAL NOT NULL
             )
             """,
@@ -781,6 +850,19 @@ class QueueStore:
                     )
                 ),
                 reason TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS onebot_queue_reaction (
+                lease_id TEXT PRIMARY KEY,
+                chat_id TEXT NOT NULL,
+                message_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL,
+                last_error TEXT,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL
             )
@@ -895,6 +977,8 @@ class QueueStore:
         self,
         message: QueueMessage,
         trigger_request: TriggerRequest | None = None,
+        *,
+        triggered_at: float | None = None,
     ) -> EnqueueResult:
         """在同一事务中去重、分配序号并可选持久化触发请求。"""
         if message.chat_type not in {"group", "dm"}:
@@ -920,6 +1004,7 @@ class QueueStore:
                         key,
                         now,
                         anchor_seq=int(existing[0]),
+                        triggered_at=triggered_at,
                     )
                     self._conn.commit()
                     return EnqueueResult(False, True, key, int(existing[0]), request_id)
@@ -944,6 +1029,16 @@ class QueueStore:
                 self._conn.execute(
                     "UPDATE onebot_queue_chat SET next_seq=?, revision=revision+1, updated_at=? WHERE chat_id=?",
                     (next_seq + 1, now, message.chat_id),
+                )
+                # 新消息是 selector 失败后的显式唤醒信号；清除持久退避，
+                # 让当前群可以在本地 debounce 后重新判断，而不是等旧退避结束。
+                self._conn.execute(
+                    """
+                    UPDATE onebot_queue_chat
+                    SET llm_next_attempt_at=NULL, updated_at=?
+                    WHERE chat_id=? AND llm_next_attempt_at IS NOT NULL
+                    """,
+                    (now, str(message.chat_id)),
                 )
                 self._conn.execute(
                     """
@@ -974,6 +1069,7 @@ class QueueStore:
                     key,
                     now,
                     anchor_seq=next_seq,
+                    triggered_at=triggered_at,
                 )
                 self._conn.commit()
                 return EnqueueResult(True, False, key, next_seq, request_id)
@@ -989,6 +1085,7 @@ class QueueStore:
         now: float,
         *,
         anchor_seq: int | None = None,
+        triggered_at: float | None = None,
     ) -> str | None:
         """插入或更新单条消息对应的 durable anchor。"""
         if trigger is None:
@@ -1075,7 +1172,7 @@ class QueueStore:
             return str(row[0]) if row else None
 
         resolved_anchor_seq = anchor_seq if anchor_seq is not None else trigger.anchor_seq
-        self._conn.execute(
+        insert_cursor = self._conn.execute(
             """
             INSERT OR IGNORE INTO onebot_queue_trigger(
                 request_id,chat_id,message_key,reason,caller_user_id,caller_user_name,
@@ -1110,6 +1207,15 @@ class QueueStore:
                 now,
             ),
         )
+        if insert_cursor.rowcount > 0 and triggered_at is not None:
+            self._conn.execute(
+                """
+                UPDATE onebot_queue_chat
+                SET last_trigger_at=?, updated_at=?
+                WHERE chat_id=?
+                """,
+                (float(triggered_at), now, str(chat_id)),
+            )
         if resolved_anchor_seq is not None:
             self._conn.execute(
                 """
@@ -1379,6 +1485,256 @@ class QueueStore:
         cutoff = now - self.dedupe_ttl_seconds
         self._conn.execute("DELETE FROM onebot_queue_dedupe WHERE created_at<?", (cutoff,))
 
+    def _row_to_reaction(self, row: sqlite3.Row) -> ReactionRecord:
+        """把 reaction SQLite 行转换为只读记录。"""
+        return ReactionRecord(
+            lease_id=str(row["lease_id"]),
+            chat_id=str(row["chat_id"]),
+            message_id=str(row["message_id"]),
+            state=str(row["state"]),
+            attempts=int(row["attempts"] or 0),
+            next_attempt_at=(
+                float(row["next_attempt_at"])
+                if row["next_attempt_at"] is not None
+                else None
+            ),
+            last_error=str(row["last_error"]) if row["last_error"] is not None else None,
+            created_at=float(row["created_at"]),
+            updated_at=float(row["updated_at"]),
+        )
+
+    def reaction_for_lease(self, lease_id: str) -> ReactionRecord | None:
+        """读取一个 lease 的 reaction 状态。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM onebot_queue_reaction WHERE lease_id=?",
+                (str(lease_id),),
+            ).fetchone()
+            return self._row_to_reaction(row) if row is not None else None
+
+    def reaction_for_target(
+        self,
+        chat_id: str,
+        message_id: str,
+    ) -> ReactionRecord | None:
+        """按群和真实消息 ID读取唯一 reaction 记录。"""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT * FROM onebot_queue_reaction
+                WHERE chat_id=? AND message_id=?
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (str(chat_id), str(message_id)),
+            ).fetchone()
+            return self._row_to_reaction(row) if row is not None else None
+
+    def record_reaction(
+        self,
+        lease_id: str,
+        chat_id: str,
+        message_id: str,
+    ) -> ReactionRecord:
+        """在调用 OneBot ``set=true`` 前持久化 reaction 目标。"""
+        normalized_lease = str(lease_id).strip()
+        normalized_chat = str(chat_id).strip()
+        normalized_message = str(message_id).strip()
+        if not normalized_lease or not normalized_chat or not normalized_message:
+            raise ValueError("reaction lease、chat_id 和 message_id 不能为空")
+        with self._lock:
+            self._transaction()
+            try:
+                now = self._now()
+                existing = self._conn.execute(
+                    """
+                    SELECT * FROM onebot_queue_reaction
+                    WHERE chat_id=? AND message_id=?
+                    ORDER BY updated_at DESC
+                    LIMIT 1
+                    """,
+                    (normalized_chat, normalized_message),
+                ).fetchone()
+                if existing is not None:
+                    existing_lease = str(existing["lease_id"])
+                    self._conn.execute(
+                        """
+                        DELETE FROM onebot_queue_reaction
+                        WHERE chat_id=? AND message_id=? AND lease_id<>?
+                        """,
+                        (normalized_chat, normalized_message, existing_lease),
+                    )
+                    self._conn.execute(
+                        """
+                        UPDATE onebot_queue_reaction
+                        SET lease_id=?, updated_at=?
+                        WHERE lease_id=?
+                        """,
+                        (
+                            normalized_lease,
+                            now,
+                            existing_lease,
+                        ),
+                    )
+                else:
+                    self._conn.execute(
+                        """
+                        INSERT INTO onebot_queue_reaction(
+                            lease_id,chat_id,message_id,state,attempts,
+                            next_attempt_at,last_error,created_at,updated_at
+                        ) VALUES (?,?,?,'pending',0,NULL,NULL,?,?)
+                        """,
+                        (
+                            normalized_lease,
+                            normalized_chat,
+                            normalized_message,
+                            now,
+                            now,
+                        ),
+                    )
+                row = self._conn.execute(
+                    "SELECT * FROM onebot_queue_reaction WHERE lease_id=?",
+                    (normalized_lease,),
+                ).fetchone()
+                if row is None:
+                    raise QueueError("reaction 记录写入后无法读取")
+                self._conn.commit()
+                return self._row_to_reaction(row)
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def mark_reaction_set(self, lease_id: str) -> bool:
+        """记录 reaction 添加成功或结果未知，之后只允许 unset。"""
+        with self._lock:
+            cursor = self._conn.execute(
+                """
+                UPDATE onebot_queue_reaction
+                SET state='maybe_set', last_error=NULL, updated_at=?
+                WHERE lease_id=? AND state IN ('pending','maybe_set')
+                """,
+                (self._now(), str(lease_id)),
+            )
+            self._conn.commit()
+            return cursor.rowcount > 0
+
+    def mark_reaction_cleanup_failure(
+        self,
+        lease_id: str,
+        reason: str,
+        *,
+        max_attempts: int = 3,
+        backoff_seconds: tuple[float, ...] = DEFAULT_BACKOFF_SECONDS,
+    ) -> ReactionRecord | None:
+        """记录 unset 失败并应用有限退避，绝不重放 set=true。"""
+        with self._lock:
+            self._transaction()
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM onebot_queue_reaction WHERE lease_id=?",
+                    (str(lease_id),),
+                ).fetchone()
+                if row is None:
+                    self._conn.commit()
+                    return None
+                attempts = int(row["attempts"] or 0) + 1
+                delays = tuple(max(0.0, float(item)) for item in backoff_seconds) or (
+                    2.0,
+                )
+                next_attempt_at = None
+                if attempts < max(1, int(max_attempts)):
+                    next_attempt_at = self._now() + min(
+                        MAX_BACKOFF_SECONDS,
+                        delays[min(attempts - 1, len(delays) - 1)],
+                    )
+                self._conn.execute(
+                    """
+                    UPDATE onebot_queue_reaction
+                    SET state='maybe_set', attempts=?, next_attempt_at=?,
+                        last_error=?, updated_at=?
+                    WHERE lease_id=?
+                    """,
+                    (
+                        attempts,
+                        next_attempt_at,
+                        str(reason)[:512],
+                        self._now(),
+                        str(lease_id),
+                    ),
+                )
+                updated = self._conn.execute(
+                    "SELECT * FROM onebot_queue_reaction WHERE lease_id=?",
+                    (str(lease_id),),
+                ).fetchone()
+                self._conn.commit()
+                return self._row_to_reaction(updated) if updated is not None else None
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def pending_reaction_cleanups(
+        self,
+        allowed_chat_ids: Iterable[str] | None = None,
+        *,
+        limit: int = 32,
+        now: float | None = None,
+        include_not_due: bool = False,
+        include_exhausted: bool = False,
+    ) -> tuple[ReactionRecord, ...]:
+        """读取到期 reaction 清理任务；只返回 pending/maybe_set 状态。"""
+        scope = (
+            None
+            if allowed_chat_ids is None
+            else frozenset(str(item) for item in allowed_chat_ids)
+        )
+        if scope is not None and not scope:
+            return ()
+        with self._lock:
+            current = self._now() if now is None else float(now)
+            params: list[Any] = []
+            scope_sql = ""
+            if scope is not None:
+                placeholders = ",".join("?" for _ in scope)
+                scope_sql = f" AND chat_id IN ({placeholders})"
+            if not include_exhausted:
+                params.append(3)
+                attempts_sql = " AND attempts < ?"
+            else:
+                attempts_sql = ""
+            due_sql = (
+                ""
+                if include_not_due
+                else " AND (next_attempt_at IS NULL OR next_attempt_at<=?)"
+            )
+            if not include_not_due:
+                params.append(current)
+            if scope is not None:
+                params.extend(sorted(scope))
+            params.append(max(1, min(256, int(limit))))
+            rows = self._conn.execute(
+                f"""
+                SELECT * FROM onebot_queue_reaction
+                WHERE state IN ('pending','maybe_set')
+                  {attempts_sql}
+                  {due_sql}
+                  {scope_sql}
+                ORDER BY updated_at, created_at
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+            return tuple(self._row_to_reaction(row) for row in rows)
+
+    def delete_reaction(self, lease_id: str) -> bool:
+        """删除已明确 unset 的本地 reaction 记录。"""
+        with self._lock:
+            cursor = self._conn.execute(
+                "DELETE FROM onebot_queue_reaction WHERE lease_id=?",
+                (str(lease_id),),
+            )
+            self._conn.commit()
+            return cursor.rowcount > 0
+
     def peek(
         self,
         chat_id: str,
@@ -1425,6 +1781,7 @@ class QueueStore:
         authority_role: str | None = "user",
         authority_tools: Iterable[str] | None = None,
         authority_self_id: str | None = None,
+        triggered_at: float | None = None,
     ) -> str | None:
         """为指定或最早待处理消息创建 durable anchor，不创建 lease。"""
         with self._lock:
@@ -1478,6 +1835,7 @@ class QueueStore:
                     str(row["message_key"]),
                     now,
                     anchor_seq=int(row["seq"]),
+                    triggered_at=triggered_at,
                 )
                 self._conn.commit()
                 return request_id
@@ -1492,6 +1850,7 @@ class QueueStore:
         reason: str,
         *,
         triggered_at: float | None = None,
+        llm_observed_seq: int | None = None,
         anchor_kind: str = "selector",
         authority_role: str | None = "user",
         authority_tools: Iterable[str] | None = None,
@@ -1531,6 +1890,14 @@ class QueueStore:
                     authority_tools=authority_tools,
                     authority_self_id=authority_self_id,
                 )
+                existing_trigger = self._conn.execute(
+                    """
+                    SELECT request_id
+                    FROM onebot_queue_trigger
+                    WHERE chat_id=? AND message_key=?
+                    """,
+                    (str(chat_id), str(row["message_key"])),
+                ).fetchone()
                 request_id = self._ensure_trigger(
                     trigger,
                     str(chat_id),
@@ -1538,16 +1905,33 @@ class QueueStore:
                     now,
                     anchor_seq=int(anchor_seq),
                 )
-                if request_id is not None and triggered_at is not None:
-                    # 当前 closeout 仍以 adapter 内存 cooldown 为主；这里只保留
-                    # durable 时间，便于重启后的诊断和后续策略恢复。
+                if request_id is not None and existing_trigger is None:
+                    llm_seq = (
+                        max(0, int(llm_observed_seq))
+                        if llm_observed_seq is not None
+                        else None
+                    )
                     self._conn.execute(
                         """
                         UPDATE onebot_queue_chat
-                        SET updated_at=?, revision=revision+1
+                        SET last_trigger_at=COALESCE(?, last_trigger_at),
+                            llm_judged_seq=CASE
+                                WHEN ? IS NULL THEN llm_judged_seq
+                                ELSE MAX(llm_judged_seq, ?)
+                            END,
+                            llm_next_attempt_at=NULL,
+                            llm_failure_count=0,
+                            llm_last_error=NULL,
+                            updated_at=?
                         WHERE chat_id=?
                         """,
-                        (float(triggered_at), str(chat_id)),
+                        (
+                            float(triggered_at) if triggered_at is not None else None,
+                            llm_seq,
+                            llm_seq,
+                            self._now(),
+                            str(chat_id),
+                        ),
                     )
                 self._conn.commit()
                 return request_id
@@ -2175,32 +2559,146 @@ class QueueStore:
                     (str(chat_id),),
                 ).fetchall()
                 if action == "retry":
-                    blocked_row_ids = [int(row["row_id"]) for row in rows]
-                    self._conn.execute(
-                        f"""
-                        UPDATE onebot_queue_message
-                        SET state='pending', lease_id=NULL, lease_until=NULL, lease_owner=NULL,
-                            lease_phase='pending', outbound_started=0, uncertain_reason=NULL,
-                            failure_reason=NULL, failure_count=0, attempts=0,
-                            next_attempt_at=?, updated_at=?
-                        WHERE row_id IN ({",".join("?" for _ in blocked_row_ids)})
-                        """,
-                        (now, now, *blocked_row_ids),
-                    )
-                    self._transition_trigger_rows(list(trigger_rows), "pending", now)
-                    if not trigger_rows:
+                    retried_row_ids: set[int] = set()
+                    for trigger_row in trigger_rows:
+                        # retry 必须重新建立 request_id。否则旧 anchor 的 authority
+                        # 和 batch 身份会被原样复活，也无法和后续明确 anchor
+                        # 区分。legacy 或 authority 无法证明的记录只能 hold。
+                        anchor_kind = str(trigger_row["anchor_kind"] or "message")
+                        if anchor_kind == "legacy" or not self._authority_row_valid(trigger_row):
+                            continue
+                        authority_self_id = str(trigger_row["authority_self_id"] or "").strip()
+                        if not authority_self_id:
+                            continue
+                        if (
+                            anchor_kind in {"operator", "admin_flush"}
+                            and str(trigger_row["authority_role"] or "") != "super_admin"
+                        ):
+                            continue
+                        group_rows = self._conn.execute(
+                            """
+                            SELECT * FROM onebot_queue_message
+                            WHERE chat_id=?
+                              AND state IN ('pending','uncertain','failed')
+                              AND (
+                                  anchor_id=?
+                                  OR message_key=?
+                              )
+                            ORDER BY seq
+                            """,
+                            (
+                                str(chat_id),
+                                str(trigger_row["request_id"]),
+                                str(trigger_row["message_key"]),
+                            ),
+                        ).fetchall()
+                        if not group_rows:
+                            continue
+                        anchor_seq = (
+                            int(trigger_row["anchor_seq"])
+                            if trigger_row["anchor_seq"] is not None
+                            else None
+                        )
+                        if anchor_seq is None:
+                            continue
+                        anchor_message = next(
+                            (
+                                row
+                                for row in group_rows
+                                if str(row["message_key"]) == str(trigger_row["message_key"])
+                                or (
+                                    anchor_seq is not None
+                                    and int(row["seq"]) == anchor_seq
+                                )
+                            ),
+                            None,
+                        )
+                        if anchor_message is None:
+                            continue
+                        if anchor_kind not in {"operator", "admin_flush"}:
+                            message_role, message_tools, message_self_id = (
+                                self._authority_from_message_row(anchor_message)
+                            )
+                            trigger_tools = frozenset(
+                                item
+                                for item in json.loads(str(trigger_row["authority_tools_json"]))
+                                if isinstance(item, str) and item not in _FORBIDDEN_AUTHORITY_TOOLS
+                            )
+                            if (
+                                message_role != str(trigger_row["authority_role"])
+                                or message_tools != trigger_tools
+                                or message_self_id != authority_self_id
+                            ):
+                                continue
+                        old_request_id = str(trigger_row["request_id"])
+                        new_trigger = TriggerRequest.create(
+                            str(chat_id),
+                            str(trigger_row["message_key"]),
+                            "admin_resolve_retry",
+                            str(trigger_row["caller_user_id"]),
+                            str(trigger_row["caller_user_name"]),
+                            anchor_seq=anchor_seq,
+                            anchor_kind=anchor_kind,
+                            batch_start_seq=(
+                                int(trigger_row["batch_start_seq"])
+                                if trigger_row["batch_start_seq"] is not None
+                                else None
+                            ),
+                            control_message_id=(
+                                str(trigger_row["control_message_id"])
+                                if trigger_row["control_message_id"] is not None
+                                else None
+                            ),
+                            authority_role=str(trigger_row["authority_role"]),
+                            authority_tools=json.loads(
+                                str(trigger_row["authority_tools_json"])
+                            ),
+                            authority_self_id=authority_self_id,
+                        )
+                        self._conn.execute(
+                            "DELETE FROM onebot_queue_trigger WHERE request_id=?",
+                            (old_request_id,),
+                        )
+                        row_ids = [int(row["row_id"]) for row in group_rows]
                         self._conn.execute(
                             f"""
                             UPDATE onebot_queue_message
-                            SET anchor_id=NULL
-                            WHERE row_id IN ({",".join("?" for _ in blocked_row_ids)})
+                            SET state='pending', lease_id=NULL, lease_until=NULL, lease_owner=NULL,
+                                lease_phase='pending', outbound_started=0, uncertain_reason=NULL,
+                                failure_reason=NULL, failure_count=0, attempts=0,
+                                next_attempt_at=?, anchor_id=NULL, updated_at=?
+                            WHERE row_id IN ({",".join("?" for _ in row_ids)})
                             """,
-                            tuple(blocked_row_ids),
+                            (now, now, *row_ids),
                         )
-                        self._ensure_retriable_trigger(
+                        request_id = self._ensure_trigger(
+                            new_trigger,
                             str(chat_id),
+                            str(trigger_row["message_key"]),
                             now,
-                            include_unattempted=True,
+                            anchor_seq=anchor_seq,
+                        )
+                        if request_id != new_trigger.request_id:
+                            raise QueueError("resolve retry 未能创建新的 durable anchor")
+                        self._conn.execute(
+                            f"""
+                            UPDATE onebot_queue_message
+                            SET anchor_id=?, updated_at=?
+                            WHERE row_id IN ({",".join("?" for _ in row_ids)})
+                            """,
+                            (request_id, now, *row_ids),
+                        )
+                        retried_row_ids.update(row_ids)
+                    # 没有旧 trigger，或旧 trigger 的 authority/batch 无法证明时，
+                    # 不猜测权限、不把消息交给管理员或后续 selector 接管。
+                    if retried_row_ids:
+                        self._conn.execute(
+                            f"""
+                            UPDATE onebot_queue_message
+                            SET next_attempt_at=?
+                            WHERE row_id IN ({",".join("?" for _ in retried_row_ids)})
+                            """,
+                            (now, *sorted(retried_row_ids)),
                         )
                 else:
                     self._conn.execute(
@@ -2221,6 +2719,8 @@ class QueueStore:
                         "DELETE FROM onebot_queue_trigger WHERE chat_id=? AND status IN ('uncertain','failed')", (str(chat_id),)
                     )
                 self._conn.commit()
+                if action == "retry":
+                    return len(retried_row_ids)
                 return len(rows)
             except Exception:
                 self._conn.rollback()
@@ -2236,7 +2736,14 @@ class QueueStore:
             counts = {str(row["state"]): int(row["count"]) for row in rows}
             bytes_total = int(sum(int(row["bytes"]) for row in rows))
             chat = self._conn.execute(
-                "SELECT summary, paused, next_seq, revision FROM onebot_queue_chat WHERE chat_id=?", (str(chat_id),)
+                """
+                SELECT summary, paused, next_seq, revision,
+                       last_trigger_at, llm_judged_seq,
+                       llm_next_attempt_at, llm_failure_count, llm_last_error
+                FROM onebot_queue_chat
+                WHERE chat_id=?
+                """,
+                (str(chat_id),),
             ).fetchone()
             trigger = self._conn.execute(
                 "SELECT COUNT(*) FROM onebot_queue_trigger WHERE chat_id=? AND status IN ('pending','uncertain','failed')",
@@ -2292,6 +2799,31 @@ class QueueStore:
                 """,
                 (str(chat_id),),
             ).fetchone()
+            reaction_stats = self._conn.execute(
+                """
+                SELECT state, COUNT(*) AS count
+                FROM onebot_queue_reaction
+                WHERE chat_id=?
+                GROUP BY state
+                """,
+                (str(chat_id),),
+            ).fetchall()
+            reaction_errors = self._conn.execute(
+                """
+                SELECT DISTINCT last_error
+                FROM onebot_queue_reaction
+                WHERE chat_id=? AND last_error IS NOT NULL
+                """,
+                (str(chat_id),),
+            ).fetchall()
+            reaction_exhausted = self._conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM onebot_queue_reaction
+                WHERE chat_id=? AND attempts>=3
+                """,
+                (str(chat_id),),
+            ).fetchone()
             chat_type = self._conn.execute(
                 "SELECT chat_type FROM onebot_queue_message WHERE chat_id=? LIMIT 1",
                 (str(chat_id),),
@@ -2315,12 +2847,152 @@ class QueueStore:
                 "next_retry_at": float(next_retry[0][0]) if next_retry and next_retry[0][0] is not None else None,
                 "failure_reasons": [str(row[0]) for row in failure_reasons],
                 "uncertain_reasons": [str(row[0]) for row in uncertain_reasons],
+                "reaction_pending": sum(
+                    int(row["count"])
+                    for row in reaction_stats
+                    if str(row["state"]) == "pending"
+                ),
+                "reaction_maybe_set": sum(
+                    int(row["count"])
+                    for row in reaction_stats
+                    if str(row["state"]) == "maybe_set"
+                ),
+                "reaction_cleanup_exhausted": int(
+                    reaction_exhausted[0] if reaction_exhausted else 0
+                ),
+                "reaction_errors": [str(row[0])[:160] for row in reaction_errors[:8]],
                 "paused": bool(chat["paused"]) if chat else False,
                 "next_seq": int(chat["next_seq"]) if chat else 1,
                 "latest_seq": max(0, int(chat["next_seq"]) - 1) if chat else 0,
                 "revision": int(chat["revision"]) if chat else 0,
                 "summary": str(chat["summary"]) if chat else "",
+                "last_trigger_at": (
+                    float(chat["last_trigger_at"])
+                    if chat and chat["last_trigger_at"] is not None
+                    else None
+                ),
+                "llm_judged_seq": int(chat["llm_judged_seq"]) if chat else 0,
+                "llm_next_attempt_at": (
+                    float(chat["llm_next_attempt_at"])
+                    if chat and chat["llm_next_attempt_at"] is not None
+                    else None
+                ),
+                "llm_failure_count": int(chat["llm_failure_count"]) if chat else 0,
+                "llm_last_error": (
+                    str(chat["llm_last_error"])
+                    if chat and chat["llm_last_error"] is not None
+                    else None
+                ),
             }
+
+    def last_trigger_at(self, chat_id: str) -> float | None:
+        """读取群最近一次真正创建 trigger 的 wall-clock 时间。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT last_trigger_at FROM onebot_queue_chat WHERE chat_id=?",
+                (str(chat_id),),
+            ).fetchone()
+            if row is None or row[0] is None:
+                return None
+            return float(row[0])
+
+    def llm_state(self, chat_id: str) -> dict[str, Any]:
+        """读取持久化 selector 游标和失败退避状态。"""
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT last_trigger_at, llm_judged_seq,
+                       llm_next_attempt_at, llm_failure_count, llm_last_error
+                FROM onebot_queue_chat
+                WHERE chat_id=?
+                """,
+                (str(chat_id),),
+            ).fetchone()
+            if row is None:
+                return {
+                    "last_trigger_at": None,
+                    "llm_judged_seq": 0,
+                    "llm_next_attempt_at": None,
+                    "llm_failure_count": 0,
+                    "llm_last_error": None,
+                }
+            return {
+                "last_trigger_at": (
+                    float(row["last_trigger_at"])
+                    if row["last_trigger_at"] is not None
+                    else None
+                ),
+                "llm_judged_seq": int(row["llm_judged_seq"] or 0),
+                "llm_next_attempt_at": (
+                    float(row["llm_next_attempt_at"])
+                    if row["llm_next_attempt_at"] is not None
+                    else None
+                ),
+                "llm_failure_count": int(row["llm_failure_count"] or 0),
+                "llm_last_error": (
+                    str(row["llm_last_error"])
+                    if row["llm_last_error"] is not None
+                    else None
+                ),
+            }
+
+    def mark_llm_judged(self, chat_id: str, observed_seq: int) -> bool:
+        """记录 selector 已经明确判断到的最高消息序号并清除退避。"""
+        with self._lock:
+            try:
+                self._transaction()
+                cursor = self._conn.execute(
+                    """
+                    UPDATE onebot_queue_chat
+                    SET llm_judged_seq=MAX(llm_judged_seq, ?),
+                        llm_next_attempt_at=NULL,
+                        llm_failure_count=0,
+                        llm_last_error=NULL,
+                        updated_at=?
+                    WHERE chat_id=?
+                    """,
+                    (max(0, int(observed_seq)), self._now(), str(chat_id)),
+                )
+                self._conn.commit()
+                return cursor.rowcount > 0
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def mark_llm_failure(
+        self,
+        chat_id: str,
+        *,
+        observed_seq: int,
+        error: str,
+        next_attempt_at: float,
+    ) -> bool:
+        """记录 selector 失败和下次尝试时间，但不消费当前消息游标。"""
+        del observed_seq
+        with self._lock:
+            try:
+                self._transaction()
+                cursor = self._conn.execute(
+                    """
+                    UPDATE onebot_queue_chat
+                    SET llm_next_attempt_at=?,
+                        llm_failure_count=llm_failure_count+1,
+                        llm_last_error=?,
+                        updated_at=?
+                    WHERE chat_id=?
+                    """,
+                    (
+                        float(next_attempt_at),
+                        str(error)[:512],
+                        self._now(),
+                        str(chat_id),
+                    ),
+                )
+                self._conn.commit()
+                return cursor.rowcount > 0
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def revision(self, chat_id: str) -> int:
         """读取群消息 revision，供旁路判断检测判断期间的新消息。"""
@@ -2688,6 +3360,119 @@ class QueueStore:
                 self._conn.rollback()
                 raise
 
+    def recover_due_triggers(
+        self,
+        *,
+        now: float | None = None,
+        cooldown_seconds: float = 0.0,
+        allowed_chat_ids: Iterable[str] | None = None,
+    ) -> tuple[TriggerRequest, ...]:
+        """为 cooldown 到期且尚未判断的最早消息创建 durable recovery anchor。"""
+        scope = (
+            None
+            if allowed_chat_ids is None
+            else frozenset(str(chat_id) for chat_id in allowed_chat_ids)
+        )
+        if scope is not None and not scope:
+            return ()
+        with self._lock:
+            try:
+                self._transaction()
+                current = self._now() if now is None else float(now)
+                params: list[Any] = []
+                scope_sql = ""
+                if scope is not None:
+                    placeholders = ",".join("?" for _ in scope)
+                    scope_sql = f" AND chat.chat_id IN ({placeholders})"
+                    params.extend(sorted(scope))
+                chats = self._conn.execute(
+                    f"""
+                    SELECT chat.*
+                    FROM onebot_queue_chat AS chat
+                    WHERE EXISTS (
+                        SELECT 1 FROM onebot_queue_message AS message
+                        WHERE message.chat_id=chat.chat_id
+                          AND message.state='pending'
+                    ){scope_sql}
+                    ORDER BY chat.chat_id
+                    """,
+                    tuple(params),
+                ).fetchall()
+                created: list[TriggerRequest] = []
+                for chat in chats:
+                    chat_id = str(chat["chat_id"])
+                    if bool(chat["paused"]):
+                        continue
+                    if (
+                        chat["last_trigger_at"] is not None
+                        and current - float(chat["last_trigger_at"])
+                        < max(0.0, float(cooldown_seconds))
+                    ):
+                        continue
+                    if (
+                        chat["llm_next_attempt_at"] is not None
+                        and float(chat["llm_next_attempt_at"]) > current
+                    ):
+                        continue
+                    blocked = self._conn.execute(
+                        """
+                        SELECT 1 FROM onebot_queue_message
+                        WHERE chat_id=? AND state IN ('leased','uncertain','failed')
+                        LIMIT 1
+                        """,
+                        (chat_id,),
+                    ).fetchone()
+                    pending_trigger = self._conn.execute(
+                        """
+                        SELECT 1 FROM onebot_queue_trigger
+                        WHERE chat_id=? AND status='pending'
+                        LIMIT 1
+                        """,
+                        (chat_id,),
+                    ).fetchone()
+                    if blocked is not None or pending_trigger is not None:
+                        continue
+                    row = self._conn.execute(
+                        """
+                        SELECT * FROM onebot_queue_message
+                        WHERE chat_id=? AND state='pending'
+                          AND anchor_id IS NULL AND seq>?
+                        ORDER BY seq LIMIT 1
+                        """,
+                        (chat_id, int(chat["llm_judged_seq"] or 0)),
+                    ).fetchone()
+                    if row is None:
+                        continue
+                    role, tools, self_id = self._authority_from_message_row(row)
+                    trigger = TriggerRequest.create(
+                        chat_id,
+                        str(row["message_key"]),
+                        "cooldown_recovery",
+                        str(row["user_id"]),
+                        str(row["user_name"]),
+                        anchor_seq=int(row["seq"]),
+                        anchor_kind="recovery",
+                        authority_role=role,
+                        authority_tools=tools,
+                        authority_self_id=self_id,
+                    )
+                    request_id = self._ensure_trigger(
+                        trigger,
+                        chat_id,
+                        str(row["message_key"]),
+                        current,
+                        anchor_seq=int(row["seq"]),
+                        triggered_at=current,
+                    )
+                    if request_id != trigger.request_id:
+                        continue
+                    created.append(trigger)
+                self._conn.commit()
+                return tuple(created)
+            except Exception:
+                self._conn.rollback()
+                raise
+
     def _append_summary(self, current: str, rows: list[sqlite3.Row]) -> str:
         """将已确认消息追加为确定性摘要，并保留最近内容。"""
         parts = [current] if current else []
@@ -2723,7 +3508,7 @@ class QueueStore:
         return QueueMessage(
             chat_id=str(row["chat_id"]),
             chat_type=str(row["chat_type"]),
-            message_id=str(row["message_id"] or row["message_key"]),
+            message_id=str(row["message_id"] or ""),
             user_id=str(row["user_id"]),
             user_name=str(row["user_name"]),
             text=str(row["text"]),

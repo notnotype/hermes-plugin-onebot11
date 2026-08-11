@@ -68,6 +68,7 @@ class TriggerAction:
     due_at: float | None = None
     revision: int | None = None
     generation: int | None = None
+    anchor_seq: int | None = None
 
 
 @dataclass
@@ -170,7 +171,7 @@ class LayeredTriggerState:
         self,
         *,
         decision: str,
-        wait_seconds: int,
+        anchor_seq: int | None,
         observed_revision: int,
         current_revision: int,
         now: float,
@@ -196,21 +197,37 @@ class LayeredTriggerState:
                 generation=self._judgement_generation,
             )
         if decision == "trigger":
+            if type(anchor_seq) is not int or anchor_seq <= 0:
+                self.llm_failures += 1
+                self._return_to_engaged_or_idle(now)
+                self.wait_until = None
+                self._candidate_type = ""
+                self.dirty_revision = None
+                return TriggerAction("none", reason="invalid_result")
             self.mode = "idle"
             self._candidate_type = ""
             self.dirty_revision = None
             return TriggerAction(
-                "direct", reason="llm", generation=self._judgement_generation
+                "direct",
+                reason="llm",
+                generation=self._judgement_generation,
+                anchor_seq=anchor_seq,
             )
-        if decision == "wait" and wait_seconds in {5, 10, 30, 60}:
+        if decision == "wait" and anchor_seq is None:
             self.mode = "waiting"
-            self.wait_until = now + wait_seconds
+            # 新合同不再允许模型控制等待秒数；等待窗口由本地状态机
+            # 控制，避免模型通过任意数字制造高频轮询。
+            self.wait_until = now + self.config.engaged_idle_seconds
             self._candidate_type = ""
             self.dirty_revision = None
             return TriggerAction("wait", reason="llm_wait", due_at=self.wait_until)
-        if decision not in {"ignore", "wait"} or (
-            decision == "wait" and wait_seconds not in {5, 10, 30, 60}
-        ):
+        if decision == "ignore" and anchor_seq is None:
+            self._return_to_engaged_or_idle(now)
+            self.wait_until = None
+            self._candidate_type = ""
+            self.dirty_revision = None
+            return TriggerAction("none", reason="llm_ignore")
+        if decision not in {"ignore", "wait"}:
             self.llm_failures += 1
         self._return_to_engaged_or_idle(now)
         self.wait_until = None
@@ -504,21 +521,22 @@ def memory_matches(text: str, words: Iterable[str]) -> bool:
     return any(str(word).casefold() in folded for word in words if str(word).strip())
 
 
-def parse_llm_decision(value: Any) -> tuple[str, int] | None:
+def parse_llm_decision(value: Any) -> tuple[str, int | None] | None:
     """严格解析旁路模型的三态 JSON 结果。"""
     if not isinstance(value, Mapping):
         return None
-    if set(value) != {"decision", "wait_seconds"}:
+    if set(value) != {"decision", "anchor_seq"}:
         return None
     decision = value.get("decision")
-    wait_seconds = value.get("wait_seconds")
-    if decision not in {"trigger", "wait", "ignore"} or type(wait_seconds) is not int:
+    anchor_seq = value.get("anchor_seq")
+    if decision not in {"trigger", "wait", "ignore"}:
         return None
-    if decision == "wait" and wait_seconds not in {5, 10, 30, 60}:
+    if decision == "trigger":
+        if type(anchor_seq) is not int or anchor_seq <= 0:
+            return None
+    elif anchor_seq is not None:
         return None
-    if decision != "wait" and wait_seconds != 0:
-        return None
-    return str(decision), wait_seconds
+    return str(decision), anchor_seq
 
 
 def build_trigger_config(extra: dict[str, Any]) -> TriggerConfig:
@@ -704,13 +722,12 @@ def build_llm_trigger_input(
     latest = queued[-1] if queued else None
     contract = "\n".join(
         (
-            "判断当前 OneBot11 群消息是否应该让机器人回复。",
-            f"候选类型：{candidate_type}。请结合历史摘要和当前队列判断。",
-            "只输出严格 JSON。合法结果示例：",
-            '{"decision":"trigger","wait_seconds":0}',
-            '{"decision":"wait","wait_seconds":5}',
-            '{"decision":"ignore","wait_seconds":0}',
-            "decision=wait 时 wait_seconds 只能是 5、10、30、60；trigger/ignore 使用 0。",
+            f"判断当前 OneBot11 群消息是否需要回复；候选类型：{candidate_type}。",
+            "只输出严格 JSON；trigger 只能选择当前队列中真实的 seq 作为 authority。",
+            '{"decision":"trigger","anchor_seq":123}',
+            '{"decision":"wait","anchor_seq":null}',
+            '{"decision":"ignore","anchor_seq":null}',
+            "wait/ignore 必须使用 null。",
         )
     )
     queue_prefix = contract + "\n当前队列：\n"

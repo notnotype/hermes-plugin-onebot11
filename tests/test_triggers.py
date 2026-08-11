@@ -181,7 +181,7 @@ def test_判断期间新消息让旧结果变脏并重新debounce():
     ).reason == "judging_dirty"
     rescheduled = state.on_llm_result(
         decision="trigger",
-        wait_seconds=0,
+        anchor_seq=1,
         observed_revision=1,
         current_revision=2,
         now=7,
@@ -217,7 +217,7 @@ def test_硬触发使旧LLM结果失效():
     assert direct.kind == "direct"
     stale = state.on_llm_result(
         decision="trigger",
-        wait_seconds=0,
+        anchor_seq=1,
         observed_revision=1,
         current_revision=2,
         now=7,
@@ -259,7 +259,7 @@ def test_旧generation不能污染新一轮LLM判断():
 
     stale = state.on_llm_result(
         decision="trigger",
-        wait_seconds=0,
+        anchor_seq=1,
         observed_revision=1,
         current_revision=2,
         now=4,
@@ -289,7 +289,7 @@ def test_模型失败在没有新消息时不空转():
 
 def test_wait不创建lease且只等待新消息():
     """旁路 wait 只改变内存状态，到期后回到 idle，不会伪造 Agent turn。"""
-    config = TriggerConfig(debounce_seconds=5)
+    config = TriggerConfig(debounce_seconds=5, engaged_idle_seconds=10)
     state = LayeredTriggerState(config)
     state.observe_message(
         chat_type="group",
@@ -302,7 +302,7 @@ def test_wait不创建lease且只等待新消息():
     assert state.on_timer(now=5).kind == "judge"
     action = state.on_llm_result(
         decision="wait",
-        wait_seconds=10,
+        anchor_seq=None,
         observed_revision=1,
         current_revision=1,
         now=5,
@@ -374,7 +374,7 @@ def test_engaged窗口最多三次仲裁并在成功后重新计数():
         assert state.on_timer(now=index + 2).kind == "judge"
         state.on_llm_result(
             decision="ignore",
-            wait_seconds=0,
+            anchor_seq=None,
             observed_revision=index + 1,
             current_revision=index + 1,
             now=index + 2,
@@ -432,25 +432,26 @@ def test_失败turn即使保留pending也退出engaged():
     assert state.engaged_max_until is None
 
 
-def test_llm决策严格限制字段和等待秒数():
+def test_llm决策严格限制真实anchor_seq合同():
     """非法 JSON 结构不能被宽松转换成触发。"""
-    assert parse_llm_decision({"decision": "trigger", "wait_seconds": 0}) == ("trigger", 0)
-    assert parse_llm_decision({"decision": "wait", "wait_seconds": 5}) == ("wait", 5)
-    assert parse_llm_decision({"decision": "wait", "wait_seconds": 7}) is None
-    assert parse_llm_decision({"decision": "trigger", "wait_seconds": 5}) is None
-    assert parse_llm_decision({"decision": "ignore", "wait_seconds": 10}) is None
+    assert parse_llm_decision({"decision": "trigger", "anchor_seq": 12}) == ("trigger", 12)
+    assert parse_llm_decision({"decision": "wait", "anchor_seq": None}) == ("wait", None)
+    assert parse_llm_decision({"decision": "ignore", "anchor_seq": None}) == ("ignore", None)
+    assert parse_llm_decision({"decision": "trigger", "anchor_seq": 0}) is None
+    assert parse_llm_decision({"decision": "trigger", "anchor_seq": True}) is None
+    assert parse_llm_decision({"decision": "wait", "anchor_seq": 12}) is None
+    assert parse_llm_decision({"decision": "ignore", "anchor_seq": 12}) is None
     assert parse_llm_decision({"decision": "trigger"}) is None
-    assert parse_llm_decision({"decision": "trigger", "wait_seconds": False}) is None
-    assert parse_llm_decision({"decision": "ignore", "wait_seconds": 0, "extra": 1}) is None
+    assert parse_llm_decision({"decision": "ignore", "anchor_seq": None, "extra": 1}) is None
 
 
-def test_llm提示词只展示合法的等待秒数合同():
+def test_llm提示词只展示真实anchor_seq合同():
     """模型看到的 JSON 示例必须与 parser 的严格合同一致。"""
     prompt = build_llm_trigger_input("", (), max_bytes=2048, candidate_type="question")
-    assert '{"decision":"trigger","wait_seconds":0}' in prompt
-    assert '{"decision":"wait","wait_seconds":5}' in prompt
-    assert '{"decision":"ignore","wait_seconds":0}' in prompt
-    assert '{"decision":"trigger|wait|ignore","wait_seconds":5}' not in prompt
+    assert '{"decision":"trigger","anchor_seq":123}' in prompt
+    assert '{"decision":"wait","anchor_seq":null}' in prompt
+    assert '{"decision":"ignore","anchor_seq":null}' in prompt
+    assert "wait_seconds" not in prompt
 
 
 def test_llm输入预算严格成立且保留最新消息():
@@ -513,5 +514,5 @@ def test_llm输入预算足够时保留完整JSON合同并裁剪最新正文():
     )
     prompt = build_llm_trigger_input("", (message,), max_bytes=512)
     assert len(prompt.encode("utf-8")) <= 512
-    assert '{"decision":"trigger","wait_seconds":0}' in prompt
+    assert '{"decision":"trigger","anchor_seq":123}' in prompt
     assert "最新问题？" in prompt

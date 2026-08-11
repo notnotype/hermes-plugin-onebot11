@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 
-from .queue import QueueLease, QueueStore
+from .queue import QueueError, QueueLease, QueueStore, TriggerRequest
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +37,11 @@ class GroupDispatcher:
         lease_seconds: float = 120.0,
         heartbeat_seconds: float | None = None,
         recovery_poll_seconds: float = 5.0,
+        recovery_cooldown_seconds: float = 0.0,
         can_dispatch: Callable[[str], bool] | None = None,
         on_lease_lost: Callable[[QueueLease], Awaitable[None]] | None = None,
         recovery_chat_ids: Callable[[], Iterable[str] | None] | None = None,
+        on_recovery_wakeup: Callable[[], Awaitable[bool]] | None = None,
     ) -> None:
         """初始化调度器；lease 的续租由后台 heartbeat 负责。"""
         self.store = store
@@ -46,9 +49,11 @@ class GroupDispatcher:
         self.lease_seconds = max(5.0, float(lease_seconds))
         self.heartbeat_seconds = heartbeat_seconds or max(1.0, self.lease_seconds / 3)
         self.recovery_poll_seconds = max(0.05, float(recovery_poll_seconds))
+        self.recovery_cooldown_seconds = max(0.0, float(recovery_cooldown_seconds))
         self._can_dispatch = can_dispatch or (lambda _chat_id: True)
         self._on_lease_lost = on_lease_lost
         self._recovery_chat_ids = recovery_chat_ids
+        self._on_recovery_wakeup = on_recovery_wakeup
         self._locks: dict[str, asyncio.Lock] = {}
         self._active: dict[str, ActiveTurn] = {}
         self._heartbeat_tasks: dict[str, asyncio.Task[None]] = {}
@@ -73,13 +78,26 @@ class GroupDispatcher:
             return False
         lock = self._lock_for(chat_id)
         async with lock:
+            if self._closed or self.store.closed:
+                return False
+            try:
+                status = self.store.status(chat_id)
+            except QueueError:
+                return False
             if (
                 chat_id in self._active
-                or self.store.status(chat_id).get("paused")
+                or status.get("paused")
                 or not self._can_dispatch(chat_id)
             ):
                 return False
-            lease = await asyncio.to_thread(self.store.claim, chat_id, self.lease_seconds)
+            try:
+                lease = await asyncio.to_thread(
+                    self.store.claim,
+                    chat_id,
+                    self.lease_seconds,
+                )
+            except QueueError:
+                return False
             if lease is None:
                 return False
             self._active[chat_id] = ActiveTurn(lease=lease, started_at=lease.claimed_at)
@@ -142,6 +160,8 @@ class GroupDispatcher:
     ) -> bool:
         """按真实处理结果确认、释放或标记 uncertain，不在此处启动下一轮。"""
         lease_id = str(lease_id)
+        if self._closed or self.store.closed:
+            return False
         active: ActiveTurn | None = None
         chat_id: str | None = None
         for candidate_chat, candidate in list(self._active.items()):
@@ -154,7 +174,12 @@ class GroupDispatcher:
         lock = self._lock_for(chat_id)
         async with lock:
             current = self._active.get(chat_id)
-            if current is None or current.lease.lease_id != lease_id:
+            if (
+                self._closed
+                or self.store.closed
+                or current is None
+                or current.lease.lease_id != lease_id
+            ):
                 return False
             task = self._heartbeat_tasks.pop(chat_id, None)
             if task is not None:
@@ -194,32 +219,64 @@ class GroupDispatcher:
         if self._closed:
             return []
         self._ensure_recovery_loop()
-        requests = await asyncio.to_thread(
-            self.store.recover_trigger_requests,
-            self._recovery_chat_ids() if self._recovery_chat_ids is not None else None,
-        )
+        try:
+            requests = await self._collect_recovery_requests()
+        except QueueError:
+            return []
         chats: list[str] = []
         for request in requests:
             if self._can_dispatch(request.chat_id) and await self.notify(request.chat_id):
                 chats.append(request.chat_id)
         return chats
 
-    def _ensure_recovery_loop(self) -> None:
-        """启动轻量恢复轮询，等待其他进程失效 lease 到期。"""
-        if self._recovery_task is None or self._recovery_task.done():
-            self._recovery_task = asyncio.create_task(self._recovery_loop())
+    async def _collect_recovery_requests(self) -> tuple[TriggerRequest, ...]:
+        """收集 durable trigger；策略回调可接管 cooldown recovery。"""
+        allowed_chat_ids = (
+            self._recovery_chat_ids()
+            if self._recovery_chat_ids is not None
+            else None
+        )
+        requests = await asyncio.to_thread(
+            self.store.recover_trigger_requests,
+            allowed_chat_ids,
+        )
+        policy_handled = False
+        if self._on_recovery_wakeup is not None:
+            try:
+                policy_handled = bool(await self._on_recovery_wakeup())
+            except QueueError:
+                raise
+            except Exception:
+                logger.exception("OneBot11 恢复策略回调失败")
+                # 策略回调异常时不能退回 generic direct recovery；
+                # 否则 selector-aware adapter 会被绕过而产生错误 authority。
+                policy_handled = True
+        if not policy_handled and self.recovery_cooldown_seconds > 0:
+            due_requests = await asyncio.to_thread(
+                self.store.recover_due_triggers,
+                now=time.time(),
+                cooldown_seconds=self.recovery_cooldown_seconds,
+                allowed_chat_ids=allowed_chat_ids,
+            )
+            requests = tuple(
+                {
+                    request.request_id: request
+                    for request in (*requests, *due_requests)
+                }.values()
+            )
+        return tuple(requests)
 
     async def _recovery_loop(self) -> None:
         """周期恢复过期 lease，不抢占仍由其他进程持有的 lease。"""
         try:
             while not self._closed:
                 await asyncio.sleep(self.recovery_poll_seconds)
-                requests = await asyncio.to_thread(
-                    self.store.recover_trigger_requests,
-                    self._recovery_chat_ids()
-                    if self._recovery_chat_ids is not None
-                    else None,
-                )
+                if self.store.closed:
+                    return
+                try:
+                    requests = await self._collect_recovery_requests()
+                except QueueError:
+                    return
                 for request in requests:
                     chat_id = request.chat_id
                     if (
@@ -240,6 +297,12 @@ class GroupDispatcher:
         except Exception:
             logger.exception("OneBot11 lease 恢复轮询失败")
 
+    def _ensure_recovery_loop(self) -> None:
+        """启动轻量恢复轮询，等待其他进程失效 lease 到期。"""
+        if self._recovery_task is None or self._recovery_task.done():
+            self._recovery_task = asyncio.create_task(self._recovery_loop())
+
+
     def _finish_recovery_dispatch(self, chat_id: str, task: asyncio.Task[None]) -> None:
         """清理恢复任务引用，并记录启动失败。"""
         if self._recovery_dispatch_tasks.get(chat_id) is task:
@@ -259,7 +322,12 @@ class GroupDispatcher:
         notify_on_resume: bool = True,
     ) -> None:
         """暂停或恢复自动 dispatch；调用方可延迟恢复通知。"""
-        await asyncio.to_thread(self.store.set_paused, str(chat_id), paused)
+        if self._closed or self.store.closed:
+            return
+        try:
+            await asyncio.to_thread(self.store.set_paused, str(chat_id), paused)
+        except QueueError:
+            return
         if not paused and notify_on_resume:
             await self.notify(str(chat_id))
 
@@ -274,9 +342,21 @@ class GroupDispatcher:
             None,
         )
 
+    def active_leases(self) -> tuple[QueueLease, ...]:
+        """返回当前活动 lease 快照，供 adapter 在 shutdown 前 fencing。"""
+        return tuple(turn.lease for turn in self._active.values())
+
     async def close(self) -> None:
-        """停止 heartbeat；不擅自改变 lease 状态，交给恢复流程处理。"""
+        """停止 heartbeat 并先在内存中 fencing 活动 turn。"""
         self._closed = True
+        self._active = {
+            chat_id: ActiveTurn(
+                lease=turn.lease,
+                started_at=turn.started_at,
+                lease_lost=True,
+            )
+            for chat_id, turn in self._active.items()
+        }
         recovery = self._recovery_task
         self._recovery_task = None
         if recovery is not None:

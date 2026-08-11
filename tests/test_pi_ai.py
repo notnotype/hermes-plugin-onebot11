@@ -40,7 +40,7 @@ async def test_pi_ai客户端不把密钥值写入stdin(monkeypatch: pytest.Monk
     """Python 只把环境变量名传给 helper，绝不把密钥值放入 JSON。"""
     script = tmp_path / "helper.mjs"
     script.write_text("// test helper\n", encoding="utf-8")
-    process = _FakeProcess(b'{"ok":true,"text":"{\\"decision\\":\\"ignore\\",\\"wait_seconds\\":0}"}')
+    process = _FakeProcess(b'{"ok":true,"text":"{\\"decision\\":\\"ignore\\",\\"anchor_seq\\":null}"}')
     monkeypatch.setattr("onebot11.pi_ai.shutil.which", lambda _name: "node")
 
     async def create_process(*args: object, **kwargs: object) -> _FakeProcess:
@@ -154,7 +154,7 @@ async def test_pi_ai真实custom_endpoint使用system_prompt和环境变量key(
     ):
         pytest.skip("未安装 Node.js 或 pi-ai npm 依赖")
 
-    expected = '{"decision":"ignore","wait_seconds":0}'
+    expected = '{"decision":"ignore","anchor_seq":null}'
     captured: dict[str, object] = {}
 
     async def handle(

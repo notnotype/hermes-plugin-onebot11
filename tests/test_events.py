@@ -24,6 +24,7 @@ def test_私聊消息事件():
     assert event.user_id == "123456789"
     assert event.user_name == "小明"
     assert event.message_id == "1001"
+    assert event.message_key == "dm:1001"
 
 
 def test_群聊消息事件():
@@ -43,6 +44,8 @@ def test_群聊消息事件():
     assert event.user_id == "123456789"
     # 群昵称(card)优先, 其次 nickname
     assert event.user_name == "群昵称"
+    assert event.message_id == "2002"
+    assert event.message_key == "group:2002"
 
 
 def test_raw_self_id不匹配时拒绝():
@@ -103,6 +106,32 @@ def test_图片进images():
     assert event.images == ["pic.jpg"]
 
 
+def test_图片同时有url和file时只选择url但保留诊断字段():
+    """同一个 image segment 不应因为两个字段而下载两次。"""
+    raw = {
+        "post_type": "message",
+        "message_type": "group",
+        "message_id": 2008,
+        "group_id": 88888888,
+        "user_id": 123456789,
+        "message": [
+            {
+                "type": "image",
+                "data": {
+                    "url": "https://cdn.example/image.png",
+                    "file": "file-id-1",
+                },
+            }
+        ],
+        "sender": {"nickname": "小明"},
+    }
+    event = build_inbound_event(raw, self_id="3101482118")
+    assert event is not None
+    assert event.images == ["https://cdn.example/image.png"]
+    assert event.image_urls == ["https://cdn.example/image.png"]
+    assert event.image_files == ["file-id-1"]
+
+
 def test_at自己标记():
     raw = {
         "post_type": "message",
@@ -139,7 +168,20 @@ def test_缺少message字段返回None():
     assert build_inbound_event(raw, self_id="3101482118") is None
 
 
-def test_缺少message_id时忽略时间戳生成稳定去重键():
+def test_非法message类型只丢弃当前事件():
+    """坏消息不能让 OneBot WS 处理链因 ValueError 断开。"""
+    raw = {
+        "post_type": "message",
+        "message_type": "group",
+        "message_id": 2007,
+        "group_id": 888,
+        "user_id": 123,
+        "message": {"type": "text", "data": {"text": "不是数组或 CQ"}},
+    }
+    assert build_inbound_event(raw, self_id="1") is None
+
+
+def test_缺少message_id时分离真实ID和稳定去重键():
     """同一重放事件的时间字段变化不能造成第二条队列消息。"""
     first = {
         "post_type": "message",
@@ -153,7 +195,10 @@ def test_缺少message_id时忽略时间戳生成稳定去重键():
     first_event = build_inbound_event(first, self_id="1")
     replay_event = build_inbound_event(replay, self_id="1")
     assert first_event is not None and replay_event is not None
-    assert first_event.message_id == replay_event.message_id
+    assert first_event.message_id == ""
+    assert replay_event.message_id == ""
+    assert first_event.message_key == replay_event.message_key
+    assert first_event.message_key.startswith("hash:")
 
 
 def test_保留CQ原文供队列最近原文使用():

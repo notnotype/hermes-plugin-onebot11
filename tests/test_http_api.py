@@ -215,6 +215,43 @@ async def test_非幂等发送失败不自动重试(fake_server):
         await api.close()
 
 
+async def test_action重定向不跟随也不把token转发到新地址():
+    """OneBot action 的 3xx 不能把写请求 body/token 转发到另一地址。"""
+    captured: list[dict] = []
+
+    async def redirect_handler(request: web.Request) -> web.Response:
+        """返回一个指向同服务另一端点的重定向。"""
+        return web.Response(status=302, headers={"Location": "/capture"})
+
+    async def capture_handler(request: web.Request) -> web.Response:
+        """如果客户端跟随重定向，这里会记录到意外请求。"""
+        captured.append({"auth": request.headers.get("Authorization", "")})
+        return web.json_response(
+            {"status": "ok", "retcode": 0, "data": {"message_id": 99}}
+        )
+
+    app = web.Application()
+    app.router.add_post("/send_group_msg", redirect_handler)
+    app.router.add_post("/capture", capture_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "127.0.0.1", 0)
+    await site.start()
+    api = OneBotHttpApi(
+        f"http://127.0.0.1:{runner.addresses[0][1]}",
+        token="secret",
+    )
+    try:
+        with pytest.raises(OneBotApiError) as exc_info:
+            await api.send_message("888", "不要跳转", chat_type="group")
+        assert exc_info.value.unknown_outcome
+        assert exc_info.value.status == "http_302_redirect"
+        assert captured == []
+    finally:
+        await api.close()
+        await runner.cleanup()
+
+
 async def test_retcode非零抛错():
     """HTTP 200 但 retcode != 0 时抛 OneBotApiError。"""
 
