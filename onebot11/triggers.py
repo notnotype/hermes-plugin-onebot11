@@ -139,6 +139,11 @@ class LayeredTriggerState:
                 self._leave_engaged()
             elif self.arbitration_count >= self.config.engaged_max_arbitrations:
                 return TriggerAction("none", reason="arbitration_limit")
+            elif self.config.question_enabled and is_question(text):
+                # 连续对话中的问句仍按 question 候选处理：本地词表能识别
+                # 不带问号的问句（如"你吃饭了吗"），避免低价模型在 engaged
+                # 提示词里漏判。
+                return self._schedule("question", revision, now, gap=gap)
             else:
                 return self._schedule("engaged", revision, now, gap=gap)
 
@@ -769,7 +774,8 @@ def build_llm_trigger_input(
     max_bytes = max(1, int(max_bytes))
     queued = tuple(messages)
     latest = queued[-1] if queued else None
-    question_rule = "最新消息含问号或疑问词（什么/怎么/为什么/几/多少/谁/哪/啥/吗/呢）必须 trigger；"
+    question_words = "、".join(QUESTION_WORDS)
+    question_rule = f"最新消息含问号或疑问词（{question_words}）必须 trigger；"
     if candidate_type == "engaged":
         rules = (
             question_rule,

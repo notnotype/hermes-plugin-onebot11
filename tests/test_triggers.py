@@ -499,9 +499,13 @@ def test_waiting短确认词和真实问句都进入selector():
     assert acknowledgement.candidate_type == "wait_followup"
     assert state.llm_calls == 0
 
+
+def test_engaged问句优先走question候选():
+    """活跃对话中的问句（含不带问号的）走 question 候选，不走 engaged 软判断。"""
     state = LayeredTriggerState(TriggerConfig(debounce_seconds=5))
     state.on_turn_complete(success=True, now=0)
-    question = state.observe_message(
+
+    action = state.observe_message(
         chat_type="group",
         text="可以吗？",
         mentioned_self=False,
@@ -509,9 +513,27 @@ def test_waiting短确认词和真实问句都进入selector():
         revision=1,
         now=1,
     )
-    assert question.kind == "schedule"
-    assert question.candidate_type == "engaged"
+    assert action.kind == "schedule"
+    assert action.candidate_type == "question"
     assert state.llm_calls == 0
+
+
+def test_engaged无问号问句识别():
+    """不带问号的问句（你吃饭了吗、你是不是爱吃饭）也能在活跃对话中触发。"""
+    for text in ("你吃饭了吗", "你是不是爱吃饭", "明天星期几"):
+        state = LayeredTriggerState(TriggerConfig(debounce_seconds=5))
+        state.on_turn_complete(success=True, now=0)
+        action = state.observe_message(
+            chat_type="group",
+            text=text,
+            mentioned_self=False,
+            has_context=True,
+            revision=1,
+            now=1,
+        )
+        assert action.kind == "schedule", text
+        assert action.candidate_type == "question", text
+        assert state.llm_calls == 0, text
 
 
 def test_idle短确认词不直接唤醒():
