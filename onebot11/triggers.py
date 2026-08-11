@@ -769,14 +769,16 @@ def build_llm_trigger_input(
     max_bytes = max(1, int(max_bytes))
     queued = tuple(messages)
     latest = queued[-1] if queued else None
+    question_rule = "最新消息含问号或疑问词（什么/怎么/为什么/几/多少/谁/哪/啥/吗/呢）必须 trigger；"
     if candidate_type == "engaged":
         rules = (
-            "只有群成员明确向机器人提问、请求帮助或明显延续与机器人的对话才 trigger；",
+            question_rule,
+            "其余消息只有明确向机器人提问、请求帮助或明显延续与机器人的对话才 trigger；",
             "群成员之间的互动、评论、调侃、@其他人、陈述句和纯图片消息默认 ignore。",
         )
     else:
         rules = (
-            "最新消息含问号或疑问词（什么/怎么/为什么/几/多少/谁/哪/啥/吗/呢）必须 trigger；",
+            question_rule,
             "明显与当前对话无关的闲聊才 ignore。",
         )
     contract = "\n".join(
@@ -784,6 +786,7 @@ def build_llm_trigger_input(
             f"判断当前 OneBot11 群消息是否需要回复；候选类型：{candidate_type}。",
             "规则：" + rules[0],
             rules[1],
+            *(rules[2:]),
             "只输出严格 JSON；trigger 只能选择当前队列中真实的 seq 作为 authority。",
             '{"decision":"trigger","anchor_seq":123}',
             '{"decision":"wait","anchor_seq":null}',

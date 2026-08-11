@@ -796,7 +796,7 @@ def test_selector提示词包含问句触发规则():
 
 
 def test_selector_engaged提示词默认ignore成员互动():
-    """engaged 候选必须明确要求只对机器人提问/延续对话才 trigger。"""
+    """engaged 候选必须包含问句硬规则，同时默认 ignore 成员互动。"""
     prompt = build_llm_trigger_input(
         "",
         (
@@ -814,7 +814,8 @@ def test_selector_engaged提示词默认ignore成员互动():
         candidate_type="engaged",
     )
     assert "候选类型：engaged" in prompt
-    assert "明确向机器人提问" in prompt
+    assert "必须 trigger" in prompt
+    assert "延续与机器人的对话" in prompt
     assert "默认 ignore" in prompt
 
 
