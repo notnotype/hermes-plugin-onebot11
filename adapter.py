@@ -521,6 +521,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._media_delivery_scopes: dict[str, MediaDeliveryScope] = {}
         self._control_plane_sent_scopes: set[str] = set()
         self._long_running_notice_tasks: dict[str, asyncio.Task[None]] = {}
+        self._long_running_notice_events: dict[str, Any] = {}
         self._outbound_gate = asyncio.Lock()
         self._aux_event_count = 0
         self._adapter_epoch = 0
@@ -803,6 +804,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._media_delivery_scopes.clear()
         self._control_plane_sent_scopes.clear()
         self._long_running_notice_tasks.clear()
+        self._long_running_notice_events.clear()
         self._bindings.clear()
 
     def _policy_config_signature(self) -> tuple[object, ...] | None:
@@ -1929,7 +1931,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         return f"{scope}:control:{kind}"
 
     def _schedule_long_running_notice(self, event: Any, lease_id: str) -> None:
-        """为一个活动群 turn 安排一次性长时间处理提示。"""
+        """为一个活动群 turn 安排一次性长时间处理提示（保存 event 供重置复用）。"""
         delay = float(self.policy_snapshot.long_running_notice_seconds)
         normalized_lease_id = str(lease_id or "").strip()
         if self._closed or delay <= 0 or not normalized_lease_id:
@@ -1938,6 +1940,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         if current is not None and not current.done():
             return
         try:
+            self._long_running_notice_events[normalized_lease_id] = event
             task = asyncio.create_task(
                 self._send_long_running_notice_after_delay(
                     event,
@@ -1949,6 +1952,24 @@ class OneBot11Adapter(BasePlatformAdapter):
             logger.debug("OneBot11 无法创建长时间处理提示 task", exc_info=True)
             return
         self._long_running_notice_tasks[normalized_lease_id] = task
+
+    def _reset_long_running_notice(self, chat_id: str) -> None:
+        """中间正文成功发送后重置当前活动 turn 的长时间处理计时器。"""
+        normalized = str(chat_id or "").strip()
+        if self._closed or not normalized:
+            return
+        active = self._dispatcher.active(normalized)
+        if active is None:
+            return
+        lease_id = str(active.lease.lease_id or "").strip()
+        if not lease_id:
+            return
+        current = self._long_running_notice_tasks.pop(lease_id, None)
+        if current is not None and not current.done():
+            current.cancel()
+        event = self._long_running_notice_events.get(lease_id)
+        if event is not None:
+            self._schedule_long_running_notice(event, lease_id)
 
     async def _send_long_running_notice_after_delay(
         self,
@@ -2051,7 +2072,9 @@ class OneBot11Adapter(BasePlatformAdapter):
 
     async def _cancel_long_running_notice(self, lease_id: str) -> None:
         """取消一个 turn 的一次性长时间提示。"""
-        task = self._long_running_notice_tasks.pop(str(lease_id), None)
+        normalized = str(lease_id)
+        self._long_running_notice_events.pop(normalized, None)
+        task = self._long_running_notice_tasks.pop(normalized, None)
         if task is None or task is asyncio.current_task():
             return
         task.cancel()
@@ -2061,6 +2084,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         """取消所有尚未发送的长时间处理提示。"""
         tasks = list(self._long_running_notice_tasks.values())
         self._long_running_notice_tasks.clear()
+        self._long_running_notice_events.clear()
         for task in tasks:
             task.cancel()
         if tasks:
@@ -5333,6 +5357,14 @@ class OneBot11Adapter(BasePlatformAdapter):
                     if sent_id:
                         self._last_bot_message_ids[target.chat_id] = str(sent_id)
                     sent.append(sent_id)
+                    if (
+                        not _FINAL_DELIVERY.get()
+                        and target.chat_type == "group"
+                    ):
+                        # 中间正文是"bot 仍在活动"的最直接证据：成功发出一条
+                        # interim 后重置长时间处理计时器，避免 bot 一直有输出
+                        # 却仍触发"仍在处理中"的冗余提示。
+                        self._reset_long_running_notice(target.chat_id)
                 except OneBotApiError as exc:
                     if lease_id:
                         if exc.unknown_outcome or sent:

@@ -4340,6 +4340,59 @@ async def test_长时间运行提示只发送一次且不污染业务marker(
         await adapter.disconnect()
 
 
+async def test_中间正文发送后重置长时间提示计时器(monkeypatch, fake_http_server):
+    """interim 成功发送后必须重置 60s 提示计时器，不能照旧触发冗余提示。"""
+    base, calls = fake_http_server
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API=base,
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_LONG_RUNNING_NOTICE_SECONDS="3600",
+    )
+    adapter.show_interim_group = True
+    await adapter.connect()
+    adapter._chat_types["888"] = "group"
+    adapter._targets["888"] = adapter_module.ChatTarget("group", "888")
+    # 模拟当前活动 turn：interim 发送时按 chat_id 找到 lease 才能重置。
+    active_turn = SimpleNamespace(
+        lease=SimpleNamespace(lease_id="interim-reset-lease"),
+    )
+    adapter._dispatcher._active["888"] = active_turn
+    event = SimpleNamespace(
+        metadata={
+            "onebot11_lease_id": "interim-reset-lease",
+            "onebot11_target": {"chat_type": "group", "chat_id": "888"},
+            "onebot11_anchor_message_id": "1001",
+        }
+    )
+    try:
+        adapter._schedule_long_running_notice(event, "interim-reset-lease")
+        first_task = adapter._long_running_notice_tasks["interim-reset-lease"]
+        assert not first_task.done()
+
+        result = await adapter.send("888", "正在生成图片，请稍候…")
+        assert result.success
+        second_task = adapter._long_running_notice_tasks["interim-reset-lease"]
+        assert second_task is not first_task
+        await asyncio.sleep(0)
+        assert first_task.done()
+        assert not second_task.done()
+        # 中途正文发出去后，3600s 内不应出现"仍在处理中"提示。
+        await asyncio.sleep(0.05)
+        assert not second_task.done()
+        sent_texts = [
+            segment.get("data", {}).get("text", "")
+            for call in calls
+            for segment in call["params"].get("message", [])
+            if segment.get("type") == "text"
+        ]
+        assert "仍在处理中，请稍候…" not in sent_texts
+    finally:
+        adapter._dispatcher._active.pop("888", None)
+        adapter._bindings.clear()
+        await adapter.disconnect()
+
+
 async def test_权限hook审计失败仍然fail_closed(monkeypatch):
     """审计旁路异常不能让 pre_tool_call 失去阻断能力。"""
     adapter = _make_adapter(
