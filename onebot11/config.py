@@ -237,7 +237,7 @@ def effective_extra(
     return result
 
 
-def _roles_file_path(
+def roles_file_path(
     extra: Mapping[str, Any],
     env: Mapping[str, Any],
 ) -> Path:
@@ -295,7 +295,7 @@ def apply_roles_overrides(
 ) -> dict[str, Any]:
     """把独立 roles 文件合并进 extra；文件存在时作为该键的事实来源。"""
     env = os.environ if environ is None else environ
-    overrides = _load_roles_overrides(_roles_file_path(extra, env))
+    overrides = _load_roles_overrides(roles_file_path(extra, env))
     if not overrides:
         return dict(extra)
     merged = dict(extra)

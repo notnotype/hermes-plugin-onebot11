@@ -156,6 +156,36 @@ def test_普通用户无权调用Hermes通用工具():
     assert validate_tool_call("terminal", {}, ctx) is not None
 
 
+def test_trusted_user显式配置的通用工具放行():
+    """trusted_user 通过 roles 显式配置 image_generate 后应放行。"""
+    ctx = CallerContext(
+        user_id="1259901822",
+        chat_type="group",
+        chat_id="1072992996",
+        role="trusted_user",
+        allowed_tools=frozenset({"qq_get_message", "image_generate"}),
+        self_id="3101482118",
+    )
+    assert validate_tool_call("image_generate", {}, ctx) is None
+    # 未显式配置的通用工具仍拒绝。
+    assert validate_tool_call("terminal", {}, ctx) is not None
+    # OneBot 只读工具按配置放行。
+    assert validate_tool_call("qq_get_message", {}, ctx) is None
+
+
+def test_trusted_user未配置image_generate时拒绝():
+    """roles 没给 trusted_user 配 image_generate 时必须 fail-closed。"""
+    ctx = CallerContext(
+        user_id="1336488699",
+        chat_type="group",
+        chat_id="1072992996",
+        role="trusted_user",
+        allowed_tools=frozenset({"qq_get_message"}),
+        self_id="3101482118",
+    )
+    assert validate_tool_call("image_generate", {}, ctx) is not None
+
+
 def test_role_prompt展示完整角色工具目录并强调锚点授权():
     """模型可以了解各角色能力，但不能把目录当作实际授权来源。"""
     context = CallerContext(

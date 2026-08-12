@@ -108,6 +108,7 @@ parse_runtime_config = _proto.config.parse_runtime_config
 RuntimePolicySnapshot = _proto.config.RuntimePolicySnapshot
 build_policy_snapshot = _proto.config.build_policy_snapshot
 runtime_static_fingerprint = _proto.config.runtime_static_fingerprint
+roles_file_path = _proto.config.roles_file_path
 FormattedText = _proto.formatting.FormattedText
 
 logger = logging.getLogger(__name__)
@@ -807,7 +808,6 @@ class OneBot11Adapter(BasePlatformAdapter):
     def _policy_config_signature(self) -> tuple[object, ...] | None:
         """读取 Hermes config.yaml 与独立 roles 文件的轻量签名。"""
         config_path = self._hermes_home / "config.yaml"
-        roles_path = self._hermes_home / "onebot11" / "roles.yaml"
         try:
             config_stat = config_path.stat()
         except OSError:
@@ -817,6 +817,7 @@ class OneBot11Adapter(BasePlatformAdapter):
             int(config_stat.st_mtime_ns),
             int(config_stat.st_size),
         )
+        roles_path = roles_file_path(self._runtime_config.extra, os.environ)
         try:
             roles_stat = roles_path.stat()
             signature = signature + (
@@ -7065,6 +7066,14 @@ def check_requirements() -> bool:
     """只检查插件运行依赖；部署配置由 validate_config 读取 YAML 或环境变量。"""
     try:
         import aiohttp  # noqa: F401
+    except ImportError:
+        return False
+    # 独立 roles 文件存在时还需要 PyYAML；roles 文件是可选的，缺失时
+    # 不强制要求 yaml，避免没有角色文件的部署被额外依赖卡住。
+    try:
+        roles_path = roles_file_path({}, os.environ)
+        if roles_path.expanduser().resolve().is_file():
+            import yaml  # noqa: F401
     except ImportError:
         return False
     return True

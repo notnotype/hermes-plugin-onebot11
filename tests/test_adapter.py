@@ -179,6 +179,37 @@ async def test_policy_reload原子替换权限并清理旧确认令牌(monkeypat
     await adapter.disconnect()
 
 
+async def test_自定义roles路径纳入配置签名(monkeypatch, tmp_path):
+    """roles_file 使用自定义路径时，签名必须监视该文件而不是默认位置。"""
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text("gateway: {}\n", encoding="utf-8")
+    roles_path = tmp_path / "custom-roles.yaml"
+    roles_path.write_text(
+        "super_admins: ['1']\nroles: {}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("ONEBOT11_ROLES_FILE", str(roles_path))
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    try:
+        first = adapter._policy_config_signature()
+        assert first is not None
+        roles_path.write_text(
+            "super_admins: ['2']\nroles: {}\n",
+            encoding="utf-8",
+        )
+        second = adapter._policy_config_signature()
+        assert second is not None
+        assert second != first
+    finally:
+        await adapter.disconnect()
+
+
 async def test_policy_reload拒绝静态连接配置变化(monkeypatch):
     """HTTP/队列等静态字段变化必须明确要求重启。"""
     adapter = _make_adapter(
@@ -5799,6 +5830,34 @@ async def test_adapter关闭后确认执行fail_closed(monkeypatch):
 def test_check_requirements(monkeypatch):
     """依赖检查不读取部署配置；配置合同由 validate_config 负责。"""
     assert check_requirements()
+
+
+def test_check_requirements_roles文件存在时要求PyYAML(monkeypatch, tmp_path):
+    """独立 roles 文件存在但缺 PyYAML 时依赖检查必须失败。"""
+    import sys
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    (hermes_home / "onebot11").mkdir()
+    (hermes_home / "onebot11" / "roles.yaml").write_text(
+        "super_admins: ['1']\nroles: {}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    # 模拟 PyYAML 未安装：把 yaml 从 sys.modules 移除，import 会抛 ImportError。
+    monkeypatch.setitem(sys.modules, "yaml", None)
+    assert check_requirements() is False
+
+
+def test_check_requirements_无roles文件时不强制PyYAML(monkeypatch, tmp_path):
+    """roles 文件缺失时，PyYAML 不可用不应阻止基础依赖通过。"""
+    import sys
+
+    hermes_home = tmp_path / "hermes-empty-home"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setitem(sys.modules, "yaml", None)
+    assert check_requirements() is True
 
 
 def test_validate_config支持YAML配置且拒绝非法HTTP地址(monkeypatch):
