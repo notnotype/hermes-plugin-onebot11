@@ -58,6 +58,82 @@ def test未知策略和错误YAML列表fail_closed():
         parse_runtime_config(_extra(roles={"user": {"tools": {"bad": "shape"}}}))
 
 
+def test_roles文件覆盖配置角色(tmp_path, monkeypatch):
+    """独立 roles 文件存在时作为 super_admins/roles 的事实来源。"""
+    roles_path = tmp_path / "roles.yaml"
+    roles_path.write_text(
+        "\n".join(
+            (
+                "super_admins: ['2056963663']",
+                "roles:",
+                "  trusted_user:",
+                "    users: ['1259901822', '1336488699']",
+                "    tools: [qq_get_message, image_generate]",
+                "  user:",
+                "    tools: [qq_get_message]",
+                "  super_admin:",
+                "    tools: [qq_get_message, qq_delete_message]",
+            )
+        ),
+        encoding="utf-8",
+    )
+    env = {"ONEBOT11_ROLES_FILE": str(roles_path)}
+    runtime = parse_runtime_config(
+        _extra(
+            super_admins=["old-admin"],
+            roles={
+                "trusted_user": {"users": ["111"], "tools": ["qq_get_message"]},
+                "user": {"tools": []},
+                "super_admin": {"tools": []},
+            },
+        ),
+        env,
+    )
+    assert runtime.super_admins == frozenset({"2056963663"})
+    assert runtime.trusted_users == frozenset({"1259901822", "1336488699"})
+    assert "image_generate" in runtime.role_tools["trusted_user"]
+    assert runtime.role_tools["user"] == frozenset({"qq_get_message"})
+    assert "qq_delete_message" in runtime.role_tools["super_admin"]
+
+
+def test_roles文件缺失时回退配置角色(tmp_path, monkeypatch):
+    """没有独立 roles 文件时保持 config.yaml 的角色配置。"""
+    env = {"ONEBOT11_ROLES_FILE": str(tmp_path / "missing.yaml")}
+    runtime = parse_runtime_config(
+        _extra(
+            super_admins=["2056963663"],
+            roles={"user": {"tools": ["qq_get_message"]}},
+        ),
+        env,
+    )
+    assert runtime.super_admins == frozenset({"2056963663"})
+    assert runtime.role_tools["user"] == frozenset({"qq_get_message"})
+
+
+def test_roles文件非法结构和未知键fail_closed(tmp_path):
+    """roles 文件不是 YAML mapping 或包含未知键时拒绝启动。"""
+    bad_yaml = tmp_path / "bad.yaml"
+    bad_yaml.write_text("{unclosed", encoding="utf-8")
+    with pytest.raises(ValueError):
+        parse_runtime_config(_extra(), {"ONEBOT11_ROLES_FILE": str(bad_yaml)})
+
+    not_mapping = tmp_path / "list.yaml"
+    not_mapping.write_text("- a\n- b\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        parse_runtime_config(
+            _extra(),
+            {"ONEBOT11_ROLES_FILE": str(not_mapping)},
+        )
+
+    unknown_key = tmp_path / "unknown.yaml"
+    unknown_key.write_text("roles: {}\nsecret: 1\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        parse_runtime_config(
+            _extra(),
+            {"ONEBOT11_ROLES_FILE": str(unknown_key)},
+        )
+
+
 def test超级管理员返回统一解析结果并拒绝mapping():
     """adapter 与 validate_config 必须共享同一份严格管理员配置。"""
     runtime = parse_runtime_config(_extra(super_admins=["2056963663"]))

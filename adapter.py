@@ -443,7 +443,7 @@ class OneBot11Adapter(BasePlatformAdapter):
 
         self._hermes_home = _resolve_hermes_home()
         self._policy_source_signature = self._policy_config_signature()
-        self._policy_failed_signature: tuple[str, int, int] | None = None
+        self._policy_failed_signature: tuple[object, ...] | None = None
         queue_path = runtime.queue_db_path
         if not queue_path:
             queue_path = str(self._hermes_home / "onebot11" / "queue.sqlite3")
@@ -804,14 +804,29 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._long_running_notice_tasks.clear()
         self._bindings.clear()
 
-    def _policy_config_signature(self) -> tuple[str, int, int] | None:
-        """读取 Hermes config.yaml 的轻量签名，供入站前自动检查。"""
-        path = self._hermes_home / "config.yaml"
+    def _policy_config_signature(self) -> tuple[object, ...] | None:
+        """读取 Hermes config.yaml 与独立 roles 文件的轻量签名。"""
+        config_path = self._hermes_home / "config.yaml"
+        roles_path = self._hermes_home / "onebot11" / "roles.yaml"
         try:
-            stat = path.stat()
+            config_stat = config_path.stat()
         except OSError:
             return None
-        return str(path), int(stat.st_mtime_ns), int(stat.st_size)
+        signature = (
+            str(config_path),
+            int(config_stat.st_mtime_ns),
+            int(config_stat.st_size),
+        )
+        try:
+            roles_stat = roles_path.stat()
+            signature = signature + (
+                str(roles_path),
+                int(roles_stat.st_mtime_ns),
+                int(roles_stat.st_size),
+            )
+        except OSError:
+            pass
+        return signature
 
     def _load_reload_extra(self) -> dict[str, Any]:
         """通过 Hermes loader 读取当前配置，失败时回退到初始 extra。"""

@@ -237,6 +237,74 @@ def effective_extra(
     return result
 
 
+def _roles_file_path(
+    extra: Mapping[str, Any],
+    env: Mapping[str, Any],
+) -> Path:
+    """解析独立 roles 文件路径；未配置时使用 Hermes home 默认位置。"""
+    raw = extra.get("roles_file")
+    if raw is None:
+        raw = env.get("ONEBOT11_ROLES_FILE")
+    if raw is not None:
+        raw_text = str(raw).strip()
+        if raw_text:
+            return Path(raw_text).expanduser()
+    configured_home = str(env.get("HERMES_HOME") or "").strip()
+    if configured_home:
+        base = Path(configured_home).expanduser()
+    elif os.name == "nt":
+        local_appdata = str(env.get("LOCALAPPDATA") or "").strip()
+        base = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
+        base = base / "hermes"
+    else:
+        base = Path.home() / ".hermes"
+    return base / "onebot11" / "roles.yaml"
+
+
+def _load_roles_overrides(path: Path) -> dict[str, Any]:
+    """读取独立 roles 文件；文件不存在返回空 dict，非法结构直接抛错。"""
+    resolved = path.expanduser().resolve()
+    if not resolved.is_file():
+        return {}
+    try:
+        import yaml  # noqa: PLC0415
+    except ImportError as exc:
+        raise ValueError(
+            "读取 OneBot roles 文件需要 PyYAML，请安装后重试"
+        ) from exc
+    try:
+        raw = yaml.safe_load(resolved.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"OneBot roles 文件解析失败: {resolved}") from exc
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise ValueError("OneBot roles 文件必须是 YAML mapping")
+    allowed_keys = {"roles", "super_admins", "admins"}
+    unknown = set(raw) - allowed_keys
+    if unknown:
+        raise ValueError(
+            "OneBot roles 文件包含未知键: " + ", ".join(sorted(unknown))
+        )
+    return dict(raw)
+
+
+def apply_roles_overrides(
+    extra: Mapping[str, Any],
+    environ: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """把独立 roles 文件合并进 extra；文件存在时作为该键的事实来源。"""
+    env = os.environ if environ is None else environ
+    overrides = _load_roles_overrides(_roles_file_path(extra, env))
+    if not overrides:
+        return dict(extra)
+    merged = dict(extra)
+    for key in ("roles", "super_admins", "admins"):
+        if key in overrides:
+            merged[key] = overrides[key]
+    return merged
+
+
 def _string(value: Any, *, name: str, default: str = "") -> str:
     """解析非空或可为空的字符串配置。"""
     if value is None:
@@ -353,6 +421,9 @@ def parse_runtime_config(
     """解析完整运行时配置；``require_http_api`` 仅用于平台启用校验。"""
     env = os.environ if environ is None else environ
     effective = effective_extra(extra, env)
+    # 独立 roles 文件存在时作为 super_admins/roles 的事实来源，优先于
+    # config.yaml 和环境变量，避免安全敏感配置被代理工具直接改写。
+    effective = apply_roles_overrides(effective, env)
     http_api = _string(effective.get("http_api"), name="http_api")
     if http_api:
         parse_http_base_url(http_api)
