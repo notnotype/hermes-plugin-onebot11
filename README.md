@@ -172,6 +172,32 @@ platforms:
 `queue_recovery_poll_seconds` 只负责发现已过期 lease，不会抢占仍有效的 lease。正常主动断开时，
 未开始出站的 lease 回到 pending 且不消耗失败预算；只有过期的明确 `agent_running` lease
 才按最多 3 次的 2/4/8 秒退避恢复，达到上限进入 `failed`。出站已开始、阶段未知或租约阶段缺失进入 `uncertain`。
+
+#### 独立 roles 文件（可选）
+
+`roles`、`super_admins` 默认从 `platforms.onebot11.extra` 读取；如果 Hermes 对
+`~/.hermes/config.yaml` 有写保护（代理工具无法修改），可以把角色配置放到独立文件：
+
+```yaml
+# ~/.hermes/onebot11/roles.yaml（默认路径；也可用 ONEBOT11_ROLES_FILE 或
+# platforms.onebot11.extra.roles_file 指定其它路径）
+super_admins:
+- '2056963663'
+roles:
+  trusted_user:
+    users:
+    - '1259901822'
+    - '1336488699'
+    tools:
+    - qq_get_message
+    - qq_get_group_msg_history
+    - image_generate
+```
+
+文件存在时，其 `roles` / `super_admins` / `admins` 整体覆盖 config.yaml 中的同名键，
+启动、`validate_config` 和 `/onebot reload` 都使用同一解析路径；文件不存在则回退到
+config.yaml，行为不变。文件必须是合法 YAML mapping，未知键会直接拒绝启动（fail-closed）。
+
 LLM trigger 默认关闭，启用时必须同时配置明确的 `provider`、`model` 和群 allowlist；每群最多一个判断任务，使用 5 秒 debounce 和全局并发上限。判断由插件自有 Node helper 通过固定版本 `@earendil-works/pi-ai` 发起，不经过 Hermes auxiliary，不回退 Hermes 主 Agent，也不主动切换 provider。`api_key_env` 只保存环境变量名，密钥值不会进入 YAML、命令行、日志或 SQLite。Node、依赖缺失、超时、非法 JSON 或模型失败都按不触发处理，消息继续留在 pending。
 旁路模型只接受 `{"decision":"trigger","anchor_seq":123}`、`{"decision":"wait","anchor_seq":null}` 或 `{"decision":"ignore","anchor_seq":null}`；`trigger` 必须选择真实 pending 消息的 seq，权限完全继承该消息。非法结果、超时或模型失败按不触发处理，并按持久化退避等待后续判断。
 
