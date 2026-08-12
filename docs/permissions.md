@@ -106,6 +106,21 @@ snapshot。新消息、新 anchor 和恢复任务使用新策略；active turn �
 authority 和工具快照，但每次工具/出站仍重新检查当前白名单。成功 reload 会使旧
 confirmation token 失效。
 
+## 权限修改 SOP 与写保护
+
+权限的唯一事实来源是独立文件 `~/.hermes/onebot11/roles.yaml`（存在时覆盖
+config.yaml 的 `roles`/`super_admins`/`admins`）。修改流程固定为：
+
+1. 站长手动编辑 `roles.yaml`（代理不直接改文件）；
+2. 群内发送 `/onebot reload` 生效；
+3. 站长明确授权时，代理可以先展示 diff，但仍由站长落地。
+
+Hermes 的 file 工具对 `~/.hermes/config.yaml` 有写保护；OneBot 侧在
+`pre_tool_call` 对 `terminal` 命令再做一层兜底：检测到写意图
+（重定向/tee、sed/perl -i、python 写文件、mv/cp/rm、编辑器）指向
+`config.yaml`、`roles.yaml`、`.env`、`auth.json`、`auth.lock` 时直接拒绝，
+防止代理用 shell 绕过文件写保护。纯读取（cat/grep）不受影响。
+
 ## 身份传递
 
 每次入站 turn 都创建不可变 `CallerContext`。Hermes 的 `session_key` 只用于 session 路由，不能当作身份；工具身份按完整 `(session_id, turn_id)` 绑定。handler 或 hook 只收到其中一个坐标时，不得使用 ContextVar 猜测缺失的另一个坐标，必须 fail-closed。

@@ -4426,6 +4426,54 @@ async def test_权限hook审计失败仍然fail_closed(monkeypatch):
         await adapter.disconnect()
 
 
+async def test_权限hook拦截terminal写敏感配置(monkeypatch):
+    """super_admin 在群里也不能通过 terminal 写 Hermes 安全敏感配置。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    caller = adapter._caller_for_event(
+        SimpleNamespace(user_id="2056963663", chat_type="group", chat_id="888")
+    )
+    # 测试环境没有部署配置，显式声明超管，验证"超管也不能写敏感配置"。
+    monkeypatch.setattr(adapter, "super_admins", frozenset({"2056963663"}))
+    caller = adapter._caller_for_event(
+        SimpleNamespace(user_id="2056963663", chat_type="group", chat_id="888")
+    )
+    adapter._bindings.bind(
+        adapter_module.TurnBinding(
+            "session-term",
+            "turn-term",
+            caller,
+            "lease-term",
+        )
+    )
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    monkeypatch.setattr(adapter, "_lease_is_current", lambda _lease_id: True)
+    try:
+        blocked = adapter_module._pre_tool_call_hook(
+            tool_name="terminal",
+            session_id="session-term",
+            turn_id="turn-term",
+            args={"command": "sed -i 's/a/b/' ~/.hermes/config.yaml"},
+        )
+        assert blocked is not None
+        assert blocked["action"] == "block"
+        assert "安全敏感配置" in blocked["message"]
+
+        allowed = adapter_module._pre_tool_call_hook(
+            tool_name="terminal",
+            session_id="session-term",
+            turn_id="turn-term",
+            args={"command": "cat ~/.hermes/config.yaml"},
+        )
+        assert allowed is None
+    finally:
+        adapter._bindings.clear()
+        await adapter.disconnect()
+
+
 async def test_send_multiple_images同一turn相同路径只访问一次(monkeypatch):
     """Hermes 同轮重复提取同一文件时 OneBot 只收到一次图片请求。"""
     adapter = _make_adapter(

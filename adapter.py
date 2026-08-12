@@ -80,6 +80,7 @@ role_for_user = _proto.permissions.role_for_user
 access_allowed = _proto.permissions.access_allowed
 role_prompt = _proto.permissions.role_prompt
 validate_tool_call = _proto.permissions.validate_tool_call
+terminal_writes_sensitive_config = _proto.permissions.terminal_writes_sensitive_config
 handle_get_friend_msg_history = _proto.tools.handle_get_friend_msg_history
 handle_get_group_info = _proto.tools.handle_get_group_info
 handle_get_group_member_info = _proto.tools.handle_get_group_member_info
@@ -7012,6 +7013,28 @@ def _pre_tool_call_hook(
                 "action": "block",
                 "message": "OneBot11 ContextVar caller 与显式 turn binding 冲突",
             }
+        # Hermes 的 file 工具对 config.yaml 有写保护，但 terminal 可以绕过；
+        # 这里对 OneBot turn 的 terminal 命令做统一兜底，禁止写安全敏感配置。
+        if normalized_tool_name == "terminal":
+            raw_command = (args or {}).get("command")
+            if isinstance(raw_command, str):
+                config_error = terminal_writes_sensitive_config(raw_command)
+                if config_error:
+                    _safe_audit(
+                        adapter,
+                        "permission_denied",
+                        {
+                            "tool": normalized_tool_name,
+                            "user_id": binding.caller.user_id,
+                            "chat_type": binding.caller.chat_type,
+                            "chat_id": binding.caller.chat_id,
+                            "reason": config_error,
+                        },
+                    )
+                    return {
+                        "action": "block",
+                        "message": f"权限错误: {config_error}",
+                    }
         if (
             binding.caller.adapter_epoch is not None
             and binding.caller.adapter_epoch != adapter._adapter_epoch

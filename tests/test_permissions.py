@@ -14,6 +14,7 @@ from onebot11.permissions import (
     parse_admin_list,
     role_for_user,
     role_prompt,
+    terminal_writes_sensitive_config,
     validate_message_scope,
     validate_tool_call,
 )
@@ -184,6 +185,27 @@ def test_trusted_user未配置image_generate时拒绝():
         self_id="3101482118",
     )
     assert validate_tool_call("image_generate", {}, ctx) is not None
+
+
+def test_terminal写敏感配置被拦截():
+    """terminal 写 config.yaml/roles.yaml/.env 等必须被 OneBot 侧拒绝。"""
+    assert terminal_writes_sensitive_config("sed -i 's/a/b/' ~/.hermes/config.yaml") is not None
+    assert terminal_writes_sensitive_config("echo x > ~/.hermes/onebot11/roles.yaml") is not None
+    assert terminal_writes_sensitive_config("python3 -c \"open('/home/u/.hermes/.env','w').write('x')\"") is not None
+    assert terminal_writes_sensitive_config("tee -a ~/.hermes/config.yaml") is not None
+    assert terminal_writes_sensitive_config("mv /tmp/new ~/.hermes/auth.json") is not None
+    assert terminal_writes_sensitive_config("rm ~/.hermes/auth.lock") is not None
+    assert terminal_writes_sensitive_config("vim ~/.hermes/config.yaml") is not None
+
+
+def test_terminal读取配置不拦截():
+    """纯读取（cat/grep）和无关写操作不拦截，避免误伤诊断。"""
+    assert terminal_writes_sensitive_config("cat ~/.hermes/config.yaml") is None
+    assert terminal_writes_sensitive_config("grep -n roles ~/.hermes/config.yaml") is None
+    assert terminal_writes_sensitive_config("ls ~/.hermes") is None
+    assert terminal_writes_sensitive_config("touch /tmp/hello.txt") is None
+    assert terminal_writes_sensitive_config("cp ~/.hermes/config.yaml /tmp/config.yaml.bak") is None
+    assert terminal_writes_sensitive_config("echo hello") is None
 
 
 def test_role_prompt展示完整角色工具目录并强调锚点授权():

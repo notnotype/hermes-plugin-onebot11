@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import re
 import threading
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -23,6 +24,42 @@ READ_ONLY_TOOLS = frozenset(
 )
 ROLE_NAMES = ("user", "trusted_user", "super_admin")
 FORBIDDEN_TOOL_NAMES = frozenset({"delegate_task", "tool_search"})
+
+# Hermes 安全敏感配置文件：代理不得通过任何工具写入这些文件。
+# 与 Hermes file 工具写保护保持一致，并额外覆盖 terminal 绕过路径。
+SENSITIVE_CONFIG_NAMES = (
+    "config.yaml",
+    "roles.yaml",
+    ".env",
+    "auth.json",
+    "auth.lock",
+)
+
+# 写意图正则：命中"敏感文件 + 写操作"组合时才拦截，纯读取（cat/grep/read_file）
+# 不受影响。覆盖 shell 重定向、tee、sed/perl -i、python 写文件、mv/cp/rm 和编辑器。
+# 文件名前允许任意目录前缀（含 ~/.hermes、/home/<user>/.hermes、onebot11/ 等），
+# 并加边界避免误伤 .env.example / config.yaml.bak 之类的副本。
+_SENSITIVE_FILE_RE = (
+    r"(?:^|[\s\"'=/>~])(?:[^\s\"']*/)?"
+    r"(?:config\.yaml|roles\.yaml|\.env|auth\.json|auth\.lock)"
+    r"(?=$|[\s\"';|&])"
+)
+_CONFIG_WRITE_PATTERNS = (
+    # 重定向/tee 直接写敏感文件
+    re.compile(r"[>]+\s*" + _SENSITIVE_FILE_RE),
+    re.compile(r"\btee\b(?:\s+-[a-zA-Z]+)*\s+" + _SENSITIVE_FILE_RE),
+    # sed/perl 原地编辑
+    re.compile(r"\b(?:sed|perl)\s+-i\b.*" + _SENSITIVE_FILE_RE),
+    # python 写文件
+    re.compile(r"\b(?:python3?|pypy3?)\b.*\bopen\([^)]*" + _SENSITIVE_FILE_RE + r"[^)]*['\"]w"),
+    re.compile(r"\bwrite_(?:text|bytes)\([^)]*" + _SENSITIVE_FILE_RE),
+    # mv/cp 目标为敏感文件：只匹配命令尾部目标参数，避免误伤源路径。
+    re.compile(r"\b(?:mv|cp)\b.*\s" + _SENSITIVE_FILE_RE + r"(?:\s*$|\s*(?:;|&&|\|))"),
+    # rm 删除敏感文件
+    re.compile(r"\brm\b(?:\s+-[a-zA-Z]+)*\s+" + _SENSITIVE_FILE_RE),
+    # 交互式编辑器打开敏感文件（代理无理由用编辑器）
+    re.compile(r"\b(?:vi|vim|nano)\b\s+" + _SENSITIVE_FILE_RE),
+)
 WRITE_TOOLS = frozenset(
     {
         "qq_delete_message",
@@ -434,6 +471,26 @@ def role_prompt(
         "但不能使用 OneBot 群管理写工具，也不能修改权限、白名单或角色配置。\n"
         "- 所有 QQ 查询只能作用于当前目标；管理写操作必须先通过 /onebot confirm 完成。"
     )
+
+
+def terminal_writes_sensitive_config(command: str) -> str | None:
+    """检测 terminal 命令是否试图写入 Hermes 安全敏感配置，返回错误文本。
+
+    只拦截"写意图 + 敏感文件"组合：重定向、tee、sed/perl -i、python 写文件、
+    mv/cp/rm 和编辑器。纯读取（cat config.yaml、grep、read_file）不拦截。
+    Hermes 的 file 工具写保护不覆盖 terminal，这里是 OneBot 侧的统一兜底。
+    """
+    normalized = str(command or "").strip()
+    if not normalized:
+        return None
+    for pattern in _CONFIG_WRITE_PATTERNS:
+        if pattern.search(normalized):
+            return (
+                "OneBot11 拒绝通过 terminal 写入 Hermes 安全敏感配置"
+                "（config.yaml / roles.yaml / .env / auth.json）；"
+                "权限与白名单由站长在 roles.yaml 维护。"
+            )
+    return None
 
 
 def validate_message_scope(message: Mapping[str, Any], context: CallerContext) -> str | None:
