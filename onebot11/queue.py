@@ -24,7 +24,7 @@ DEFAULT_BACKOFF_SECONDS = (2.0, 4.0, 8.0)
 MAX_BACKOFF_SECONDS = 60.0
 _HARD_TRIGGER_REASONS = frozenset({"mention", "keyword", "always", "admin_flush"})
 _AUTHORITY_ROLES = frozenset({"user", "trusted_user", "super_admin"})
-_FORBIDDEN_AUTHORITY_TOOLS = frozenset({"delegate_task", "tool_search"})
+_FORBIDDEN_AUTHORITY_TOOLS = frozenset({"tool_search"})
 logger = logging.getLogger(__name__)
 
 

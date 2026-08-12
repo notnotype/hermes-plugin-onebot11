@@ -239,7 +239,15 @@ segment，并可带 caption/reply。Hermes 是否提供媒体结果聚合不影�
 同一 anchor 批次可能来自多个用户，但权限主体始终是该 anchor 对应真实消息的触发用户；
 其他用户消息只作为不可信上下文，不会把普通用户升级为超级管理员，也不会改变当前群目标。
 OneBot turn 的 generic Hermes 工具同样经过 `pre_tool_call` 硬门禁；普通用户不能因为
-工具名不是 `qq_*` 就绕过角色配置，`delegate_task` 和 `tool_search` 当前始终拒绝。
+工具名不是 `qq_*` 就绕过角色配置。`delegate_task` 可以作为显式 generic 能力授予，
+用于把需要执行环境的工作交给 Hermes 子代理；`tool_search` 仍始终拒绝。若启用
+`main_agent_read_only`，主 agent 只能直接使用 `read_file`、`search_files`（内容搜索和
+glob 文件搜索，等价于 Grep/Glob）、网页/视觉等只读工具以及 `delegate_task`；
+子代理才可使用项目所需的 `terminal`、`process`、`write_file` 和 `patch`，并且不能
+调用 OneBot QQ 工具、发送消息或再次委派。`search_files(target=content)` 是内容
+正则搜索，`search_files(target=files)` 是 glob 文件搜索，因此主 agent 不需要直接
+执行 `rg`。只读模式不限制 QQ 群管理写工具（仍需超级管理员 + 确认令牌），但
+`read_file` 会拒绝读取 `.env`/`auth.json`/`auth.lock` 凭据文件。
 
 群级运维命令由超级管理员直接发送：`/onebot status`、`queue`、`flush`、`clear`、`pause`、`resume`、`resolve retry|discard`、`resolve action retry|discard OPERATION_ID` 和 `confirm TOKEN`。`clear` 不删除 Hermes session 历史，但会同时失效当前群旧的 debounce/活跃触发状态；`uncertain` 和 `failed` 都不会自动重试，必须明确 resolve。队列消息的 `resolve retry` 只在旧 anchor 的 authority、真实消息和 batch 仍可证明时生成新的 request_id，并保留原权限；无法证明的旧记录保持 hold，不能由管理员身份或后续 selector 猜测接管。管理动作 `unknown` 的 `retry` 只解除重复执行阻断，之后仍需重新生成预览并确认，不会直接重放。
 

@@ -23,8 +23,58 @@ READ_ONLY_TOOLS = frozenset(
         "qq_get_group_member_info",
     }
 )
+# Hermes 通用工具中可在“主 agent 只读”模式使用的集合。这里的只读是
+# 工具语义上的只读：不会写本地文件、启动进程、修改外部状态或产生付费
+# 生成任务。文件检索使用 Hermes 原生 ``search_files``，它同时覆盖 Grep
+# （内容正则搜索）和 Glob（文件名 glob 搜索），因此不需要开放 terminal
+# 来执行 rg。
+READ_ONLY_GENERIC_TOOLS = frozenset(
+    {
+        "read_file",
+        "search_files",
+        "web_search",
+        "web_extract",
+        "vision_analyze",
+        "skills_list",
+        "skill_view",
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_get_images",
+        "browser_vision",
+        "session_search",
+    }
+)
 ROLE_NAMES = ("user", "trusted_user", "super_admin")
-FORBIDDEN_TOOL_NAMES = frozenset({"delegate_task", "tool_search"})
+# ``delegate_task`` 是显式的角色能力：允许客服主 agent 把需要执行环境的
+# 工作交给子代理；``tool_search`` 仍然禁止，避免动态发现工具绕过本轮
+# authority 快照。子代理的 shell 访问由 adapter 在 delegated-child 上下文
+# 中单独放行，而不是把 shell 权限写进普通用户角色。
+FORBIDDEN_TOOL_NAMES = frozenset({"tool_search"})
+
+# 即使主 agent 已获授权，子代理也不应直接操作 OneBot、再次派发任务或
+# 代表父 turn 发送消息；子代理的职责是处理项目工作并把结果交回父 agent。
+DELEGATED_CHILD_FORBIDDEN_TOOLS = frozenset(
+    {
+        "delegate_task",
+        "send_message",
+        "cronjob",
+    }
+)
+DELEGATED_CHILD_TOOLS = frozenset(
+    {
+        "terminal",
+        "process",
+        "read_file",
+        "search_files",
+        "write_file",
+        "patch",
+        "web_search",
+        "web_extract",
+        "vision_analyze",
+        "skills_list",
+        "skill_view",
+    }
+)
 
 # Hermes 安全敏感配置文件：代理不得通过任何工具写入这些文件。
 # 与 Hermes file 工具写保护保持一致，并额外覆盖 terminal 绕过路径。
@@ -35,6 +85,7 @@ SENSITIVE_CONFIG_NAMES = (
     "auth.json",
     "auth.lock",
 )
+SENSITIVE_READ_NAMES = frozenset({".env", "auth.json", "auth.lock"})
 
 # 写意图正则：命中"敏感文件 + 写操作"组合时才拦截，纯读取（cat/grep/read_file）
 # 不受影响。覆盖 shell 重定向、tee、sed/perl -i、python 写文件、mv/cp/rm 和编辑器。
@@ -434,10 +485,34 @@ def role_for_user(
 def role_prompt(
     context: CallerContext,
     role_catalog: Mapping[str, Any] | None = None,
+    *,
+    main_agent_read_only: bool = False,
+    delegated_child: bool = False,
 ) -> str:
     """生成注入 Hermes 的角色、工具目录和作用域提示。"""
-    if context.role == "super_admin":
-        tools = "全部工具（除 delegate_task、tool_search；OneBot 群管理写工具仍需确认）"
+    if delegated_child:
+        tools = ", ".join(sorted(DELEGATED_CHILD_TOOLS))
+    elif main_agent_read_only:
+        # 只读模式下即使配置文件误把 terminal/write_file 放进了角色，
+        # 提示词也不能把它们展示成当前可用能力；真正的硬拦截仍在
+        # validate_tool_call 和 adapter hook 中执行。
+        read_only_tools = context.allowed_tools & (
+            READ_ONLY_TOOLS | READ_ONLY_GENERIC_TOOLS
+        )
+        if context.role == "super_admin":
+            # super_admin 的 generic 工具授权由 Hermes 默认工具集提供，
+            # 不会全部重复写进 OneBot 的角色 snapshot；只读模式下仍要
+            # 把实际可直接使用的 read_file/search_files 等能力告诉模型。
+            read_only_tools = (
+                read_only_tools
+                | READ_ONLY_GENERIC_TOOLS
+                | (context.allowed_tools & WRITE_TOOLS)
+            )
+        if context.role == "super_admin" or "delegate_task" in context.allowed_tools:
+            read_only_tools = read_only_tools | {"delegate_task"}
+        tools = ", ".join(sorted(read_only_tools)) or "无"
+    elif context.role == "super_admin":
+        tools = "全部工具（除 tool_search；OneBot 群管理写工具仍需确认）"
     else:
         tools = ", ".join(sorted(context.allowed_tools)) or "无"
     target = "群" if context.chat_type == "group" else "私聊"
@@ -471,6 +546,21 @@ def role_prompt(
         "- user 默认只有只读工具；trusted_user 可按配置逐项获得 Hermes generic 工具，"
         "但不能使用 OneBot 群管理写工具，也不能修改权限、白名单或角色配置。\n"
         "- 所有 QQ 查询只能作用于当前目标；管理写操作必须先通过 /onebot confirm 完成。"
+        + (
+            "\n- 当前是 Hermes delegated child：可以使用 terminal/process/read_file/search_files、"
+            "write_file/patch 等项目工具；不能调用任何 QQ 工具、delegate_task、send_message 或 cronjob。"
+            if delegated_child
+            else ""
+        )
+        + (
+            "\n- 当前主 agent 是只读模式：可以使用 read_file/search_files（Grep/Glob 内容与文件搜索）、"
+            "web_search/web_extract、vision_analyze 等只读工具；需要 terminal、process、"
+            "write_file、patch 或 execute_code 时必须通过 delegate_task 交给子代理。"
+            "QQ 群管理写工具（撤回/禁言/踢人/全员禁言）不受只读限制，仅超级管理员可用，"
+            "且必须先通过 /onebot confirm。"
+            if main_agent_read_only and not delegated_child
+            else ""
+        )
     )
 
 
@@ -527,6 +617,21 @@ def file_tool_writes_sensitive_config(path: str) -> str | None:
     return None
 
 
+def file_tool_reads_sensitive_config(path: str) -> str | None:
+    """阻止主 agent 读取凭据文件；只读模式下的 read_file 门禁。"""
+    raw = str(path or "").strip()
+    if not raw:
+        return None
+    expanded = os.path.expanduser(raw)
+    try:
+        resolved = os.path.realpath(expanded)
+    except OSError:
+        resolved = os.path.normpath(expanded)
+    if os.path.basename(resolved).casefold() in SENSITIVE_READ_NAMES:
+        return "OneBot11 拒绝读取安全敏感凭据文件（.env / auth.json / auth.lock）"
+    return None
+
+
 def validate_message_scope(message: Mapping[str, Any], context: CallerContext) -> str | None:
     """校验 OneBot get_msg 返回的消息属于当前群或当前私聊。"""
     message_type = str(message.get("message_type") or "")
@@ -570,6 +675,9 @@ def validate_tool_call(
     params: Mapping[str, Any],
     ctx: CallerContext,
     admins: set[str] | None = None,
+    *,
+    main_agent_read_only: bool = False,
+    delegated_child: bool = False,
 ) -> str | None:
     """校验工具角色、会话类型和目标范围，返回错误文本或 ``None``。"""
     del params, admins
@@ -578,10 +686,36 @@ def validate_tool_call(
         return "工具名为空（权限系统 fail-closed）"
     if normalized_tool_name in FORBIDDEN_TOOL_NAMES:
         return f"OneBot11 当前禁止调用 {normalized_tool_name}"
+    if delegated_child:
+        if normalized_tool_name.startswith("qq_"):
+            return "OneBot11 子代理不能直接调用 QQ 工具，请由主 agent 处理"
+        if normalized_tool_name in DELEGATED_CHILD_FORBIDDEN_TOOLS:
+            return f"OneBot11 子代理不能调用 {normalized_tool_name}"
+        if normalized_tool_name not in DELEGATED_CHILD_TOOLS:
+            return f"OneBot11 子代理不能调用 {normalized_tool_name}"
+    if main_agent_read_only and not delegated_child:
+        # QQ 群管理写工具不受“只读”限制：只读只限 shell/文件/代码执行；
+        # 撤回/禁言/踢人/全员禁言继续由后面的 super_admin + 当前群 +
+        # 确认令牌流程把关。
+        if normalized_tool_name == "delegate_task":
+            if normalized_tool_name not in ctx.allowed_tools and ctx.role != "super_admin":
+                return f"角色 {ctx.role} 无权调用 {normalized_tool_name}"
+        elif (
+            normalized_tool_name not in READ_ONLY_GENERIC_TOOLS
+            and normalized_tool_name not in READ_ONLY_TOOLS
+            and normalized_tool_name not in WRITE_TOOLS
+        ):
+            return f"当前 OneBot 主 agent 处于只读模式，不能调用 {normalized_tool_name}"
     if normalized_tool_name not in ctx.allowed_tools:
         # 超级管理员默认拥有 Hermes 通用工具（terminal、read_file 等由
         # Hermes 自己执行）；OneBot 工具仍必须出现在角色的工具集合中。
-        if ctx.role != "super_admin" or normalized_tool_name.startswith("qq_"):
+        if delegated_child:
+            if (
+                ctx.role != "super_admin"
+                and "delegate_task" not in ctx.allowed_tools
+            ):
+                return f"角色 {ctx.role} 未向子代理授予 {tool_name}"
+        elif ctx.role != "super_admin" or normalized_tool_name.startswith("qq_"):
             return f"角色 {ctx.role} 无权调用 {tool_name}"
     if normalized_tool_name.startswith("qq_") and normalized_tool_name not in ALL_TOOLS:
         return "未知 OneBot11 工具（权限系统 fail-closed）"

@@ -5548,6 +5548,290 @@ async def test_generic工具trusted_user显式授权时允许(monkeypatch):
         await adapter.disconnect()
 
 
+async def test_main_agent只读模式放行委派但阻断terminal(monkeypatch):
+    """只读主 agent 可以委派；直接 terminal 必须在 hook 层阻断。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    adapter._replace_policy(main_agent_read_only=True)
+    caller = adapter_module.CallerContext(
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+        role="super_admin",
+        allowed_tools=adapter_module.READ_ONLY_TOOLS,
+        self_id="1",
+        adapter_epoch=adapter._adapter_epoch,
+    )
+    binding = adapter_module.TurnBinding("readonly-session", "readonly-turn", caller)
+    adapter._bindings.bind(binding)
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    caller_token = adapter_module._CURRENT_CALLER.set(caller)
+    binding_token = adapter_module._CURRENT_BINDING.set(binding)
+    event_token = adapter_module._CURRENT_EVENT.set(None)
+    try:
+        assert adapter_module._pre_tool_call_hook(
+            tool_name="search_files",
+            session_id=binding.session_id,
+            turn_id=binding.turn_id,
+            args={"pattern": "delegate_task"},
+        ) is None
+        assert adapter_module._pre_tool_call_hook(
+            tool_name="delegate_task",
+            session_id=binding.session_id,
+            turn_id=binding.turn_id,
+            args={"goal": "检查项目"},
+        ) is None
+        blocked = adapter_module._pre_tool_call_hook(
+            tool_name="terminal",
+            session_id=binding.session_id,
+            turn_id=binding.turn_id,
+            args={"command": "rg TODO ."},
+        )
+        assert blocked == {
+            "action": "block",
+            "message": "权限错误: 当前 OneBot 主 agent 处于只读模式，不能调用 terminal",
+        }
+    finally:
+        adapter_module._CURRENT_EVENT.reset(event_token)
+        adapter_module._CURRENT_BINDING.reset(binding_token)
+        adapter_module._CURRENT_CALLER.reset(caller_token)
+        await adapter.disconnect()
+
+
+async def test_delegated_child只允许项目工具且拒绝QQ(monkeypatch):
+    """Hermes delegated-child context 可用 shell，但不能借父身份调用 QQ。"""
+    from agent.delegation_context import delegated_child_context
+
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    adapter._replace_policy(main_agent_read_only=True)
+    caller = adapter_module.CallerContext(
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+        role="super_admin",
+        allowed_tools=adapter_module.READ_ONLY_TOOLS,
+        self_id="1",
+        adapter_epoch=adapter._adapter_epoch,
+    )
+    binding = adapter_module.TurnBinding("parent-session", "parent-turn", caller)
+    adapter._bindings.bind(binding)
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    caller_token = adapter_module._CURRENT_CALLER.set(caller)
+    binding_token = adapter_module._CURRENT_BINDING.set(binding)
+    event_token = adapter_module._CURRENT_EVENT.set(None)
+    onebot_context_token = adapter_module._CURRENT_ONEBOT_CONTEXT.set(True)
+    try:
+        with delegated_child_context("child-session"):
+            assert adapter_module._pre_tool_call_hook(
+                tool_name="terminal",
+                session_id="child-session",
+                turn_id="child-turn",
+                args={"command": "rg -n TODO ."},
+            ) is None
+            blocked = adapter_module._pre_tool_call_hook(
+                tool_name="qq_get_message",
+                session_id="child-session",
+                turn_id="child-turn",
+                args={"message_id": "1"},
+            )
+            assert blocked == {
+                "action": "block",
+                "message": "权限错误: OneBot11 子代理不能直接调用 QQ 工具，请由主 agent 处理",
+            }
+    finally:
+        adapter_module._CURRENT_ONEBOT_CONTEXT.reset(onebot_context_token)
+        adapter_module._CURRENT_EVENT.reset(event_token)
+        adapter_module._CURRENT_BINDING.reset(binding_token)
+        adapter_module._CURRENT_CALLER.reset(caller_token)
+        await adapter.disconnect()
+
+
+async def test_无父binding的子代理仍然拒绝OneBot工具(monkeypatch):
+    """delegated-child 标记不能单独伪造 OneBot 父 turn 身份。"""
+    from agent.delegation_context import delegated_child_context
+
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    adapter._replace_policy(main_agent_read_only=True)
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    event_token = adapter_module._CURRENT_EVENT.set(None)
+    caller_token = adapter_module._CURRENT_CALLER.set(None)
+    binding_token = adapter_module._CURRENT_BINDING.set(None)
+    onebot_context_token = adapter_module._CURRENT_ONEBOT_CONTEXT.set(True)
+    try:
+        with delegated_child_context("orphan-child"):
+            blocked = adapter_module._pre_tool_call_hook(
+                tool_name="terminal",
+                session_id="orphan-child",
+                turn_id="orphan-turn",
+                args={"command": "pwd"},
+            )
+        assert blocked == {
+            "action": "block",
+            "message": "OneBot11 current turn binding unavailable",
+        }
+    finally:
+        adapter_module._CURRENT_ONEBOT_CONTEXT.reset(onebot_context_token)
+        adapter_module._CURRENT_BINDING.reset(binding_token)
+        adapter_module._CURRENT_CALLER.reset(caller_token)
+        adapter_module._CURRENT_EVENT.reset(event_token)
+        await adapter.disconnect()
+
+
+async def test_普通平台子代理不受OneBot全局hook影响(monkeypatch):
+    """没有 OneBot lineage 时，通用 Hermes 子代理仍由 Hermes 自己授权。"""
+    from agent.delegation_context import delegated_child_context
+
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    event_token = adapter_module._CURRENT_EVENT.set(None)
+    caller_token = adapter_module._CURRENT_CALLER.set(None)
+    binding_token = adapter_module._CURRENT_BINDING.set(None)
+    onebot_context_token = adapter_module._CURRENT_ONEBOT_CONTEXT.set(False)
+    try:
+        with delegated_child_context("other-platform-child"):
+            assert adapter_module._pre_tool_call_hook(
+                tool_name="terminal",
+                session_id="other-platform-child",
+                turn_id="other-turn",
+                args={"command": "pwd"},
+                platform="discord",
+            ) is None
+    finally:
+        adapter_module._CURRENT_ONEBOT_CONTEXT.reset(onebot_context_token)
+        adapter_module._CURRENT_BINDING.reset(binding_token)
+        adapter_module._CURRENT_CALLER.reset(caller_token)
+        adapter_module._CURRENT_EVENT.reset(event_token)
+        await adapter.disconnect()
+
+
+async def test_只读模式read_file敏感文件被拦截(monkeypatch):
+    """主 agent 只读可以读代码，但不能把 .env/auth.json 读进上下文。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    adapter._replace_policy(main_agent_read_only=True)
+    caller = adapter_module.CallerContext(
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+        role="super_admin",
+        allowed_tools=adapter_module.READ_ONLY_TOOLS,
+        self_id="1",
+        adapter_epoch=adapter._adapter_epoch,
+    )
+    binding = adapter_module.TurnBinding("readonly-session", "readonly-turn", caller)
+    adapter._bindings.bind(binding)
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    caller_token = adapter_module._CURRENT_CALLER.set(caller)
+    binding_token = adapter_module._CURRENT_BINDING.set(binding)
+    event_token = adapter_module._CURRENT_EVENT.set(None)
+    onebot_context_token = adapter_module._CURRENT_ONEBOT_CONTEXT.set(True)
+    try:
+        assert adapter_module._pre_tool_call_hook(
+            tool_name="read_file",
+            session_id=binding.session_id,
+            turn_id=binding.turn_id,
+            args={"path": "/opt/data/repo/neuro-book/README.md"},
+        ) is None
+        blocked = adapter_module._pre_tool_call_hook(
+            tool_name="read_file",
+            session_id=binding.session_id,
+            turn_id=binding.turn_id,
+            args={"path": "/opt/data/.env"},
+        )
+        assert blocked == {
+            "action": "block",
+            "message": "权限错误: OneBot11 拒绝读取安全敏感凭据文件（.env / auth.json / auth.lock）",
+        }
+    finally:
+        adapter_module._CURRENT_ONEBOT_CONTEXT.reset(onebot_context_token)
+        adapter_module._CURRENT_EVENT.reset(event_token)
+        adapter_module._CURRENT_BINDING.reset(binding_token)
+        adapter_module._CURRENT_CALLER.reset(caller_token)
+        await adapter.disconnect()
+
+
+async def test_同一候选queued_reaction失败后不重复调用(monkeypatch):
+    """同一条候选消息 reaction 失败后不再反复调用 OneBot API。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "groups": ["888"],
+                },
+            },
+        )
+    )
+    calls: list[tuple[str, str, bool]] = []
+
+    async def failing_reaction(message_id: str, emoji_id: str, *, enabled: bool) -> None:
+        calls.append((message_id, emoji_id, enabled))
+        raise adapter_module.OneBotApiError("set_msg_emoji_like", "failed", 0)
+
+    monkeypatch.setattr(adapter._api, "set_message_emoji_like", failing_reaction)
+    message = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1001",
+        user_id="123",
+        user_name="小明",
+        text="这个问题怎么处理？",
+        message_key="group:1001",
+    )
+    adapter._queue.enqueue(message)
+    try:
+        adapter._schedule_queued_reaction("888", message)
+        await asyncio.sleep(0.05)
+        assert calls == [("1001", "128064", True)]
+        adapter._schedule_queued_reaction("888", message)
+        adapter._schedule_queued_reaction("888", message)
+        await asyncio.sleep(0.05)
+        assert len(calls) == 1
+        next_message = QueueMessage(
+            chat_id="888",
+            chat_type="group",
+            message_id="1002",
+            user_id="123",
+            user_name="小明",
+            text="换个问题",
+            message_key="group:1002",
+        )
+        adapter._queue.enqueue(next_message)
+        adapter._schedule_queued_reaction("888", next_message)
+        await asyncio.sleep(0.05)
+        assert calls[-1] == ("1002", "128064", True)
+        assert len(calls) == 2
+        adapter._schedule_clear_queued_reaction("888", reset_attempted=True)
+        adapter._schedule_queued_reaction("888", message)
+        await asyncio.sleep(0.05)
+        assert len(calls) == 3
+    finally:
+        await adapter.disconnect()
+
+
 async def test_hook拒绝事件metadata与显式turn不一致(monkeypatch):
     """一个 OneBot 事件不能借用同一适配器中的另一个 turn binding。"""
     adapter = _make_adapter(

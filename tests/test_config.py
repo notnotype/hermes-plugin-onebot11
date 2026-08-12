@@ -218,20 +218,44 @@ def test启用llm_trigger必须显式配置群allowlist():
         )
 
 
-def test角色工具名允许Hermes通用工具但禁止子代理绕过():
-    """角色可以精确授予 Hermes 工具名，但不能配置越权桥接工具。"""
+def test角色工具名允许显式委派但禁止动态工具发现():
+    """角色可以显式授予委派能力，但不能配置动态工具发现桥。"""
     runtime = parse_runtime_config(
-        _extra(roles={"trusted_user": {"tools": ["terminal", "browser"]}})
-    )
-    assert runtime.role_tools["trusted_user"] == frozenset({"terminal", "browser"})
-    with pytest.raises(ValueError, match="禁止"):
-        parse_runtime_config(
-            _extra(roles={"user": {"tools": ["delegate_task"]}})
+        _extra(
+            roles={
+                "trusted_user": {"tools": ["terminal", "browser", "delegate_task"]},
+                "user": {"tools": ["delegate_task"]},
+            }
         )
+    )
+    assert runtime.role_tools["trusted_user"] == frozenset(
+        {"terminal", "browser", "delegate_task"}
+    )
+    assert runtime.role_tools["user"] == frozenset({"delegate_task"})
     with pytest.raises(ValueError, match="禁止"):
         parse_runtime_config(
             _extra(roles={"user": {"tools": ["tool_search"]}})
         )
+
+
+def test主agent只读模式可由独立roles文件配置(tmp_path):
+    """只读开关和角色配置一起从独立 roles 文件读取。"""
+    roles_path = tmp_path / "roles.yaml"
+    roles_path.write_text(
+        "main_agent_read_only: true\nroles: {}\n",
+        encoding="utf-8",
+    )
+    runtime = parse_runtime_config(
+        _extra(),
+        {"ONEBOT11_ROLES_FILE": str(roles_path)},
+    )
+    assert runtime.main_agent_read_only is True
+
+
+def test主agent只读开关严格解析():
+    """不能用字符串 truthiness 把错误配置当成只读模式。"""
+    with pytest.raises(ValueError):
+        parse_runtime_config(_extra(main_agent_read_only="sometimes"))
 
 
 def test显式空超级管理员工具与错误角色类型区分():

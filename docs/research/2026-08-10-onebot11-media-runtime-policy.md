@@ -98,5 +98,7 @@ active turn 的 authority/tool snapshot 不因 reload 中途扩大，但每次�
 - tool-search bridge 传递 `session_id`、`turn_id`、`api_request_id`；
 - per-turn `allowed_tool_names` 继承到 tool search、execute_code 和 delegation 子 Agent。
 
-在这些能力完成前，OneBot 不允许 `delegate_task`，也不把 role catalog 伪装成
-通用 Hermes 工具授权。Docker 子代理、OneBot 12、语音转写和语义摘要继续不纳入本轮。
+在这些能力完成前，OneBot 不开启动态 `tool_search`，也不把 role catalog 伪装成
+通用 Hermes 工具授权。`delegate_task` 仅作为显式委派入口：主 agent 只读时可由角色
+配置授予，子代理使用项目工具但不能调用 QQ、发送消息或再次委派；缺少父 binding
+时仍 fail-closed。Docker 子代理、OneBot 12、语音转写和语义摘要继续不纳入本轮。

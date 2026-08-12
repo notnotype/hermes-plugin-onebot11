@@ -15,7 +15,12 @@ super_admin > trusted_user > user
 `super_admin`，配置解析器拒绝把这些写工具加入 `user` 或 `trusted_user`；
 Hermes generic 工具（例如网页、浏览器、终端或文件能力）可以按工具名显式授予
 `trusted_user`，并由 adapter、hooks 和 handler 运行时双重 fail-closed 校验。
-当前 `delegate_task` 和 `tool_search` 永久禁止，避免 Hermes 上游丢失 turn 身份时形成假安全。
+`tool_search` 永久禁止，避免动态发现工具绕过本轮 authority 快照；`delegate_task`
+不再全局禁止。`super_admin` 默认拥有 Hermes 通用工具，因此可以直接委派；
+`user`/`trusted_user` 必须显式把它加入角色工具集合。启用 `main_agent_read_only`
+时主 agent 只能直接使用只读工具，项目执行能力交给 Hermes delegated child。子代理
+继承父 turn 的 binding/lease/epoch 和访问范围，但不能调用 QQ 工具、send_message、
+cronjob 或再次委派；缺少 delegated-child context 或父 binding 时按 fail-closed 处理。
 
 trusted_user 不能通过 Agent 或工具修改权限、白名单、角色配置或运行时 Python。权限变化只通过 YAML/环境配置和人工部署生效。
 

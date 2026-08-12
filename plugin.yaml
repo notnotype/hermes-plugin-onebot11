@@ -12,8 +12,10 @@ description: >
   non-idempotent delivery is never retried. Text replies default to plain text,
   and policy/trigger permissions support runtime reload through /onebot reload.
   LLM selector decisions choose a real pending message anchor and inherit its
-  authority; generic Hermes tools are hard-gated per OneBot turn, while
-  delegate_task and tool_search remain disabled.
+  authority; generic Hermes tools are hard-gated per OneBot turn. The optional
+  main-agent read-only policy keeps file search/read and delegation available,
+  while delegated children can use the inherited project toolset; tool_search
+  remains disabled.
   Optional layered LLM trigger uses the plugin's Node.js >=22.19/pi-ai helper,
   not Hermes auxiliary; install runtime dependencies with npm ci --omit=dev.
 author: notnotype
@@ -62,6 +64,10 @@ optional_env:
   - name: ONEBOT11_SUPER_ADMINS
     description: "超级管理员 QQ 列表（逗号分隔；空 = 写操作 fail-closed）"
     prompt: "超级管理员 QQ 列表"
+    password: false
+  - name: ONEBOT11_MAIN_AGENT_READ_ONLY
+    description: "主 agent 只读模式；文件检索仍使用 Hermes search_files，执行工作交给 delegate_task 子代理"
+    prompt: "OneBot 主 agent 只读"
     password: false
   - name: ONEBOT11_ADMINS
     description: "ONEBOT11_SUPER_ADMINS 的兼容旧名"

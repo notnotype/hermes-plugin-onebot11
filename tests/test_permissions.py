@@ -4,6 +4,7 @@
 import pytest
 
 from onebot11.permissions import (
+    WRITE_TOOLS,
     CallerContext,
     ToolContext,
     TurnBinding,
@@ -11,6 +12,7 @@ from onebot11.permissions import (
     access_allowed,
     build_role_tools,
     build_trusted_users,
+    file_tool_reads_sensitive_config,
     file_tool_writes_sensitive_config,
     parse_admin_list,
     role_for_user,
@@ -141,8 +143,9 @@ def test_超级管理员默认拥有Hermes通用工具():
     assert validate_tool_call("skill_view", {}, ctx) is None
     # OneBot 工具仍必须出现在角色的工具集合中。
     assert validate_tool_call("qq_set_group_ban", {}, ctx) is not None
-    # FORBIDDEN 工具对超级管理员也始终拒绝。
-    assert validate_tool_call("delegate_task", {}, ctx) is not None
+    # delegate_task 是显式的 generic 编排能力；tool_search 仍始终拒绝。
+    assert validate_tool_call("delegate_task", {}, ctx) is None
+    assert validate_tool_call("tool_search", {}, ctx) is not None
 
 
 def test_普通用户无权调用Hermes通用工具():
@@ -186,6 +189,140 @@ def test_trusted_user未配置image_generate时拒绝():
         self_id="3101482118",
     )
     assert validate_tool_call("image_generate", {}, ctx) is not None
+
+
+def test_主agent只读模式允许文件检索和delegate但拒绝执行():
+    """主 agent 可以用 Hermes 原生 search_files 做 Grep/Glob，不需要 shell。"""
+    ctx = CallerContext(
+        user_id="2056963663",
+        chat_type="group",
+        chat_id="942513604",
+        role="super_admin",
+        allowed_tools=frozenset({"search_files", "read_file"}),
+        self_id="3101482118",
+    )
+    assert validate_tool_call(
+        "search_files", {}, ctx, main_agent_read_only=True
+    ) is None
+    assert validate_tool_call(
+        "read_file", {}, ctx, main_agent_read_only=True
+    ) is None
+    assert validate_tool_call(
+        "delegate_task", {}, ctx, main_agent_read_only=True
+    ) is None
+    assert validate_tool_call(
+        "terminal", {}, ctx, main_agent_read_only=True
+    ) is not None
+    assert validate_tool_call(
+        "write_file", {}, ctx, main_agent_read_only=True
+    ) is not None
+
+
+def test_子代理继承shell但不继承OneBot和编排权限():
+    """子代理可以执行项目 shell，但不能再次派发、发消息或调用 QQ 工具。"""
+    ctx = CallerContext(
+        user_id="2056963663",
+        chat_type="group",
+        chat_id="942513604",
+        role="super_admin",
+        allowed_tools=frozenset(),
+        self_id="3101482118",
+    )
+    assert validate_tool_call(
+        "terminal", {}, ctx, main_agent_read_only=True, delegated_child=True
+    ) is None
+    assert validate_tool_call(
+        "write_file", {}, ctx, main_agent_read_only=True, delegated_child=True
+    ) is None
+    assert validate_tool_call(
+        "qq_get_message", {}, ctx, delegated_child=True
+    ) is not None
+    assert validate_tool_call(
+        "delegate_task", {}, ctx, delegated_child=True
+    ) is not None
+
+
+def test_search_files覆盖grep和glob说明():
+    """权限提示明确告诉模型 search_files 是只读 Grep/Glob 替代。"""
+    context = CallerContext(
+        user_id="2056963663",
+        chat_type="group",
+        chat_id="942513604",
+        role="super_admin",
+        allowed_tools=frozenset({"read_file", "search_files", "delegate_task"}),
+        self_id="3101482118",
+    )
+    prompt = role_prompt(context, main_agent_read_only=True)
+    assert "search_files" in prompt
+    assert "Grep/Glob" in prompt
+
+
+def test_主agent只读提示不展示被配置的写工具():
+    """只读提示不能把角色快照中的 terminal/write_file 误报为可用。"""
+    context = CallerContext(
+        user_id="2056963663",
+        chat_type="group",
+        chat_id="942513604",
+        role="trusted_user",
+        allowed_tools=frozenset({"terminal", "write_file", "read_file"}),
+    )
+    prompt = role_prompt(context, main_agent_read_only=True)
+    assert "当前允许工具：read_file" in prompt
+    assert "terminal" not in prompt.split("当前允许工具：", 1)[1].split("\n", 1)[0]
+    assert "write_file" not in prompt.split("当前允许工具：", 1)[1].split("\n", 1)[0]
+
+
+def test_只读模式超级管理员QQ写工具仍可用():
+    """只读只限 shell/文件/代码执行；QQ 写工具仍走 super_admin + 确认令牌。"""
+    super_ctx = CallerContext(
+        user_id="2056963663",
+        chat_type="group",
+        chat_id="942513604",
+        role="super_admin",
+        allowed_tools=WRITE_TOOLS | {"qq_get_message"},
+        self_id="3101482118",
+    )
+    assert validate_tool_call(
+        "qq_set_group_ban", {}, super_ctx, main_agent_read_only=True
+    ) is None
+    user_ctx = CallerContext(
+        user_id="1259901822",
+        chat_type="group",
+        chat_id="942513604",
+        role="user",
+        allowed_tools={"qq_get_message"},
+        self_id="3101482118",
+    )
+    assert validate_tool_call(
+        "qq_set_group_ban", {}, user_ctx, main_agent_read_only=True
+    ) is not None
+
+
+def test_敏感凭据文件读保护():
+    """主 agent 只读模式可以查代码，但不能把凭据读进上下文。"""
+    assert file_tool_reads_sensitive_config(".env") is not None
+    assert file_tool_reads_sensitive_config("/opt/data/auth.json") is not None
+    assert file_tool_reads_sensitive_config("~/auth.lock") is not None
+    assert file_tool_reads_sensitive_config("config.yaml") is None
+    assert file_tool_reads_sensitive_config("roles.yaml") is None
+    assert file_tool_reads_sensitive_config(".env.example") is None
+    assert file_tool_reads_sensitive_config("/opt/data/repo/neuro-book/README.md") is None
+    assert file_tool_reads_sensitive_config("") is None
+
+
+def test_只读提示保留QQ写工具与确认说明():
+    """提示词必须告诉模型：QQ 写工具不受只读限制，但仍需确认。"""
+    context = CallerContext(
+        user_id="2056963663",
+        chat_type="group",
+        chat_id="942513604",
+        role="super_admin",
+        allowed_tools=WRITE_TOOLS | {"read_file", "search_files"},
+        self_id="3101482118",
+    )
+    prompt = role_prompt(context, main_agent_read_only=True)
+    assert "qq_set_group_ban" in prompt
+    assert "/onebot confirm" in prompt
 
 
 def test_terminal写敏感配置被拦截():

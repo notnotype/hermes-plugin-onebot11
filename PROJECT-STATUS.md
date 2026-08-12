@@ -19,7 +19,7 @@
 | `onebot11/queue.py` | 完成 | SQLite WAL、schema 12 迁移、持久 cooldown/LLM judged cursor/失败退避、消息/TurnAnchor 去重、固定 batch lease、heartbeat、摘要、tombstone、uncertain 人工 resolve、reaction cleanup、reopen 和管理动作 operation ledger |
 | `onebot11/dispatch.py` | 完成 | 每群最多一个活动 turn，恢复触发请求和 cooldown 到期恢复；LLM selector 开启时由 adapter 策略回调接管，不绕过 anchor 选择；暂停/恢复、失败状态转换和 reconnect reset |
 | `onebot11/triggers.py` | 完成 | @、关键词、always、问句/记忆候选、自适应 debounce（消息间隔超过窗口立即判断，活跃时 trailing 节流）、60 秒活跃窗口、只选择真实 `anchor_seq` 的严格 selector；无短确认词特例，engaged 内所有普通消息统一交给 selector；纯图片消息不进 selector；prompt 按候选类型区分；**三档 engage 预算**（shallow/normal/deep）：bot 提问标记（`bot_asked`）+ 同用户回复 → deep 免 debounce 立即判断；回复引用 bot 或任务词 → deep；他人插话回落 normal；连续 ignore 降档 shallow；deep waiting 攒满 N 条新消息立即判；`short_rule_max_chars` 开启后 shallow 档无信号短消息本地 ignore |
-| `onebot11/permissions.py` | 完成 | `CallerContext`、`ChatTarget`、精确 `(session_id, turn_id)` binding、user/trusted_user/super_admin 角色、只读边界和 fail-closed；`super_admin` 默认拥有全部 Hermes 通用工具（`delegate_task`/`tool_search` 始终禁止） |
+| `onebot11/permissions.py` | 完成 | `CallerContext`、`ChatTarget`、精确 `(session_id, turn_id)` binding、user/trusted_user/super_admin 角色、主 agent 只读边界和 fail-closed；`tool_search` 始终禁止，`delegate_task` 作为委派入口，子代理只获得项目工具且不能调用 QQ/发送/再次委派 |
 | `onebot11/media.py` | 完成 | 当前 turn 内按规范化来源和内容 hash 做防御性媒体去重，不跨 turn/重启承诺 exactly-once |
 | `onebot11/formatting.py` | 完成 | OneBot 默认纯文本转换、Markdown image marker 清理和不可用 renderer 审计 |
 | `onebot11/tools.py` | 完成 | 当前群/私聊范围查询和群管理写工具；写操作必须确认 |

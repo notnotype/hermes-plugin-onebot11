@@ -46,6 +46,7 @@ class RuntimeConfig:
     super_admins: frozenset[str]
     trusted_users: frozenset[str]
     role_tools: dict[str, frozenset[str]]
+    main_agent_read_only: bool
     trigger_config: TriggerConfig
     processing_reaction_enabled: bool
     processing_reaction_emoji_id: str
@@ -97,6 +98,7 @@ class RuntimePolicySnapshot:
     super_admins: frozenset[str]
     trusted_users: frozenset[str]
     role_tools: Mapping[str, frozenset[str]]
+    main_agent_read_only: bool
     trigger_config: TriggerConfig
     processing_reaction_enabled: bool
     processing_reaction_emoji_id: str
@@ -133,6 +135,7 @@ def build_policy_snapshot(
         super_admins=frozenset(runtime.super_admins),
         trusted_users=frozenset(runtime.trusted_users),
         role_tools=runtime.role_tools,
+        main_agent_read_only=runtime.main_agent_read_only,
         trigger_config=runtime.trigger_config,
         processing_reaction_enabled=runtime.processing_reaction_enabled,
         processing_reaction_emoji_id=runtime.processing_reaction_emoji_id,
@@ -150,6 +153,7 @@ def runtime_static_fingerprint(runtime: RuntimeConfig) -> tuple[tuple[str, str],
         "super_admins",
         "trusted_users",
         "role_tools",
+        "main_agent_read_only",
         "trigger_config",
         "processing_reaction_enabled",
         "processing_reaction_emoji_id",
@@ -229,6 +233,7 @@ def effective_extra(
         "LLM_TRIGGER_API_KEY_ENV": "llm_trigger_api_key_env",
         "LLM_TRIGGER_ENABLED": "llm_trigger_enabled",
         "LLM_TRIGGER_GROUPS": "llm_trigger_groups",
+        "MAIN_AGENT_READ_ONLY": "main_agent_read_only",
     }
     for suffix, field in fields.items():
         name = f"ONEBOT11_{suffix}"
@@ -280,7 +285,7 @@ def _load_roles_overrides(path: Path) -> dict[str, Any]:
         return {}
     if not isinstance(raw, Mapping):
         raise ValueError("OneBot roles 文件必须是 YAML mapping")
-    allowed_keys = {"roles", "super_admins", "admins"}
+    allowed_keys = {"roles", "super_admins", "admins", "main_agent_read_only"}
     unknown = set(raw) - allowed_keys
     if unknown:
         raise ValueError(
@@ -299,7 +304,7 @@ def apply_roles_overrides(
     if not overrides:
         return dict(extra)
     merged = dict(extra)
-    for key in ("roles", "super_admins", "admins"):
+    for key in ("roles", "super_admins", "admins", "main_agent_read_only"):
         if key in overrides:
             merged[key] = overrides[key]
     return merged
@@ -471,6 +476,11 @@ def parse_runtime_config(
     super_admins = frozenset(parse_admin_list(raw_admins))
     trusted_users = build_trusted_users(effective)
     role_tools = build_role_tools(effective)
+    main_agent_read_only = parse_bool(
+        effective.get("main_agent_read_only"),
+        default=False,
+        name="main_agent_read_only",
+    )
     trigger_config = build_trigger_config(effective)
     if trigger_config.llm_enabled and not trigger_config.llm_allowed_groups:
         raise ValueError("启用 LLM trigger 时必须配置非空 llm_trigger_groups")
@@ -560,6 +570,7 @@ def parse_runtime_config(
         super_admins=super_admins,
         trusted_users=trusted_users,
         role_tools=role_tools,
+        main_agent_read_only=main_agent_read_only,
         trigger_config=trigger_config,
         processing_reaction_enabled=reaction_enabled,
         processing_reaction_emoji_id=reaction_emoji,

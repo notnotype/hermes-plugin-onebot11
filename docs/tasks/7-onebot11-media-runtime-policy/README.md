@@ -50,8 +50,10 @@
 - role prompt 展示三类角色工具目录，但明确 role catalog 不是硬授权来源；
 - 审计写失败只记录日志，不改变权限 hook 的 fail-closed 结果。
 - Hermes generic 工具也进入 OneBot turn 的 `pre_tool_call` 硬门禁；普通用户
-  不能因为工具不是 `qq_*` 就绕过角色工具快照。`delegate_task` 和 `tool_search`
-  仍在配置层、运行时双重禁止。
+  不能因为工具不是 `qq_*` 就绕过角色工具快照。`tool_search` 仍在配置层、运行时
+  双重禁止；`delegate_task` 必须显式配置。启用主 agent 只读后，主 agent 可直接
+  使用 `read_file/search_files`，需要 terminal/process/write_file/patch 的工作交给
+  delegated child；子代理不能调用 QQ 工具、send_message、cronjob 或再次委派。
 
 ### 触发、身份和上下文
 
@@ -86,8 +88,10 @@
   语义摘要或通用媒体发送；
 - Hermes heartbeat 在上游提供明确 control-plane metadata 前不作为 OneBot 业务合同；
 - Hermes 通用 web/browser/terminal/file 工具在 OneBot turn 中由插件的
-  `pre_tool_call` 按角色快照硬拦截；tool-search/子代理若丢失 turn 身份则继续拒绝，
-  不在插件中伪造权限传递。
+  `pre_tool_call` 按角色快照硬拦截；`tool_search` 继续拒绝，`delegate_task` 必须显式
+  配置。主 agent 只读时可直接使用 `read_file/search_files`，需要 terminal/process/
+  write_file/patch 的工作交给 delegated child；子代理若丢失父 binding 仍拒绝，且不能
+  调用 QQ 工具、send_message、cronjob 或再次委派。
 
 ## 验证
 
@@ -114,6 +118,6 @@ Arch 联调仍严格限制为群 `1072992996`、私聊用户 `2056963663`；
 - Hermes 上游增加明确的 long-running/system-error control-plane metadata 后，再开启
   OneBot 控制面通知的真实 heartbeat 联调；
 - renderer 任务另行定义 PNG 字体、尺寸、临时文件和外部 URL allowlist；
-- Hermes 上游完成 tool-search `turn_id` 和 delegation 继承后，再评估是否解除
-  `delegate_task`/`tool_search` 的 OneBot 禁止；当前 generic 工具本身已经由
-  OneBot `pre_tool_call` 按 role snapshot 硬门禁。
+- Hermes 上游完善 tool-search `turn_id` 和 delegation 继承后，再评估是否扩大
+  generic 工具范围；当前 `tool_search` 仍禁用，`delegate_task` 仅作为显式委派入口，
+  generic 工具本身已经由 OneBot `pre_tool_call` 按 role snapshot 硬门禁。

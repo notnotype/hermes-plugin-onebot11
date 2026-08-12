@@ -46,7 +46,7 @@ platforms:
 
 默认权限（未显式配置 `tools` 时）：
 
-- `super_admin`：全部 OneBot 工具 + 全部 Hermes 通用工具（`delegate_task`、`tool_search` 始终禁止；OneBot 群管理写工具仍需当前群 + 确认令牌）。
+- `super_admin`：全部 OneBot 工具 + 全部 Hermes 通用工具；`tool_search` 始终禁止，`delegate_task` 作为显式委派能力使用；OneBot 群管理写工具仍需当前群 + 确认令牌。
 - `user`：五个只读 OneBot 工具。
 - `trusted_user`：五个只读 OneBot 工具；需要 Hermes 通用能力时必须在 `tools` 中逐项显式配置。
 
@@ -58,17 +58,33 @@ platforms:
 当前锚点的不可变 authority 快照、`(session_id, turn_id)` binding、lease、adapter
 状态和工具 handler 硬校验。Hermes 的 generic tool-search bridge 可能在普通
 `pre_tool_call` 之前只读取 catalog；这不是授权或执行入口，OneBot 不在插件内
-monkey patch Hermes。`delegate_task` 当前不属于 OneBot 可配置工具，也不会把
-OneBot 权限传给 Hermes 子代理；Hermes 的 tool-search/子代理 turn 传递能力完成前，
-插件会在配置和运行时拒绝它。
+monkey patch Hermes。`delegate_task` 可以显式加入角色工具目录，但不把 OneBot QQ
+权限传给 Hermes 子代理。开启 `main_agent_read_only: true` 后，主 agent 直接只能
+使用 Hermes 的只读工具；子代理在 Hermes 的 delegated-child 上下文中可以使用项目
+工具（包括 terminal、process、read_file、search_files、write_file、patch），但不能
+调用 QQ 工具、`send_message`、`cronjob` 或再次委派。缺少 delegated-child 上下文时
+按主 agent 处理并 fail-closed。
 
 网页搜索、浏览器自动化、终端、文件读写等 Hermes 通用工具在 OneBot turn 中也会
 进入插件的 `pre_tool_call` 角色硬门禁；普通用户不会因为工具名不是 `qq_*` 就自动获得
-权限。`super_admin` 默认拥有全部 Hermes 通用工具（`delegate_task`、`tool_search`
-始终禁止），相当于配置文件中直接授予 shell/文件等本机能力；`trusted_user` 或
-`user` 要开放这类高风险能力，只能在 `tools` 中逐项配置。`execute_code` 一旦授予，
-代表高风险本机代码执行能力。该门禁依赖 Hermes 传递精确 `(session_id, turn_id)`；
-tool-search、delegation 或子代理缺少 turn 身份时 fail-closed，不伪造权限继承。
+权限。`tool_search` 始终禁止；`delegate_task` 是显式委派能力，只有角色工具快照允许时
+主 agent 才能调用。启用 `main_agent_read_only` 后，即使 super_admin 也不能直接使用
+terminal、process、write_file、patch 或 execute_code；但可以直接使用
+read_file/search_files 做只读检查，并把执行工作委派给子代理。子代理的工具仍受
+OneBot 父 turn 的 binding、lease、epoch 和访问策略约束；子代理不能调用 QQ 工具、
+send_message、cronjob 或再次委派。`trusted_user` 或 `user` 要开放 generic 能力，
+仍只能在 `tools` 中逐项配置。该门禁依赖 Hermes 传递精确 `(session_id, turn_id)`；
+缺少父 binding 时 fail-closed，不伪造权限继承。
+
+主 agent 只读时不需要通过 terminal 执行 `rg`：Hermes 原生 `search_files` 的
+`target=content` 是内容正则搜索（Grep），`target=files` 是 glob 文件搜索（Glob），
+`read_file` 用于读取文件。只有实际修改、运行测试或执行 shell 工作才交给
+`delegate_task` 子代理。
+
+只读不限制 QQ 群管理写工具：撤回、禁言、踢人、全员禁言仍由 super_admin + 当前群 +
+`/onebot confirm` 确认令牌把关。主 agent 的 `read_file` 不能读取 `.env`、
+`auth.json`、`auth.lock` 等凭据文件，避免密钥进入模型上下文；
+`config.yaml`/`roles.yaml` 仍可读。
 
 默认只读工具：
 
