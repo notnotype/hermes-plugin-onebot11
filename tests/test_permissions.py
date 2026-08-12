@@ -11,6 +11,7 @@ from onebot11.permissions import (
     access_allowed,
     build_role_tools,
     build_trusted_users,
+    file_tool_writes_sensitive_config,
     parse_admin_list,
     role_for_user,
     role_prompt,
@@ -206,6 +207,26 @@ def test_terminal读取配置不拦截():
     assert terminal_writes_sensitive_config("touch /tmp/hello.txt") is None
     assert terminal_writes_sensitive_config("cp ~/.hermes/config.yaml /tmp/config.yaml.bak") is None
     assert terminal_writes_sensitive_config("echo hello") is None
+
+
+def test_file工具写敏感配置被拦截():
+    """Hermes write_file/patch 写 roles.yaml/config.yaml 等必须被 OneBot 侧拒绝。"""
+    assert file_tool_writes_sensitive_config("~/.hermes/onebot11/roles.yaml") is not None
+    assert file_tool_writes_sensitive_config("/home/u/.hermes/config.yaml") is not None
+    assert file_tool_writes_sensitive_config("~/.hermes/.env") is not None
+    assert file_tool_writes_sensitive_config("~/.hermes/auth.json") is not None
+    assert file_tool_writes_sensitive_config("roles.yaml") is not None
+    assert file_tool_writes_sensitive_config("config.yaml") is not None
+
+
+def test_file工具写普通文件不拦截():
+    """write_file/patch 写业务代码或临时文件不受影响。"""
+    assert file_tool_writes_sensitive_config("~/Code/onebot11/adapter.py") is None
+    assert file_tool_writes_sensitive_config("/tmp/notes.txt") is None
+    assert file_tool_writes_sensitive_config("onebot11/triggers.py") is None
+    assert file_tool_writes_sensitive_config("") is None
+    assert file_tool_writes_sensitive_config("config.yaml.bak") is None
+    assert file_tool_writes_sensitive_config(".env.example") is None
 
 
 def test_role_prompt展示完整角色工具目录并强调锚点授权():

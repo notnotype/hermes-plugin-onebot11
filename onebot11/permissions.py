@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import threading
 from collections.abc import Mapping
@@ -490,6 +491,39 @@ def terminal_writes_sensitive_config(command: str) -> str | None:
                 "（config.yaml / roles.yaml / .env / auth.json）；"
                 "权限与白名单由站长在 roles.yaml 维护。"
             )
+    return None
+
+
+def file_tool_writes_sensitive_config(path: str) -> str | None:
+    """检测 Hermes file 工具（write_file/patch）是否写向安全敏感配置。
+
+    Hermes 的 file 工具只保护 config.yaml 和系统路径，不保护插件自己的
+    roles.yaml；这里按真实路径（含 ~ 展开）兜底，防止用 write_file 或
+    patch 绕过 terminal 写保护修改白名单/角色。
+    """
+    raw = str(path or "").strip()
+    if not raw:
+        return None
+    expanded = os.path.expanduser(raw)
+    try:
+        resolved = os.path.realpath(expanded)
+    except OSError:
+        resolved = os.path.normpath(expanded)
+    base_names = {os.path.basename(resolved).casefold()}
+    if raw != expanded:
+        base_names.add(os.path.basename(expanded).casefold())
+    if base_names & {
+        "config.yaml",
+        "roles.yaml",
+        ".env",
+        "auth.json",
+        "auth.lock",
+    }:
+        return (
+            "OneBot11 拒绝通过 file 工具写入 Hermes 安全敏感配置"
+            "（config.yaml / roles.yaml / .env / auth.json）；"
+            "权限与白名单由站长在 roles.yaml 维护。"
+        )
     return None
 
 

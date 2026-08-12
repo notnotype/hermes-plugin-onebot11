@@ -81,6 +81,7 @@ access_allowed = _proto.permissions.access_allowed
 role_prompt = _proto.permissions.role_prompt
 validate_tool_call = _proto.permissions.validate_tool_call
 terminal_writes_sensitive_config = _proto.permissions.terminal_writes_sensitive_config
+file_tool_writes_sensitive_config = _proto.permissions.file_tool_writes_sensitive_config
 handle_get_friend_msg_history = _proto.tools.handle_get_friend_msg_history
 handle_get_group_info = _proto.tools.handle_get_group_info
 handle_get_group_member_info = _proto.tools.handle_get_group_member_info
@@ -1967,10 +1968,12 @@ class OneBot11Adapter(BasePlatformAdapter):
             return
         current = self._long_running_notice_tasks.pop(lease_id, None)
         if current is not None and not current.done():
+            # 只有取消一个仍在等待的计时器才重新排程；提示已经发出后
+            # （task 已完成）不再重建，避免同一 turn 反复出现"仍在处理中"。
             current.cancel()
-        event = self._long_running_notice_events.get(lease_id)
-        if event is not None:
-            self._schedule_long_running_notice(event, lease_id)
+            event = self._long_running_notice_events.get(lease_id)
+            if event is not None:
+                self._schedule_long_running_notice(event, lease_id)
 
     async def _send_long_running_notice_after_delay(
         self,
@@ -7035,6 +7038,32 @@ def _pre_tool_call_hook(
                         "action": "block",
                         "message": f"权限错误: {config_error}",
                     }
+        if normalized_tool_name in {"write_file", "patch"}:
+            # Hermes file 工具只保护 config.yaml；roles.yaml 是插件自己的
+            # 白名单文件，必须在这里同样 fail-closed，防止 write_file/patch
+            # 绕过 terminal 兜底。
+            raw_path = (args or {}).get("path")
+            config_error = (
+                file_tool_writes_sensitive_config(str(raw_path))
+                if isinstance(raw_path, str)
+                else None
+            )
+            if config_error:
+                _safe_audit(
+                    adapter,
+                    "permission_denied",
+                    {
+                        "tool": normalized_tool_name,
+                        "user_id": binding.caller.user_id,
+                        "chat_type": binding.caller.chat_type,
+                        "chat_id": binding.caller.chat_id,
+                        "reason": config_error,
+                    },
+                )
+                return {
+                    "action": "block",
+                    "message": f"权限错误: {config_error}",
+                }
         if (
             binding.caller.adapter_epoch is not None
             and binding.caller.adapter_epoch != adapter._adapter_epoch
