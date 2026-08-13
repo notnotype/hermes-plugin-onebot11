@@ -5364,6 +5364,148 @@ async def test_群聊中间正文可配置为展示(monkeypatch, fake_http_serve
         await adapter.disconnect()
 
 
+async def test_队列turn在Hermes启动前发送即时确认(monkeypatch, fake_http_server):
+    """客服群 turn 必须先收到适配器确认，再进入 Hermes 工具/模型循环。"""
+    base, calls = fake_http_server
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API=base,
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_PROCESSING_REACTION_ENABLED="false",
+    )
+    adapter.show_interim_group = True
+    await adapter.connect()
+    message = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1001",
+        user_id="123",
+        user_name="小明",
+        text="请查一下项目怎么启动",
+        metadata={
+            "onebot11_authority": {
+                "role": "user",
+                "allowed_tools": sorted(adapter.role_tools["user"]),
+                "self_id": "1",
+            }
+        },
+        message_key="group:1001",
+    )
+    adapter._queue.enqueue(
+        message,
+        adapter_module.TriggerRequest.create(
+            "888",
+            message.message_key,
+            "mention",
+            "123",
+            "小明",
+            anchor_kind="hard",
+            authority_role="user",
+            authority_tools=adapter.role_tools["user"],
+            authority_self_id="1",
+        ),
+    )
+    lease = adapter._queue.claim("888")
+    assert lease is not None
+    observed: list[str] = []
+
+    async def capture_handle(_adapter, _event) -> None:
+        assert calls, "Hermes handoff 前必须已经完成即时回执"
+        assert "收到" not in _event.text
+        observed.append("hermes")
+
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", capture_handle)
+    try:
+        await adapter._start_queue_turn(lease)
+        assert observed == ["hermes"]
+        assert calls
+        assert calls[0]["path"] == "/send_group_msg"
+        first_message = calls[0]["params"]["message"]
+        assert first_message[0]["type"] == "reply"
+        assert "收到" in first_message[1]["data"]["text"]
+    finally:
+        await adapter.disconnect()
+
+
+async def test_活动lease尚未建立正式binding时允许受限出站(monkeypatch, fake_http_server):
+    """worker thread 的首次控制/中间出站不能因 binding 建立时序而被误拒绝。"""
+    base, calls = fake_http_server
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API=base,
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_PROCESSING_REACTION_ENABLED="false",
+    )
+    await adapter.connect()
+    message = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1002",
+        user_id="123",
+        user_name="小明",
+        text="需要先反馈",
+        metadata={
+            "onebot11_authority": {
+                "role": "user",
+                "allowed_tools": sorted(adapter.role_tools["user"]),
+                "self_id": "1",
+            }
+        },
+        message_key="group:1002",
+    )
+    adapter._queue.enqueue(
+        message,
+        adapter_module.TriggerRequest.create(
+            "888",
+            message.message_key,
+            "mention",
+            "123",
+            "小明",
+            anchor_kind="hard",
+            authority_role="user",
+            authority_tools=adapter.role_tools["user"],
+            authority_self_id="1",
+        ),
+    )
+    lease = adapter._queue.claim("888")
+    assert lease is not None
+    adapter._dispatcher._active["888"] = ActiveTurn(
+        lease=lease,
+        started_at=lease.claimed_at,
+    )
+    metadata = {
+        "onebot11_managed_context": True,
+        "onebot11_lease_id": lease.lease_id,
+        "onebot11_target": {"chat_type": "group", "chat_id": "888"},
+    }
+    event = SimpleNamespace(metadata=metadata)
+    event_token = adapter_module._CURRENT_EVENT.set(event)
+    caller_token = adapter_module._CURRENT_CALLER.set(None)
+    context_token = adapter_module._CURRENT_ONEBOT_CONTEXT.set(True)
+    try:
+        result = await adapter.send("888", "我先给你查一下", metadata=metadata)
+        assert result.success
+        assert calls and calls[0]["path"] == "/send_group_msg"
+        assert adapter._bindings.snapshot() == {}
+        monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+        blocked = adapter_module._pre_tool_call_hook(
+            tool_name="terminal",
+            session_id="",
+            turn_id="",
+            args={"command": "pwd"},
+            platform="onebot11",
+        )
+        assert blocked == {
+            "action": "block",
+            "message": "OneBot11 current turn binding unavailable",
+        }
+    finally:
+        adapter_module._CURRENT_ONEBOT_CONTEXT.reset(context_token)
+        adapter_module._CURRENT_CALLER.reset(caller_token)
+        adapter_module._CURRENT_EVENT.reset(event_token)
+        await adapter.disconnect()
+
+
 async def test_回复以问句或请求收尾时标记bot_asked(monkeypatch, fake_http_server):
     """bot 回复问句/请求信息时，完成 turn 应进入 deep engaged 预算。"""
     base, calls = fake_http_server

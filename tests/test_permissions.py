@@ -343,7 +343,7 @@ def test_客服只读提示要求先复用经验并自动后台委派():
     prompt = role_prompt(context, main_agent_read_only=True)
     assert "delegate_task" in prompt
     assert "自动放到后台" in prompt
-    assert "已有项目文档、客服记录和相关 skill" in prompt
+    assert "已有客服 evidence、项目 skill 和项目文档" in prompt
     assert "不要默认调用 skill_manage" in prompt
     assert "目录不可写时" in prompt
 

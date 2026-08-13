@@ -122,6 +122,9 @@ _REQUIRED_HERMES_HOOKS = frozenset(
     {"pre_gateway_dispatch", "pre_llm_call", "pre_tool_call"}
 )
 _CONTROL_PLANE_KINDS = frozenset({"long_running", "system_error_notice"})
+_TURN_START_ACK_TEXT = (
+    "收到，我先查一下已有资料；有现成答案我会直接回复，需要进一步验证的部分再后台处理。"
+)
 _CURRENT_CALLER: contextvars.ContextVar[CallerContext | None] = contextvars.ContextVar(
     "onebot11_current_caller", default=None
 )
@@ -533,6 +536,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._control_plane_sent_scopes: set[str] = set()
         self._long_running_notice_tasks: dict[str, asyncio.Task[None]] = {}
         self._long_running_notice_events: dict[str, Any] = {}
+        self._turn_start_ack_sent: set[str] = set()
         self._outbound_gate = asyncio.Lock()
         self._aux_event_count = 0
         self._adapter_epoch = 0
@@ -817,6 +821,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._control_plane_sent_scopes.clear()
         self._long_running_notice_tasks.clear()
         self._long_running_notice_events.clear()
+        self._turn_start_ack_sent.clear()
         self._bindings.clear()
 
     def _policy_config_signature(self) -> tuple[object, ...] | None:
@@ -2015,6 +2020,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                 chat_id,
                 "仍在处理中，请稍候…",
                 reply_to=str(metadata.get("onebot11_anchor_message_id") or "") or None,
+                lease_id=lease_id,
             )
             if not result.success:
                 logger.info(
@@ -2059,13 +2065,22 @@ class OneBot11Adapter(BasePlatformAdapter):
         content: str,
         *,
         reply_to: str | None = None,
+        lease_id: str | None = None,
     ) -> SendResult:
         """发送一条不带 Hermes turn 身份的控制面提示消息。"""
         if self._closed or self._ws is None:
             return SendResult(False, error="OneBot11 adapter is closed", error_kind="not_found")
+        if not self._chat_access_allowed("group", str(chat_id)):
+            return SendResult(False, error="OneBot11 target 不再满足访问策略", error_kind="permission")
+        if lease_id and not self._lease_is_current(lease_id):
+            return SendResult(False, error="OneBot11 lease 已失效，拒绝控制面出站", error_kind="fenced")
         try:
             async with self._outbound_gate:
-                if self._closed:
+                if (
+                    self._closed
+                    or not self._chat_access_allowed("group", str(chat_id))
+                    or (lease_id is not None and not self._lease_is_current(lease_id))
+                ):
                     return SendResult(False, error="OneBot11 adapter is closed", error_kind="not_found")
                 sent_id = await self._api.send_message(
                     chat_id,
@@ -3665,6 +3680,35 @@ class OneBot11Adapter(BasePlatformAdapter):
         media_dir = self._new_media_dir() if has_images else self._media_dir
         handed_off = False
         try:
+            # 客服群开启中间反馈时，先发送确定性的中文回执，再进入媒体、模型
+            # 和工具循环；这条控制面消息不进入 Hermes transcript。
+            if self.show_interim_group and lease.lease_id not in self._turn_start_ack_sent:
+                self._turn_start_ack_sent.add(lease.lease_id)
+                try:
+                    ack_result = await self._send_notice_message(
+                        lease.chat_id,
+                        _TURN_START_ACK_TEXT,
+                        reply_to=reply_id,
+                        lease_id=lease.lease_id,
+                    )
+                except Exception as exc:
+                    # 首条回执是体验增强，不得把 OneBot 控制面故障升级成
+                    # Hermes turn 启动失败；业务 turn 仍继续执行。
+                    ack_result = SendResult(
+                        False,
+                        error=f"首条回执发送异常: {type(exc).__name__}",
+                        error_kind="unknown",
+                    )
+                _safe_audit(
+                    self,
+                    "turn_start_ack",
+                    {
+                        "chat_id": lease.chat_id,
+                        "lease_id": lease.lease_id,
+                        "sent": bool(ack_result.success),
+                        "error_kind": ack_result.error_kind,
+                    },
+                )
             reaction_message_id = await self._set_processing_reaction(lease, enabled=True)
             if reaction_message_id is not None:
                 self._processing_reaction_message_ids[lease.lease_id] = reaction_message_id
@@ -3839,6 +3883,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                 _CURRENT_EVENT.reset(event_token)
         finally:
             if not handed_off:
+                self._turn_start_ack_sent.discard(lease.lease_id)
                 self._lease_session_keys.pop(lease.lease_id, None)
                 await self._clear_processing_reaction(lease.lease_id)
                 self._cleanup_media(
@@ -4779,6 +4824,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                         exc_info=True,
                     )
             self._unknown_leases.discard(lease_id)
+            self._turn_start_ack_sent.discard(lease_id)
             self._outbound_started.discard(lease_id)
             self._outbound_successful.discard(lease_id)
             self._outbound_known_failure.discard(lease_id)
@@ -6217,7 +6263,182 @@ class OneBot11Adapter(BasePlatformAdapter):
         metadata: Mapping[str, Any] | None = None,
     ) -> TurnBinding | None:
         """读取出站 binding 的统一入口，显式传入当前目标。"""
-        return self._binding_from_context(metadata, chat_id=str(chat_id))
+        binding = self._binding_from_context(metadata, chat_id=str(chat_id))
+        if binding is not None:
+            return binding
+        # Hermes 某些状态/stream 回调可能在 worker thread 中先于
+        # pre_llm_call 传播 session/turn 坐标。出站可以使用当前群唯一
+        # active lease 的受限 caller snapshot，但绝不能把这个 snapshot 写入
+        # TurnBindingStore，也不能让它成为工具 hook 的身份来源。
+        return self._active_lease_outbound_binding(str(chat_id), metadata)
+
+    def _active_lease_outbound_binding(
+        self,
+        chat_id: str,
+        metadata: Mapping[str, Any] | None,
+    ) -> TurnBinding | None:
+        """在正式 turn binding 建立前恢复仅供出站使用的临时 binding。
+
+        该路径只接受当前群唯一活动 lease 加上适配器生成的完整 caller
+        snapshot；不接受 session key、最近来源或默认目标推断。返回的 binding
+        不写入 store，因此 pre_tool_call 仍会因缺少正式 binding 而拒绝。
+        """
+        if _CURRENT_BINDING.get() is not None:
+            # ContextVar 中有旧/失效 binding 时必须 fail-closed，不能用 lease
+            # fallback 把旧 task 重新放行。
+            return None
+        current_event = _CURRENT_EVENT.get()
+        event_metadata = getattr(current_event, "metadata", None) or {}
+        sources = [
+            source
+            for source in (event_metadata, metadata)
+            if isinstance(source, Mapping)
+        ]
+        if not sources:
+            return None
+        if not any(
+            source.get("onebot11_managed_context") is True
+            or source.get("onebot11_lease_id")
+            for source in sources
+        ):
+            return None
+        # 出现正式 binding key 时，说明调用方已经有明确坐标但该 binding
+        # 无效；不能把旧 task 当作尚未绑定的时序窗口重新放行。
+        if any(_binding_key_from_metadata(source) is not None for source in sources):
+            return None
+        lease_ids = {
+            str(source.get("onebot11_lease_id") or "").strip()
+            for source in sources
+            if str(source.get("onebot11_lease_id") or "").strip()
+        }
+        if len(lease_ids) != 1:
+            return None
+        lease_id = next(iter(lease_ids))
+        active = self._dispatcher.active(str(chat_id))
+        if active is None or active.lease_lost or active.lease.lease_id != lease_id:
+            return None
+        if not self._lease_matches_target(lease_id, "group", str(chat_id)):
+            return None
+
+        # caller 的权限不能由 Hermes 回调 metadata 决定；从已经通过
+        # _start_queue_turn 校验的持久 anchor authority 重建本轮上限。
+        anchor_message = self._anchor_message(active.lease)
+        trigger = active.lease.trigger
+        authority_role = str(trigger.authority_role or "")
+        authority_self_id = str(trigger.authority_self_id or "").strip()
+        if (
+            anchor_message is None
+            or authority_role not in ROLE_NAMES
+            or authority_self_id != self.self_id
+        ):
+            return None
+        expected_caller = CallerContext(
+            user_id=str(anchor_message.user_id),
+            chat_type="group",
+            chat_id=str(chat_id),
+            role=authority_role,
+            allowed_tools=frozenset(
+                tool
+                for tool in trigger.authority_tools
+                if tool not in FORBIDDEN_TOOL_NAMES
+            ),
+            lease_id=lease_id,
+            self_id=self.self_id,
+            adapter_epoch=self._adapter_epoch,
+        )
+
+        raw_targets: list[ChatTarget] = []
+        caller_snapshots: list[CallerContext] = []
+        for source in sources:
+            raw_target = source.get("onebot11_target")
+            if raw_target is not None:
+                if not isinstance(raw_target, Mapping):
+                    return None
+                try:
+                    target = ChatTarget(
+                        str(raw_target["chat_type"]),
+                        str(raw_target["chat_id"]),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    return None
+                raw_targets.append(target)
+            raw_caller = source.get("onebot11_caller_context")
+            if raw_caller is not None:
+                caller = self._outbound_caller_from_snapshot(raw_caller, lease_id)
+                if caller is None or caller != expected_caller:
+                    return None
+                caller_snapshots.append(caller)
+        if raw_targets and any(
+            target != ChatTarget("group", str(chat_id)) for target in raw_targets
+        ):
+            return None
+        if any(candidate != expected_caller for candidate in caller_snapshots):
+            return None
+        current_caller = _CURRENT_CALLER.get()
+        if current_caller is not None and current_caller != expected_caller:
+            return None
+        return TurnBinding(
+            session_id=f"onebot11-prebinding:{lease_id}",
+            turn_id="outbound-only",
+            caller=expected_caller,
+            lease_id=lease_id,
+        )
+
+    def _outbound_caller_from_snapshot(
+        self,
+        value: Any,
+        lease_id: str,
+    ) -> CallerContext | None:
+        """解析适配器生成的 caller snapshot，供受限出站 fallback 使用。"""
+        if not isinstance(value, Mapping):
+            return None
+        try:
+            user_id = str(value["user_id"])
+            chat_type = str(value["chat_type"])
+            chat_id = str(value["chat_id"])
+            role = str(value["role"])
+            self_id = str(value["self_id"] or "").strip()
+            raw_epoch = value.get("adapter_epoch")
+            epoch = (
+                int(raw_epoch)
+                if raw_epoch is not None and not isinstance(raw_epoch, bool)
+                else None
+            )
+            raw_tools = value["allowed_tools"]
+        except (KeyError, TypeError, ValueError):
+            return None
+        if (
+            not user_id
+            or chat_type != "group"
+            or not chat_id
+            or role not in ROLE_NAMES
+            or not self_id
+            or self_id != self.self_id
+            or epoch != self._adapter_epoch
+            or not isinstance(raw_tools, (list, tuple, set, frozenset))
+            or any(not isinstance(tool, str) for tool in raw_tools)
+        ):
+            return None
+        snapshot_lease = str(value.get("lease_id") or "").strip()
+        if snapshot_lease != lease_id:
+            return None
+        if not self._chat_access_allowed("group", chat_id, user_id):
+            return None
+        allowed_tools = frozenset(
+            tool.strip()
+            for tool in raw_tools
+            if tool.strip() and tool.strip() not in FORBIDDEN_TOOL_NAMES
+        )
+        return CallerContext(
+            user_id=user_id,
+            chat_type=chat_type,
+            chat_id=chat_id,
+            role=role,
+            allowed_tools=allowed_tools,
+            lease_id=lease_id,
+            self_id=self_id,
+            adapter_epoch=epoch,
+        )
 
     def _resolve_binding(self, session_id: str | None, turn_id: str | None) -> TurnBinding | None:
         """按完整 Hermes 路由键读取 caller，不使用最近来源缓存。"""

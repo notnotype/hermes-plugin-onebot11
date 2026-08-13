@@ -18,7 +18,7 @@
 
 群消息即使没有 @、关键词或 `always` trigger，也会先写入 SQLite 队列；这保证触发时能拿到上次触发以来的上下文。没有 trigger 不会启动 Agent turn。
 
-群 turn 认领后，插件默认使用 LLBot 的 `set_msg_emoji_like` 扩展给触发消息添加 `emoji_id=128172`（💬，表示正在回复这一条，可通过 `processing_reaction_emoji_id` 配置），Hermes turn 收尾时发送 `set=false` 移除。问句/记忆候选进入旁路 selector 判断时，先给候选消息添加 `emoji_id=128064`（👀，表示 bot 正在看这条消息），判断结束（触发、忽略、超时或 wait 到期）后移除。两个指示器都只作用于当前群的真实消息 ID；内部 hash、私聊消息或 lease 已失效时跳过。reaction 是 best-effort UI 提示，失败或结果未知不会阻断 Agent 回复、队列 ack，也不会重放 `set=true`。清理记录持久化在队列 SQLite 中，启动恢复最多有限次数地尝试 `unset`；达到上限后只在状态/审计中保留，不会无限刷屏。进程硬崩溃遗留的远端 💬/👀 不纳入清理承诺。emoji ID 说明：`9203`（⏳）与 `8971` 在 QQ reaction API 上显示异常，因此回复阶段默认使用实测可用的 `128172`（💬）。
+群 turn 认领后，若开启 `show_interim_group`，插件会先发送一次不进入 Hermes transcript 的中文收到回执，再使用 LLBot 的 `set_msg_emoji_like` 扩展给触发消息添加 `emoji_id=128172`（💬，表示正在回复这一条，可通过 `processing_reaction_emoji_id` 配置），Hermes turn 收尾时发送 `set=false` 移除。问句/记忆候选进入旁路 selector 判断时，先给候选消息添加 `emoji_id=128064`（👀，表示 bot 正在看这条消息），判断结束（触发、忽略、超时或 wait 到期）后移除。两个指示器都只作用于当前群的真实消息 ID；内部 hash、私聊消息或 lease 已失效时跳过。reaction 是 best-effort UI 提示，失败或结果未知不会阻断 Agent 回复、队列 ack，也不会重放 `set=true`。清理记录持久化在队列 SQLite 中，启动恢复最多有限次数地尝试 `unset`；达到上限后只在状态/审计中保留，不会无限刷屏。进程硬崩溃遗留的远端 💬/👀 不纳入清理承诺。emoji ID 说明：`9203`（⏳）与 `8971` 在 QQ reaction API 上显示异常，因此回复阶段默认使用实测可用的 `128172`（💬）。
 
 ## 角色与工具
 
@@ -140,7 +140,7 @@ Hermes 的 file 工具对 `~/.hermes/config.yaml` 有写保护；OneBot 侧在
 ## 身份传递
 
 每次入站 turn 都创建不可变 `CallerContext`。Hermes 的 `session_key` 只用于 session 路由，不能当作身份；工具身份按完整 `(session_id, turn_id)` 绑定。handler 或 hook 只收到其中一个坐标时，不得使用 ContextVar 猜测缺失的另一个坐标，必须 fail-closed。
-Hermes 的 worker thread 与 async final delivery 可能不共享 `ContextVar`；最终文本和图片出站在缺少当前 task binding 时，只能从当前 synthetic event 的精确 `onebot11_binding_key` 恢复，并继续校验 binding store、adapter epoch、机器人 `self_id`、lease、目标和访问策略。没有该 key、key 冲突或恢复失败时不访问 OneBot。
+Hermes 的 worker thread 与 async final delivery 可能不共享 `ContextVar`；最终文本和图片出站在缺少当前 task binding 时，优先从当前 synthetic event 的精确 `onebot11_binding_key` 恢复；在 binding 尚未建立但当前群仍持有唯一有效 lease 时，插件只为业务出站使用由 anchor authority 重建的临时 snapshot，不写入正式 binding，也不允许工具 hook 使用它。两条路径都继续校验 binding store、adapter epoch、机器人 `self_id`、lease、目标和访问策略。没有可验证身份、key 冲突或恢复失败时不访问 OneBot。
 
 出站目标使用明确的 `ChatTarget(group|dm, chat_id)`。当前 turn 只能向它绑定的目标发送；同一个数字同时被识别为群号和 QQ 号时，未带明确类型的发送会被拒绝。
 
