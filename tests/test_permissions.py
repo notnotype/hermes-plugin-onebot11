@@ -325,6 +325,29 @@ def test_只读提示保留QQ写工具与确认说明():
     assert "/onebot confirm" in prompt
 
 
+def test_客服只读提示要求先复用经验并自动后台委派():
+    """客服主 agent 应先查已有经验，并使用 Hermes 的顶层后台委派合同。"""
+    context = CallerContext(
+        user_id="1259901822",
+        chat_type="group",
+        chat_id="942513604",
+        role="user",
+        allowed_tools=frozenset({
+            "read_file",
+            "search_files",
+            "web_search",
+            "delegate_task",
+        }),
+        self_id="3101482118",
+    )
+    prompt = role_prompt(context, main_agent_read_only=True)
+    assert "delegate_task" in prompt
+    assert "自动放到后台" in prompt
+    assert "已有项目文档、客服记录和相关 skill" in prompt
+    assert "不要默认调用 skill_manage" in prompt
+    assert "目录不可写时" in prompt
+
+
 def test_terminal写敏感配置被拦截():
     """terminal 写 config.yaml/roles.yaml/.env 等必须被 OneBot 侧拒绝。"""
     assert terminal_writes_sensitive_config("sed -i 's/a/b/' ~/.hermes/config.yaml") is not None

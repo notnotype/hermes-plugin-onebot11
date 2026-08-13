@@ -501,6 +501,103 @@ async def test_worker线程建立binding后async最终出站可恢复精确bindi
         await adapter.disconnect()
 
 
+async def test_worker_binding丢失event_metadata时仍按当前活动lease恢复出站(monkeypatch):
+    """Hermes status/interim callback 只带 chat_id 时仍恢复唯一活动 turn。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    adapter._ws = object()
+    adapter._chat_types["888"] = "group"
+    adapter.show_interim_group = True
+    message = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="1001",
+        user_id="123",
+        user_name="小明",
+        text="复杂任务",
+        message_key="group:1001",
+    )
+    adapter._queue.enqueue(
+        message,
+        adapter_module.TriggerRequest.create(
+            "888",
+            message.message_key,
+            "mention",
+            "123",
+            "小明",
+            authority_role="user",
+            authority_tools=adapter.role_tools["user"],
+            authority_self_id="1",
+        ),
+    )
+    lease = adapter._queue.claim("888")
+    assert lease is not None
+    adapter._dispatcher._active["888"] = ActiveTurn(
+        lease=lease,
+        started_at=lease.claimed_at,
+    )
+    caller = replace(
+        adapter._caller_for_event(
+            SimpleNamespace(user_id="123", chat_type="group", chat_id="888")
+        ),
+        lease_id=lease.lease_id,
+    )
+    binding = adapter_module.TurnBinding(
+        "worker-session",
+        "worker-turn",
+        caller,
+        lease.lease_id,
+    )
+    adapter._bindings.bind(binding)
+    calls: list[str] = []
+
+    async def fake_send_message(
+        _target_id: str,
+        content: str,
+        *,
+        chat_type: str,
+        reply_to: str | None = None,
+    ) -> str:
+        del chat_type, reply_to
+        calls.append(content)
+        return "reply-lease-fallback"
+
+    monkeypatch.setattr(adapter._api, "send_message", fake_send_message)
+    # 复现 Hermes 的 status/interim callback：它回到 gateway loop 时没有
+    # worker 的 ContextVar，只保留 synthetic event 的 lease/目标 lineage。
+    event = SimpleNamespace(
+        metadata={
+            "onebot11_managed_context": True,
+            "onebot11_lease_id": lease.lease_id,
+            "onebot11_target": {"chat_type": "group", "chat_id": "888"},
+        }
+    )
+    event_token = adapter_module._CURRENT_EVENT.set(event)
+    caller_token = adapter_module._CURRENT_CALLER.set(None)
+    binding_token = adapter_module._CURRENT_BINDING.set(None)
+    onebot_token = adapter_module._CURRENT_ONEBOT_CONTEXT.set(False)
+    try:
+        result = await adapter.send(
+            "888",
+            "中途进度",
+            metadata={
+                "onebot11_target": {"chat_type": "group", "chat_id": "888"},
+            },
+        )
+        assert result.success
+        assert calls == ["中途进度"]
+    finally:
+        adapter_module._CURRENT_ONEBOT_CONTEXT.reset(onebot_token)
+        adapter_module._CURRENT_BINDING.reset(binding_token)
+        adapter_module._CURRENT_CALLER.reset(caller_token)
+        adapter_module._CURRENT_EVENT.reset(event_token)
+        adapter._dispatcher._active.pop("888", None)
+        await adapter.disconnect()
+
+
 async def test出站binding缺失或session_turn不匹配时不访问OneBot(monkeypatch):
     """managed turn 没有精确 binding 时必须 fail-closed。"""
     adapter = _make_adapter(

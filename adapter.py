@@ -5034,7 +5034,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         metadata: Mapping[str, Any],
     ) -> SendResult:
         """发送 Hermes 明确标记的控制面消息，不污染业务 lease 状态。"""
-        binding = self._binding_from_context(metadata)
+        binding = self._binding_for_outbound(chat_id, metadata)
         if self._closed:
             return SendResult(False, error="OneBot11 adapter is closed", error_kind="not_found")
         managed_context = bool(
@@ -5247,8 +5247,9 @@ class OneBot11Adapter(BasePlatformAdapter):
                     error="OneBot11 中间正文按配置隐藏",
                     error_kind="interim_hidden",
                 )
-        binding = self._binding_from_context(
-            metadata if isinstance(metadata, Mapping) else None
+        binding = self._binding_for_outbound(
+            chat_id,
+            metadata if isinstance(metadata, Mapping) else None,
         )
         current_event = _CURRENT_EVENT.get()
         current_event_metadata = getattr(current_event, "metadata", None) or {}
@@ -5468,8 +5469,9 @@ class OneBot11Adapter(BasePlatformAdapter):
         preflight = self._preflight_image_delivery(chat_id, metadata)
         if preflight is not None:
             return preflight
-        binding = self._binding_from_context(
-            metadata if isinstance(metadata, Mapping) else None
+        binding = self._binding_for_outbound(
+            chat_id,
+            metadata if isinstance(metadata, Mapping) else None,
         )
         current_event = _CURRENT_EVENT.get()
         lease_id = binding.lease_id if binding else None
@@ -5655,7 +5657,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         metadata: Mapping[str, Any] | None,
     ) -> SendResult | None:
         """在图片下载或 OneBot 请求前校验身份、目标、权限和连接。"""
-        binding = self._binding_from_context(metadata)
+        binding = self._binding_for_outbound(chat_id, metadata)
         current_event = _CURRENT_EVENT.get()
         current_event_metadata = getattr(current_event, "metadata", None) or {}
         managed_context = bool(
@@ -5748,8 +5750,9 @@ class OneBot11Adapter(BasePlatformAdapter):
                 for _image_url, _caption in images
             ]
 
-        binding = self._binding_from_context(
-            metadata if isinstance(metadata, Mapping) else None
+        binding = self._binding_for_outbound(
+            chat_id,
+            metadata if isinstance(metadata, Mapping) else None,
         )
         current_event = _CURRENT_EVENT.get()
         current_event_metadata = getattr(current_event, "metadata", None) or {}
@@ -6079,8 +6082,10 @@ class OneBot11Adapter(BasePlatformAdapter):
     def _binding_from_context(
         self,
         metadata: Mapping[str, Any] | None = None,
+        *,
+        chat_id: str | None = None,
     ) -> TurnBinding | None:
-        """优先读取 ContextVar，缺失时按 event metadata 恢复精确 binding。"""
+        """恢复当前 turn binding；缺失 metadata 时仅允许唯一活动 lease。"""
         current_event = _CURRENT_EVENT.get()
         event_metadata = getattr(current_event, "metadata", None) or {}
         sources = [
@@ -6133,7 +6138,60 @@ class OneBot11Adapter(BasePlatformAdapter):
             return context_binding
 
         if metadata_key is None:
-            return None
+            # Hermes 的中途/状态回调可能只携带 chat_id。此时不从
+            # session key 或最近来源猜测身份，只接受该群唯一活动 lease
+            # 对应的 binding，并继续执行完整 fencing 校验。
+            onebot_evidence = bool(_CURRENT_ONEBOT_CONTEXT.get()) or any(
+                isinstance(source, Mapping)
+                and any(
+                    source.get(key) is not None
+                    for key in (
+                        "onebot11_managed_context",
+                        "onebot11_lease_id",
+                        "onebot11_caller_context",
+                        "onebot11_binding_key",
+                    )
+                )
+                for source in sources
+            )
+            if not onebot_evidence:
+                return None
+            if chat_id is None:
+                return None
+            normalized_chat_id = str(chat_id).strip()
+            if not normalized_chat_id:
+                return None
+            active = self._dispatcher.active(normalized_chat_id)
+            if active is None or active.lease_lost:
+                return None
+            binding = self._bindings.get_by_lease(active.lease.lease_id)
+            if binding is None:
+                return None
+            if current_caller is not None and current_caller != binding.caller:
+                return None
+            for source in sources:
+                raw_lease_id = str(source.get("onebot11_lease_id") or "").strip()
+                if raw_lease_id and raw_lease_id != str(binding.lease_id or ""):
+                    return None
+                raw_caller = source.get("onebot11_caller_context")
+                if isinstance(raw_caller, Mapping):
+                    if any(
+                        str(raw_caller.get(name) or "")
+                        != str(getattr(binding.caller, name) or "")
+                        for name in ("user_id", "chat_type", "chat_id", "lease_id", "self_id")
+                    ):
+                        return None
+            if (
+                binding.caller.chat_type != "group"
+                or binding.caller.chat_id != normalized_chat_id
+                or not self._binding_is_current(
+                    binding,
+                    require_self_id=True,
+                    check_lease=True,
+                )
+            ):
+                return None
+            return binding
         binding = self._bindings.get(*metadata_key)
         if binding is None:
             return None
@@ -6152,6 +6210,14 @@ class OneBot11Adapter(BasePlatformAdapter):
             if raw_lease_id and raw_lease_id != str(binding.lease_id or ""):
                 return None
         return binding
+
+    def _binding_for_outbound(
+        self,
+        chat_id: str,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> TurnBinding | None:
+        """读取出站 binding 的统一入口，显式传入当前目标。"""
+        return self._binding_from_context(metadata, chat_id=str(chat_id))
 
     def _resolve_binding(self, session_id: str | None, turn_id: str | None) -> TurnBinding | None:
         """按完整 Hermes 路由键读取 caller，不使用最近来源缓存。"""

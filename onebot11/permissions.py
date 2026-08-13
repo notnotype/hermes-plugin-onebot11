@@ -311,6 +311,19 @@ class TurnBindingStore:
         with self._lock:
             return MappingProxyType(dict(self._bindings))
 
+    def get_by_lease(self, lease_id: str | None) -> TurnBinding | None:
+        """按唯一 lease 查找 binding；多个候选时 fail-closed。"""
+        normalized = str(lease_id or "").strip()
+        if not normalized:
+            return None
+        with self._lock:
+            matches = [
+                binding
+                for binding in self._bindings.values()
+                if str(binding.lease_id or "") == normalized
+            ]
+        return matches[0] if len(matches) == 1 else None
+
     def clear(self) -> None:
         """清理 reconnect 前遗留的所有短生命周期绑定。"""
         with self._lock:
@@ -556,6 +569,13 @@ def role_prompt(
             "\n- 当前主 agent 是只读模式：可以使用 read_file/search_files（Grep/Glob 内容与文件搜索）、"
             "web_search/web_extract、vision_analyze 等只读工具；需要 terminal、process、"
             "write_file、patch 或 execute_code 时必须通过 delegate_task 交给子代理。"
+            "遇到复杂、耗时或需要运行项目工具的任务，应先给用户一条简短中文进度，"
+            "再优先调用 delegate_task 交给子代理；Hermes 会把顶层委派自动放到后台，"
+            "主 agent 负责澄清、"
+            "汇总和最终回复。开始新调研前先查已有项目文档、客服记录和相关 skill，"
+            "不要默认调用 skill_manage 修改自身 skill；只有用户明确要求沉淀经验时才维护 skill。"
+            "每个客服任务完成后应由子代理把摘要写入 evidence/documentation；目录不可写时"
+            "记录失败但仍继续把已验证结论回复给用户。"
             "QQ 群管理写工具（撤回/禁言/踢人/全员禁言）不受只读限制，仅超级管理员可用，"
             "且必须先通过 /onebot confirm。"
             if main_agent_read_only and not delegated_child
