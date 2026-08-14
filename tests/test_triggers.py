@@ -174,6 +174,47 @@ def test_llm触发失败上限可配置且拒绝越界():
                 }
             }
         )
+def test_selector默认客服参数与疑似问句候选():
+    """客服默认使用 2 秒 debounce，疑似问法只进入 selector 候选。"""
+    config = build_trigger_config({})
+    assert config.debounce_seconds == 2.0
+    assert config.llm_provider == "deepseek"
+    assert config.llm_model == "deepseek-v4-flash"
+    state = LayeredTriggerState(config)
+    for index, text in enumerate(
+        (
+            "有没有办法处理这个？",
+            "想问一下这个怎么弄",
+            "请教一下项目要放哪",
+            "能不能帮忙看一下",
+            "这个正常吗",
+        ),
+        start=1,
+    ):
+        action = state.observe_message(
+            chat_type="group",
+            text=text,
+            mentioned_self=False,
+            has_context=False,
+            revision=index,
+            now=float(index),
+        )
+        assert action.kind == "schedule"
+        state.invalidate_judgement()
+
+
+def test_selector提示词不会把疑问词当作必答触发():
+    """疑问词只能提供候选信号，群成员闲聊仍明确默认 ignore。"""
+    prompt = build_llm_trigger_input(
+        "",
+        (),
+        4_000,
+        candidate_type="question",
+    )
+    assert "必须 trigger" not in prompt
+    assert "只代表候选" in prompt
+    assert "明确向机器人求助" in prompt
+    assert "群成员之间的互动" in prompt
 
 
 def test_分层状态机只让候选消息进入仲裁():
@@ -794,8 +835,8 @@ def test_is_question不误报非提问消息():
     assert not is_question("今天天气不错")
 
 
-def test_selector提示词包含问句触发规则():
-    """合同必须显式说明问句触发规则，避免低价模型把无问号问句判成 ignore。"""
+def test_selector提示词说明问句仅是候选():
+    """合同明确问句只唤醒候选，模型仍需判断是否确实需要回复。"""
     prompt = build_llm_trigger_input(
         "",
         (
@@ -812,13 +853,15 @@ def test_selector提示词包含问句触发规则():
         max_bytes=12_000,
         candidate_type="question",
     )
-    assert "必须 trigger" in prompt
-    assert "与当前对话无关的闲聊" in prompt
+    assert "只代表候选" in prompt
+    assert "明确向机器人求助" in prompt
+    assert "不等于必须回复" in prompt
+    assert "必须 trigger" not in prompt
     assert '{"decision":"trigger","anchor_seq":123}' in prompt
 
 
 def test_selector_engaged提示词默认ignore成员互动():
-    """engaged 候选必须包含问句硬规则，同时默认 ignore 成员互动。"""
+    """engaged 候选仍需区分真实追问与群成员互动。"""
     prompt = build_llm_trigger_input(
         "",
         (
@@ -836,7 +879,7 @@ def test_selector_engaged提示词默认ignore成员互动():
         candidate_type="engaged",
     )
     assert "候选类型：engaged" in prompt
-    assert "必须 trigger" in prompt
+    assert "只代表候选" in prompt
     assert "延续与机器人的对话" in prompt
     assert "默认 ignore" in prompt
 

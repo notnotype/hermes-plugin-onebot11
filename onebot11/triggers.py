@@ -45,7 +45,7 @@ class TriggerConfig:
         "继续",
         "接着",
     )
-    debounce_seconds: float = 5.0
+    debounce_seconds: float = 2.0
     engaged_idle_seconds: float = 60.0
     engaged_max_seconds: float = 300.0
     engaged_max_arbitrations: int = 2
@@ -764,6 +764,14 @@ QUESTION_WORDS = (
     "多久",
     "几点",
     "什么时候",
+    "有没有",
+    "想问一下",
+    "请教一下",
+    "这个怎么弄",
+    "要放哪",
+    "能不能帮忙",
+    "有没有办法",
+    "这个正常吗",
 )
 ENGLISH_QUESTION_RE = re.compile(
     r"\b(?:who|what|when|where|why|how|can|could|would|should|do|does|did|is|are|will)\b",
@@ -826,17 +834,19 @@ def build_trigger_config(extra: dict[str, Any]) -> TriggerConfig:
         default=False,
         name="llm_trigger_enabled",
     )
+    provider_default = "deepseek" if not llm_enabled else ""
+    model_default = "deepseek-v4-flash" if not llm_enabled else ""
     raw_provider = _setting(
         extra,
         raw_llm,
         "llm_trigger_provider",
-        raw_llm.get("provider", ""),
+        raw_llm.get("provider", provider_default),
     )
     raw_model = _setting(
         extra,
         raw_llm,
         "llm_trigger_model",
-        raw_llm.get("model", ""),
+        raw_llm.get("model", model_default),
     )
     if raw_provider is None:
         raw_provider = ""
@@ -918,7 +928,7 @@ def build_trigger_config(extra: dict[str, Any]) -> TriggerConfig:
         maximum=32,
     )
     debounce = _bounded_float(
-        _setting(extra, raw_llm, "trigger_debounce_seconds", 5),
+        _setting(extra, raw_llm, "trigger_debounce_seconds", 2),
         name="trigger_debounce_seconds",
         minimum=0.1,
         maximum=60.0,
@@ -1195,12 +1205,13 @@ def build_llm_trigger_input(
     max_bytes: int,
     candidate_type: str = "candidate",
 ) -> str:
-    """按字节预算拼接输入，始终保留 JSON 合同和最新消息。"""
     max_bytes = max(1, int(max_bytes))
     queued = tuple(messages)
     latest = queued[-1] if queued else None
-    question_words = "、".join(QUESTION_WORDS)
-    question_rule = f"最新消息含问号或疑问词（{question_words}）必须 trigger；"
+    question_rule = (
+        "问号或常见疑问词（吗、什么、怎么、为什么、哪里、如何、能不能、请问、有没有等）只代表候选；"
+        "只有明确向机器人求助或问题与项目上下文相关时才 trigger。"
+    )
     if candidate_type == "engaged":
         rules = (
             question_rule,
@@ -1210,7 +1221,8 @@ def build_llm_trigger_input(
     else:
         rules = (
             question_rule,
-            "明显与当前对话无关的闲聊才 ignore。",
+            "群成员之间的互动、评论、调侃、@其他人、无项目上下文的陈述句默认 ignore。",
+            "疑似问句不等于必须回复；不确定时选择 ignore。",
         )
     contract = "\n".join(
         (
@@ -1248,45 +1260,40 @@ def build_llm_trigger_input(
         for message in queued[:-1]
     )
 
-    # 配置下限足以容纳完整 JSON 合同时，优先保留合同，再裁剪最新消息
-    # 正文；只有调用方传入小于合同本身的测试预算时才退化为最新消息。
     latest_bytes = byte_len(latest_line)
     prefix_bytes = byte_len(queue_prefix)
-    if prefix_bytes >= max_bytes:
-        return truncate(latest_line, max_bytes)
-    latest_budget = max_bytes - prefix_bytes
-    if latest_bytes > latest_budget:
-        return queue_prefix + truncate(latest_line, latest_budget)
-    lead_budget = max_bytes - latest_bytes
+    if prefix_bytes + latest_bytes + 1 <= max_bytes:
+        available = max_bytes - prefix_bytes - latest_bytes - 1
+        selected: list[str] = []
+        used = 0
+        for line in reversed(optional):
+            line_bytes = byte_len(line) + 1
+            if used + line_bytes > available:
+                break
+            selected.insert(0, line)
+            used += line_bytes
+        optional_text = "\n".join(selected)
+        if optional_text:
+            optional_text += "\n"
+        return queue_prefix + optional_text + truncate(
+            latest_line,
+            max_bytes - prefix_bytes - byte_len(optional_text),
+        )
 
-    available = lead_budget - prefix_bytes
-    selected_newest_first: list[str] = []
-    used = 0
-    for line in reversed(optional):
-        line_bytes = byte_len(line) + 1
-        if used + line_bytes > available:
-            break
-        selected_newest_first.append(line)
-        used += line_bytes
-    selected = list(reversed(selected_newest_first))
-    omitted = len(optional) - len(selected)
-    if omitted:
-        marker = f"[已省略 {omitted} 条更早上下文]"
-        marker_bytes = byte_len(marker) + 1
-        while selected and used + marker_bytes > available:
-            removed = selected.pop(0)
-            used -= byte_len(removed) + 1
-        if used + marker_bytes <= available:
-            selected.insert(0, marker)
-            used += marker_bytes
-    optional_text = ("\n".join(selected) + "\n") if selected else ""
-    result = queue_prefix + optional_text + latest_line
-    if byte_len(result) <= max_bytes:
-        return result
-    # 这是最后一道合同保护：无论调用方传入多小的预算，都不能
-    # 返回超限输入；尾部包含完整或受限的最新消息。
-    return truncate(queue_prefix, max(0, max_bytes - latest_bytes - 1)) + "\n" + latest_line
-
+    compact_prefix = "\n".join(
+        (
+            f"OneBot11 selector；候选类型：{candidate_type}。",
+            "问句只代表候选；明确向机器人求助、项目上下文或延续与机器人的对话才 trigger；",
+            "群成员之间的互动默认 ignore；疑似问句不等于必须回复；不确定时选择 ignore。",
+            'trigger={"decision":"trigger","anchor_seq":123}',
+            'wait={"decision":"wait","anchor_seq":null}',
+            'ignore={"decision":"ignore","anchor_seq":null}',
+        )
+    )
+    compact_bytes = byte_len(compact_prefix)
+    if compact_bytes < max_bytes:
+        return compact_prefix + "\n" + truncate(latest_line, max_bytes - compact_bytes - 1)
+    return truncate(latest_line, max_bytes)
 
 def keyword_matches(text: str, keywords: Iterable[str]) -> bool:
     """使用 Unicode casefold 的普通子串匹配关键词。"""

@@ -122,6 +122,27 @@ _REQUIRED_HERMES_HOOKS = frozenset(
     {"pre_gateway_dispatch", "pre_llm_call", "pre_tool_call"}
 )
 _CONTROL_PLANE_KINDS = frozenset({"long_running", "system_error_notice"})
+_TOOL_PROGRESS_LABELS = {
+    "read_file": "正在读取项目文件",
+    "search_files": "正在搜索项目内容",
+    "web_search": "正在搜索网页资料",
+    "web_extract": "正在读取网页资料",
+    "browser_navigate": "正在打开网页",
+    "browser_snapshot": "正在读取网页界面",
+    "browser_get_images": "正在读取网页图片",
+    "browser_vision": "正在分析网页图片",
+    "vision_analyze": "正在分析图片",
+    "delegate_task": "正在后台委派项目任务",
+    "terminal": "正在执行项目命令",
+    "process": "正在管理项目进程",
+    "write_file": "正在写入项目文件",
+    "patch": "正在修改项目文件",
+    "execute_code": "正在执行代码",
+    "image_generate": "正在生成图片",
+    "send_message": "正在发送消息",
+    "cronjob": "正在安排任务",
+    "clarify": "正在等待补充信息",
+}
 _TURN_START_ACK_TEXT = (
     "收到，我先查一下已有资料；有现成答案我会直接回复，需要进一步验证的部分再后台处理。"
 )
@@ -2358,7 +2379,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                         chat_type="group",
                         text=message.text,
                         mentioned_self=mentioned_self,
-                        has_context=bool(before.get("summary") or int(before.get("pending", 0)) > 0),
+                        has_context=bool(before.get("summary") or int(status.get("pending", 0)) > 0),
                         revision=int(status.get("revision", 0)),
                         now=now,
                         last_trigger_at=previous_trigger_at,
@@ -2370,6 +2391,13 @@ class OneBot11Adapter(BasePlatformAdapter):
                     )
                     if action.kind == "schedule":
                         await self._apply_trigger_action_locked(chat_id, action)
+                        self._audit_selector_event(
+                            "candidate_scheduled",
+                            chat_id,
+                            reason=action.reason,
+                            candidate_type=action.candidate_type,
+                            state=state,
+                        )
                         if state.mode == "debounce":
                             queued_reaction_message = message
                 if decision.triggered or action.kind == "direct":
@@ -2570,6 +2598,32 @@ class OneBot11Adapter(BasePlatformAdapter):
             },
         )
         return True
+    def _audit_selector_event(
+        self,
+        event: str,
+        chat_id: str,
+        *,
+        reason: str = "",
+        candidate_type: str = "",
+        state: LayeredTriggerState | None = None,
+    ) -> None:
+        """记录不含正文、凭据和模型输入的 selector 生命周期事件。"""
+        payload: dict[str, Any] = {
+            "chat_id": str(chat_id),
+            "reason": str(reason or "")[:96],
+            "candidate_type": str(candidate_type or "")[:32],
+        }
+        if state is not None:
+            snapshot = state.snapshot()
+            payload.update(
+                {
+                    "mode": str(snapshot.get("mode") or "")[:32],
+                    "level": str(snapshot.get("level") or "")[:32],
+                    "arbitrations": int(snapshot.get("arbitrations", 0) or 0),
+                }
+            )
+        self._audit.record(event, payload)
+
 
     def _schedule_trigger_timer(self, chat_id: str) -> None:
         """为一个群保留唯一 timer，负责 debounce、wait 和 engaged 到期。"""
@@ -2586,7 +2640,16 @@ class OneBot11Adapter(BasePlatformAdapter):
         current = asyncio.current_task()
         if previous is not None and not previous.done() and previous is not current:
             previous.cancel()
-        task = asyncio.create_task(self._run_trigger_timer(normalized))
+        try:
+            task = asyncio.create_task(self._run_trigger_timer(normalized))
+        except RuntimeError:
+            self._audit_selector_event(
+                "selector_skipped",
+                normalized,
+                reason="event_loop_unavailable",
+                state=state,
+            )
+            return
         self._trigger_timer_tasks[normalized] = task
 
     async def _run_trigger_timer(self, chat_id: str) -> None:
@@ -2616,6 +2679,13 @@ class OneBot11Adapter(BasePlatformAdapter):
                 if action.reason in {"wait_expired", "engaged_expired"}:
                     self._schedule_clear_queued_reaction(chat_id)
                 if action.kind == "judge":
+                    self._audit_selector_event(
+                        "selector_started",
+                        chat_id,
+                        reason=action.reason,
+                        candidate_type=action.candidate_type,
+                        state=state,
+                    )
                     await self._start_llm_judgement(chat_id, action)
                 elif action.kind in {"schedule", "wait"}:
                     await self._apply_trigger_action(chat_id, action)
@@ -3499,14 +3569,21 @@ class OneBot11Adapter(BasePlatformAdapter):
                         "decision": decision_name,
                         "anchor_seq": anchor_seq,
                         "duration_ms": int((time.monotonic() - started_at) * 1000),
+                        "failure": "",
                         "provider": self.trigger_config.llm_provider,
                         "model": self.trigger_config.llm_model,
-                        "concurrency_waited": concurrency_waited,
-                        "concurrency_wait_ms": concurrency_wait_ms,
-                        "model_call_started": True,
+                        "concurrency_waited": bool(concurrency_waited),
+                        "concurrency_wait_ms": int(concurrency_wait_ms),
+                        "model_call_started": bool(model_call_started),
                     },
                 )
-            if notify:
+                self._audit_selector_event(
+                    "selector_finished",
+                    normalized,
+                    reason=decision_name,
+                    candidate_type=candidate_type,
+                    state=self._trigger_states.get(normalized),
+                )
                 await self._dispatcher.notify(normalized)
         except asyncio.CancelledError:
             if not self._closed:
@@ -4990,10 +5067,60 @@ class OneBot11Adapter(BasePlatformAdapter):
         *,
         mode: str = "all",
         preview_max_len: int = 40,
-    ) -> None:
-        """OneBot 不发送 Hermes 工具进度，避免永久消息污染最终回复。"""
-        del event, mode, preview_max_len
-        return None
+    ) -> str | None:
+        """把结构化工具事件转换成不含参数的中文进度摘要。
+
+        OneBot 11 的消息是永久气泡，不能把命令、文件路径、URL、参数或
+        工具正文直接复制到 QQ。这里故意只返回固定语义标签；``preview``
+        和 ``args`` 即使由 Hermes 传入，也不进入输出或审计。连续相同
+        标签在短窗口内去重，避免同一工具的重复 start 事件刷屏。
+        """
+        del preview_max_len
+        if str(mode or "all").casefold() in {"off", "log"}:
+            return None
+        tool_name = str(getattr(event, "tool_name", "") or "").strip().casefold()
+        if not tool_name:
+            return None
+        if not self._tool_progress_allowed():
+            return None
+        line = _TOOL_PROGRESS_LABELS.get(tool_name, "正在处理项目任务")
+        now = time.monotonic()
+        last_line = getattr(self, "_last_tool_progress_line", None)
+        last_at = float(getattr(self, "_last_tool_progress_at", 0.0) or 0.0)
+        if line == last_line and now - last_at <= 2.0:
+            return None
+        self._last_tool_progress_line = line
+        self._last_tool_progress_at = now
+        return line
+
+    def _tool_progress_allowed(self) -> bool:
+        """按当前 OneBot 目标的中间消息策略决定是否展示工具进度。"""
+        current_event = _CURRENT_EVENT.get()
+        metadata = getattr(current_event, "metadata", None)
+        target: ChatTarget | None = None
+        if isinstance(metadata, Mapping):
+            raw_target = metadata.get("onebot11_target")
+            if isinstance(raw_target, Mapping):
+                chat_type = str(raw_target.get("chat_type") or "")
+                chat_id = str(raw_target.get("chat_id") or "")
+                if chat_type and chat_id:
+                    target = ChatTarget(chat_type, chat_id)
+        if target is None:
+            caller = _CURRENT_CALLER.get()
+            if caller is not None and caller.chat_type and caller.chat_id:
+                target = ChatTarget(caller.chat_type, caller.chat_id)
+        if target is None or self._interim_allowed(target):
+            return True
+        _safe_audit(
+            self,
+            "interim_hidden",
+            {
+                "chat_type": target.chat_type,
+                "chat_id": target.chat_id,
+                "reason": "工具进度按配置隐藏",
+            },
+        )
+        return False
 
     def _delivery_summary_for(self, lease_id: str | None) -> DeliverySummary | None:
         """读取或创建 managed turn 的出站结算对象。"""
@@ -6090,6 +6217,70 @@ class OneBot11Adapter(BasePlatformAdapter):
                 return False
         return True
 
+    def _delegated_binding_is_authorized(
+        self,
+        binding: TurnBinding | None,
+        *,
+        expected_caller: CallerContext | None = None,
+    ) -> bool:
+        """校验后台 child 继承的父 lineage，不要求父 lease 或 binding 仍在 store。"""
+        if not isinstance(binding, TurnBinding):
+            return False
+        if not binding.session_id or not binding.turn_id:
+            return False
+        if expected_caller is not None and expected_caller != binding.caller:
+            return False
+        caller = binding.caller
+        if (
+            not caller.self_id
+            or caller.self_id != self.self_id
+            or caller.adapter_epoch is None
+            or caller.adapter_epoch != self._adapter_epoch
+            or binding.lease_id != caller.lease_id
+            or not self._chat_access_allowed(
+                caller.chat_type,
+                caller.chat_id,
+                caller.user_id,
+            )
+        ):
+            return False
+
+        current_event = _CURRENT_EVENT.get()
+        metadata = getattr(current_event, "metadata", None) or {}
+        if not isinstance(metadata, Mapping) or not metadata.get(
+            "onebot11_managed_context"
+        ):
+            return True
+        raw_target = metadata.get("onebot11_target")
+        if not isinstance(raw_target, Mapping):
+            return False
+        if (
+            str(raw_target.get("chat_type") or "") != caller.chat_type
+            or str(raw_target.get("chat_id") or "") != caller.chat_id
+        ):
+            return False
+        raw_epoch = metadata.get("onebot11_adapter_epoch")
+        if raw_epoch is not None:
+            try:
+                if isinstance(raw_epoch, bool) or int(raw_epoch) != self._adapter_epoch:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        if metadata.get("onebot11_queue_turn") is True:
+            raw_generation = metadata.get("onebot11_reset_generation")
+            try:
+                if (
+                    raw_generation is None
+                    or isinstance(raw_generation, bool)
+                    or int(raw_generation)
+                    != self._conversation_reset_generations.get(caller.chat_id, 0)
+                ):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
+
+
     def _log_binding_diagnostic(
         self,
         metadata: Mapping[str, Any] | None,
@@ -6483,25 +6674,42 @@ class OneBot11Adapter(BasePlatformAdapter):
                         },
                         ensure_ascii=False,
                     )
-                binding = self._resolve_binding(session_id, turn_id)
+                resolved_binding = self._resolve_binding(session_id, turn_id)
                 context_binding = _CURRENT_BINDING.get()
                 context_caller = _CURRENT_CALLER.get()
-                if (
-                    binding is None
-                    or (
-                        context_binding is not None
-                        and context_binding != binding
-                    )
-                    or (
-                        context_caller is not None
-                        and context_caller != binding.caller
-                    )
-                ):
-                    binding = None
+                if delegated_child:
+                    binding = context_binding
+                    if (
+                        binding is None
+                        or (
+                            resolved_binding is not None
+                            and resolved_binding != binding
+                        )
+                        or not self._delegated_binding_is_authorized(
+                            binding,
+                            expected_caller=context_caller,
+                        )
+                    ):
+                        binding = None
+                else:
+                    binding = resolved_binding
+                    if (
+                        binding is None
+                        or (
+                            context_binding is not None
+                            and context_binding != binding
+                        )
+                        or (
+                            context_caller is not None
+                            and context_caller != binding.caller
+                        )
+                    ):
+                        binding = None
             else:
                 binding = self._binding_from_context()
             if binding is None:
                 return json.dumps({"status": "permission_error", "error": "当前 turn 身份绑定不存在"}, ensure_ascii=False)
+
             if (
                 binding.caller.adapter_epoch is not None
                 and binding.caller.adapter_epoch != self._adapter_epoch
@@ -6515,7 +6723,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                     {"status": "permission_error", "error": "OneBot11 adapter 已关闭"},
                     ensure_ascii=False,
                 )
-            if binding.lease_id and not self._lease_is_current(binding.lease_id):
+            if binding.lease_id and not delegated_child and not self._lease_is_current(binding.lease_id):
                 self._audit.record(
                     "permission_denied",
                     {
@@ -7189,10 +7397,10 @@ def _pre_llm_call_hook(session_id: str = "", turn_id: str = "", platform: Any = 
     if not adapter._chat_access_allowed(caller.chat_type, caller.chat_id, caller.user_id):
         _clear_current_turn_binding(adapter)
         return {"context": "OneBot11 caller is no longer authorized; all OneBot11 tools must be denied."}
-    if caller.lease_id and not adapter._lease_is_current(caller.lease_id):
+    if caller.lease_id and not delegated_child and not adapter._lease_is_current(caller.lease_id):
         _clear_current_turn_binding(adapter)
         return {"context": "OneBot11 caller lease unavailable; all OneBot11 tools must be denied."}
-    if caller.lease_id and not adapter._lease_matches_target(
+    if caller.lease_id and not delegated_child and not adapter._lease_matches_target(
         caller.lease_id, caller.chat_type, caller.chat_id
     ):
         _clear_current_turn_binding(adapter)
@@ -7203,8 +7411,19 @@ def _pre_llm_call_hook(session_id: str = "", turn_id: str = "", platform: Any = 
     if delegated_child:
         if context_binding is None:
             return {"context": "OneBot11 delegated child lacks parent turn binding; all tools must be denied."}
-        # delegated child 可能只带自己的 session/turn 坐标，没有原始 event
-        # 的 ContextVar；确认父 binding 后显式保留 OneBot lineage。
+        if exact_binding is not None and exact_binding != context_binding:
+            _clear_current_turn_binding(adapter)
+            return {"context": "OneBot11 delegated child turn binding conflicts with parent binding; all tools must be denied."}
+        if not adapter._delegated_binding_is_authorized(
+            context_binding,
+            expected_caller=caller,
+        ):
+            _clear_current_turn_binding(adapter)
+            return {"context": "OneBot11 delegated child parent binding unavailable or invalid; all tools must be denied."}
+        # Child coordinates are never registered as a new OneBot identity;
+        # retain only the verified parent lineage in this child ContextVar.
+        _CURRENT_BINDING.set(context_binding)
+        _CURRENT_CALLER.set(caller)
         _CURRENT_ONEBOT_CONTEXT.set(True)
         return {
             "context": role_prompt(
@@ -7381,20 +7600,26 @@ def _pre_tool_call_hook(
             "message": f"权限错误: OneBot11 当前禁止调用 {normalized_tool_name}",
         }
     try:
-        binding = exact_binding or adapter._resolve_binding(
-            normalized_session_id,
-            normalized_turn_id,
-        )
-        if binding is None and delegated_child:
-            # Hermes delegate_task 子代理使用自己的 session/turn 坐标，但
-            # 仍运行在父 OneBot turn 的 context 中；继承父 binding 后再
-            # 执行一次 delegated-child 的工具限制，不能把子代理坐标
-            # 当成新的 OneBot 身份。
-            binding = _CURRENT_BINDING.get()
-        if binding is None:
-            return {"action": "block", "message": "OneBot11 current turn binding unavailable"}
         context_binding = _CURRENT_BINDING.get()
         current_caller = _CURRENT_CALLER.get()
+        if delegated_child:
+            binding = context_binding
+            if (
+                binding is None
+                or (exact_binding is not None and exact_binding != binding)
+                or not adapter._delegated_binding_is_authorized(
+                    binding,
+                    expected_caller=current_caller,
+                )
+            ):
+                return {"action": "block", "message": "OneBot11 current turn binding unavailable"}
+        else:
+            binding = exact_binding or adapter._resolve_binding(
+                normalized_session_id,
+                normalized_turn_id,
+            )
+        if binding is None:
+            return {"action": "block", "message": "OneBot11 current turn binding unavailable"}
         if context_binding is not None and context_binding != binding:
             return {
                 "action": "block",
@@ -7484,7 +7709,7 @@ def _pre_tool_call_hook(
             and binding.caller.adapter_epoch != adapter._adapter_epoch
         ):
             return {"action": "block", "message": "权限错误: 当前 adapter epoch 已失效"}
-        if binding.lease_id and not adapter._lease_is_current(binding.lease_id):
+        if binding.lease_id and not delegated_child and not adapter._lease_is_current(binding.lease_id):
             _safe_audit(
                 adapter,
                 "permission_denied",

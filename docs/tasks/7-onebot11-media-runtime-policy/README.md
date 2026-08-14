@@ -84,8 +84,7 @@
 
 ## 计划出入
 
-- 本轮没有修改本地 Hermes，也没有实现 renderer、Docker 子代理、OneBot 12、原始 WS spool、
-  语义摘要或通用媒体发送；
+- 本轮没有修改本地 Hermes，也没有实现 renderer、Docker 子代理、OneBot 12、原始 WS spool、语义摘要或通用媒体发送；
 - Hermes heartbeat 在上游提供明确 control-plane metadata 前不作为 OneBot 业务合同；
 - Hermes 通用 web/browser/terminal/file 工具在 OneBot turn 中由插件的
   `pre_tool_call` 按角色快照硬拦截；`tool_search` 继续拒绝，`delegate_task` 必须显式
@@ -93,31 +92,32 @@
   write_file/patch 的工作交给 delegated child；子代理若丢失父 binding 仍拒绝，且不能
   调用 QQ 工具、send_message、cronjob 或再次委派。
 
+本轮新增客服收口：delegated child 在父 QQ turn 结束后仍可继续使用项目工具，但不继承 QQ 出站、QQ 查询、cronjob 或再次委派权限；复杂问题先发送固定中文回执，再由后台委派执行。Hermes 工具事件只映射为固定中文摘要，不把参数、路径、URL 或工具正文发送到 QQ。该行为已经由交接时的 delegated-child 回归测试、Hermes 组合 smoke 和 Arch 现场审计共同核对。
+
+Arch 现场使用插件 checkout `e05e4b0f25d7be9aef706dde1d16849f06c742a5`，容器为 `running healthy`，当前白名单为群 `942513604`、超级管理员 `2056963663`、机器人 `3101482118`。LLBot 与 Hermes 反向 WS/HTTP 配置和 `get_status`/`get_login_info` 已核对；白名单外真实 QQ 群消息产生 `access_denied` 且未进入队列。目标客服群的历史真实消息曾完成 `inbound message -> response ready -> Sending response`，但本轮没有取得该群的真人客户端入站消息，因此不把 HTTP 出站探针或历史记录写成当前真人 QQ Agent pipeline 通过。
+
 ## 验证
 
 本 worktree 使用本地 Hermes 源码：
 
 ```text
 PYTHONPATH=C:\Users\notnotype\AppData\Local\hermes\hermes-agent;C:\Users\notnotype\AppData\Local\hermes\hermes-agent\venv\Lib\site-packages pytest -q
-326 passed, 1 skipped
-ruff check .
+419 passed, 4 warnings
 ```
 
-skip 是 `tests/test_pi_ai.py` 缺少 pi-ai npm 运行依赖；adapter 集成测试在上述
-Hermes 源码路径下实际运行，没有因缺 gateway 跳过。`scripts/verify_hermes_integration.py`
-在临时 `HERMES_HOME` 下也通过，输出
-`Hermes integration smoke passed: tools=9 hooks=5 pi_ai_trigger=True reconnect=True slash_commands=True`；
-`node --check scripts/onebot11-pi-trigger.mjs` 也通过；测试数字必须以实际命令结果为准。
+纯插件门禁为 `247 passed, 1 skipped`；skip 是 `tests/test_adapter.py` 因缺少 Hermes `gateway`。本轮完整 Hermes 环境测试实际运行了 adapter 集成测试；Windows asyncio subprocess transport 关闭期产生 4 条警告，无测试失败。
 
-Arch 联调仍严格限制为群 `1072992996`、私聊用户 `2056963663`；
-本任务未在该 worktree 部署或发送未经授权的管理动作。合成 WS payload
-与真人 QQ 客户端消息必须分开记录，前者不升级为 OneBot 11 协议保证。
+`ruff check .`、`node --check scripts/onebot11-pi-trigger.mjs` 和 `git diff --check` 通过。`scripts/verify_hermes_integration.py` 在临时 `HERMES_HOME` 下通过，测试部分为 `419 passed, 4 warnings`，随后输出 `tools=9 hooks=5 pi_ai_trigger=True reconnect=True slash_commands=True`。测试数字以对应实际命令结果为准。
+
+Arch 组合证据：容器 `hermes-support-support-hermes-1` 为 `running healthy`，插件 checkout 与目标 commit 一致，反向 WS 监听 `0.0.0.0:18880`，LLBot HTTP `get_status` 为 `online=true, good=true`，`get_login_info` 返回机器人 QQ `3101482118`。历史目标群 Agent 日志包含 `inbound message`、`response ready` 和 `Sending response`；本轮白名单外真实群入站只形成 `access_denied`，目标客服群真人入站未取得，故真人 QQ Agent pipeline 标记为未验证。
+
+Arch 联调固定记录为群 `942513604`、超级管理员 `2056963663`、机器人 `3101482118`；本轮未执行禁言、踢人、撤回、全员禁言，未修改 Arch 配置、生产 SQLite 或 `PRAGMA user_version`。合成 HTTP 出站、真实 QQ 群入站和插件审计分开记录，未把 HTTP 探针升级为真人协议保证。
 
 ## 后续
 
-- Hermes 上游增加明确的 long-running/system-error control-plane metadata 后，再开启
-  OneBot 控制面通知的真实 heartbeat 联调；
+- 获取目标客服群 `942513604` 的真人客户端入站后，验证中文即时回执、固定工具进度、后台 delegated child completion 和最终回复在 QQ 上的顺序；
+- 在真人链路可用后，验证两名真人同时 @、selector/engage 窗口、图片-only/文字+图片、多媒体去重和管理写动作预览；
+- 制造并人工处理非幂等出站 `unknown` 与 `resolve action retry|discard`；不执行真实禁言、踢人、撤回或全员禁言；
+- Hermes 上游增加明确的 long-running/system-error control-plane metadata 后，再开启 OneBot 控制面通知的真实 heartbeat 联调；
 - renderer 任务另行定义 PNG 字体、尺寸、临时文件和外部 URL allowlist；
-- Hermes 上游完善 tool-search `turn_id` 和 delegation 继承后，再评估是否扩大
-  generic 工具范围；当前 `tool_search` 仍禁用，`delegate_task` 仅作为显式委派入口，
-  generic 工具本身已经由 OneBot `pre_tool_call` 按 role snapshot 硬门禁。
+- Hermes 上游完善 tool-search `turn_id` 和 delegation 继承后，再评估是否扩大 generic 工具范围；当前 `tool_search` 仍禁用，`delegate_task` 仅作为显式委派入口，generic 工具本身已经由 OneBot `pre_tool_call` 按 role snapshot 硬门禁。

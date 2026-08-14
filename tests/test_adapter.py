@@ -39,6 +39,7 @@ from gateway.platforms.base import (  # noqa: E402
     ProcessingOutcome,
     SendResult,
 )
+from gateway.stream_events import ToolCallChunk  # noqa: E402
 
 import adapter as adapter_module  # noqa: E402
 from adapter import OneBot11Adapter, check_requirements, register, validate_config  # noqa: E402
@@ -596,6 +597,217 @@ async def test_worker_binding丢失event_metadata时仍按当前活动lease恢�
         adapter_module._CURRENT_EVENT.reset(event_token)
         adapter._dispatcher._active.pop("888", None)
         await adapter.disconnect()
+
+
+def test_delegated_child父lease结束后仍可执行项目工具但不能越权(monkeypatch):
+    """后台子代理不应被父 QQ lease 的正常收尾误杀。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    caller = replace(
+        adapter._caller_for_event(
+            SimpleNamespace(user_id="123", chat_type="group", chat_id="888")
+        ),
+        role="super_admin",
+        lease_id="parent-lease",
+    )
+    binding = adapter_module.TurnBinding(
+        "parent-session",
+        "parent-turn",
+        caller,
+        "parent-lease",
+    )
+    adapter._bindings.bind(binding)
+    # 模拟父 turn wrapper 收尾：child 仍持有 ContextVar lineage，但 store 已清理。
+    adapter._bindings.discard_if_matches(binding)
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    monkeypatch.setattr(adapter_module, "_is_delegated_child_turn", lambda _kwargs: True)
+    monkeypatch.setattr(adapter, "_lease_is_current", lambda _lease_id: False)
+    monkeypatch.setattr(adapter, "_chat_access_allowed", lambda *_args: True)
+
+    binding_token = adapter_module._CURRENT_BINDING.set(binding)
+    caller_token = adapter_module._CURRENT_CALLER.set(caller)
+    context_token = adapter_module._CURRENT_ONEBOT_CONTEXT.set(True)
+    try:
+        assert adapter_module._pre_tool_call_hook(
+            tool_name="terminal",
+            session_id="child-session",
+            turn_id="child-turn",
+            args={"command": "pwd"},
+        ) is None
+        blocked_qq = adapter_module._pre_tool_call_hook(
+            tool_name="qq_get_message",
+            session_id="child-session",
+            turn_id="child-turn",
+            args={},
+        )
+        assert blocked_qq is not None
+        assert blocked_qq["action"] == "block"
+        blocked_send = adapter_module._pre_tool_call_hook(
+            tool_name="send_message",
+            session_id="child-session",
+            turn_id="child-turn",
+            args={},
+        )
+        assert blocked_send is not None
+        assert blocked_send["action"] == "block"
+    finally:
+        adapter_module._CURRENT_ONEBOT_CONTEXT.reset(context_token)
+        adapter_module._CURRENT_CALLER.reset(caller_token)
+        adapter_module._CURRENT_BINDING.reset(binding_token)
+        adapter._bindings.clear()
+        asyncio.run(adapter.disconnect())
+
+
+def test_delegated_child_pre_llm跳过父租约但保留父lineage(monkeypatch):
+    """父 lease 和 binding store 清理后，child 仍须验证继承的父身份。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    caller = replace(
+        adapter._caller_for_event(
+            SimpleNamespace(user_id="123", chat_type="group", chat_id="888")
+        ),
+        role="super_admin",
+        lease_id="parent-lease",
+    )
+    binding = adapter_module.TurnBinding(
+        "parent-session",
+        "parent-turn",
+        caller,
+        "parent-lease",
+    )
+    adapter._bindings.bind(binding)
+    adapter._bindings.discard_if_matches(binding)
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    monkeypatch.setattr(adapter_module, "_is_delegated_child_turn", lambda _kwargs: True)
+    monkeypatch.setattr(adapter, "_lease_is_current", lambda _lease_id: False)
+    monkeypatch.setattr(adapter, "_chat_access_allowed", lambda *_args: True)
+    binding_token = adapter_module._CURRENT_BINDING.set(binding)
+    caller_token = adapter_module._CURRENT_CALLER.set(caller)
+    context_token = adapter_module._CURRENT_ONEBOT_CONTEXT.set(True)
+    try:
+        result = adapter_module._pre_llm_call_hook(
+            session_id="child-session",
+            turn_id="child-turn",
+            platform="subagent",
+        )
+        assert result is not None
+        assert adapter_module._CURRENT_BINDING.get() == binding
+    finally:
+        adapter_module._CURRENT_ONEBOT_CONTEXT.reset(context_token)
+        adapter_module._CURRENT_CALLER.reset(caller_token)
+        adapter_module._CURRENT_BINDING.reset(binding_token)
+        adapter._bindings.clear()
+        asyncio.run(adapter.disconnect())
+
+
+@pytest.mark.parametrize("invalid_identity", ["self_id", "adapter_epoch", "access"])
+def test_delegated_child身份变化后fail_closed(monkeypatch, invalid_identity):
+    """self_id、epoch 或白名单变化不能让旧 child 继续获得权限。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    caller = replace(
+        adapter._caller_for_event(
+            SimpleNamespace(user_id="123", chat_type="group", chat_id="888")
+        ),
+        role="super_admin",
+        lease_id="parent-lease",
+    )
+    if invalid_identity == "self_id":
+        caller = replace(caller, self_id="other-bot")
+    elif invalid_identity == "adapter_epoch":
+        caller = replace(caller, adapter_epoch=adapter._adapter_epoch + 1)
+    else:
+        monkeypatch.setattr(adapter, "_chat_access_allowed", lambda *_args: False)
+    binding = adapter_module.TurnBinding(
+        "parent-session",
+        "parent-turn",
+        caller,
+        "parent-lease",
+    )
+    adapter._bindings.bind(binding)
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    monkeypatch.setattr(adapter_module, "_is_delegated_child_turn", lambda _kwargs: True)
+    monkeypatch.setattr(adapter, "_lease_is_current", lambda _lease_id: False)
+    binding_token = adapter_module._CURRENT_BINDING.set(binding)
+    caller_token = adapter_module._CURRENT_CALLER.set(caller)
+    context_token = adapter_module._CURRENT_ONEBOT_CONTEXT.set(True)
+    try:
+        blocked = adapter_module._pre_tool_call_hook(
+            tool_name="terminal",
+            session_id="child-session",
+            turn_id="child-turn",
+            args={"command": "pwd"},
+        )
+        assert blocked is not None
+        assert blocked["action"] == "block"
+    finally:
+        adapter_module._CURRENT_ONEBOT_CONTEXT.reset(context_token)
+        adapter_module._CURRENT_CALLER.reset(caller_token)
+        adapter_module._CURRENT_BINDING.reset(binding_token)
+        adapter._bindings.clear()
+        asyncio.run(adapter.disconnect())
+
+
+def test_delegated_child不能借用其他群binding(monkeypatch):
+    """child 坐标命中另一个群的 binding 时必须拒绝跨群串用。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    parent_caller = replace(
+        adapter._caller_for_event(
+            SimpleNamespace(user_id="123", chat_type="group", chat_id="888")
+        ),
+        role="super_admin",
+        lease_id="parent-lease",
+    )
+    other_caller = replace(parent_caller, chat_id="999", lease_id="other-lease")
+    parent_binding = adapter_module.TurnBinding(
+        "parent-session",
+        "parent-turn",
+        parent_caller,
+        "parent-lease",
+    )
+    other_binding = adapter_module.TurnBinding(
+        "child-session",
+        "child-turn",
+        other_caller,
+        "other-lease",
+    )
+    adapter._bindings.bind(parent_binding)
+    adapter._bindings.bind(other_binding)
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    monkeypatch.setattr(adapter_module, "_is_delegated_child_turn", lambda _kwargs: True)
+    monkeypatch.setattr(adapter, "_lease_is_current", lambda _lease_id: False)
+    monkeypatch.setattr(adapter, "_chat_access_allowed", lambda *_args: True)
+    binding_token = adapter_module._CURRENT_BINDING.set(parent_binding)
+    caller_token = adapter_module._CURRENT_CALLER.set(parent_caller)
+    context_token = adapter_module._CURRENT_ONEBOT_CONTEXT.set(True)
+    try:
+        blocked = adapter_module._pre_tool_call_hook(
+            tool_name="terminal",
+            session_id="child-session",
+            turn_id="child-turn",
+            args={"command": "pwd"},
+        )
+        assert blocked is not None
+        assert blocked["action"] == "block"
+    finally:
+        adapter_module._CURRENT_ONEBOT_CONTEXT.reset(context_token)
+        adapter_module._CURRENT_CALLER.reset(caller_token)
+        adapter_module._CURRENT_BINDING.reset(binding_token)
+        adapter._bindings.clear()
+        asyncio.run(adapter.disconnect())
 
 
 async def test出站binding缺失或session_turn不匹配时不访问OneBot(monkeypatch):
@@ -6758,3 +6970,43 @@ async def test_selector_queued_reaction_移除失败重试一次(monkeypatch):
         assert "888" not in adapter._queued_reaction_message_ids
     finally:
         await adapter.disconnect()
+
+
+def test_工具进度输出中文且脱敏(monkeypatch):
+    """结构化工具事件只展示安全摘要，不泄露命令、路径或凭据。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    event = ToolCallChunk(
+        tool_name="terminal",
+        preview="cat /srv/neuro-book/.env API_KEY=sk-live-very-secret-value",
+        args={
+            "command": "cat /srv/neuro-book/.env API_KEY=sk-live-very-secret-value",
+        },
+    )
+    rendered = adapter.format_tool_event(event, mode="all", preview_max_len=80)
+    assert rendered is not None
+    assert rendered.startswith("正在执行")
+    assert "/srv/neuro-book" not in rendered
+    assert "sk-live-very-secret-value" not in rendered
+    assert ".env" not in rendered
+    asyncio.run(adapter.disconnect())
+
+
+def test_工具进度连续相同内容去重(monkeypatch):
+    """相同工具摘要连续到达时只保留一次展示。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    event = ToolCallChunk(
+        tool_name="read_file",
+        preview="README.md",
+        args={"path": "README.md"},
+    )
+    assert adapter.format_tool_event(event) is not None
+    assert adapter.format_tool_event(event) is None
+    asyncio.run(adapter.disconnect())

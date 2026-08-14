@@ -6,7 +6,7 @@
 
 - **私聊**：和机器人一对一聊天,每条消息都会回复。
 - **群聊**：整群共享一个 Hermes session；允许的消息先进入持久 SQLite 队列。每个 durable TurnAnchor 只消费自己边界内的批次，同群仍保持单活动 turn 并按 anchor 顺序串行处理；@、关键词、`always` 或分层 LLM trigger 才会创建 anchor。
-- **连续对话**：成功回复后进入最多 60 秒的活跃窗口；窗口内普通消息统一交给低成本旁路模型判断是否回复（没有特例词），单窗口最多仲裁 2 次。debounce 是自适应的：群消息间隔超过 5 秒（不活跃）时立即判断，间隔小于 5 秒（活跃）时按 trailing 节流合并。
+ - **连续对话**：成功回复后进入最多 60 秒的活跃窗口；窗口内普通消息统一交给低成本旁路模型判断是否回复（没有特例词），单窗口最多仲裁 2 次。debounce 默认 2 秒：群消息间隔超过 2 秒（不活跃）时立即判断，间隔小于 2 秒（活跃）时按 trailing 节流合并。
 - **群级旁路命令**：`/context`、`/ctx` 在入队前返回有界队列/lease/policy 诊断；超级管理员可以发送 `/new [title]`、`/reset` 或 `/clear` 重置当前群的 shared session。它们都不会作为普通群消息交给 Agent。
 - **处理指示器**：问句/记忆候选进入 selector 判断时给候选消息添加 👀（表示“bot 正在看这条消息”），判断结束（触发、忽略、超时或 wait 到期）后移除；任何触发方式进入回复阶段后，给触发消息添加 💬（表示“正在回复这一条”），Hermes turn 收尾时自动移除。两种指示器都是 best-effort，失败或结果未知不影响回复、队列 ack 或 Agent 完成，也不重放设置请求；没有真实消息 ID 或 QQ 框架不支持该扩展时按 best-effort 跳过。
 - **中间正文**：Hermes ReAct 过程中产生的 AI 中间评论（commentary/工具进度/状态提示）默认在群聊隐藏、在私聊展示，可用 `show_interim_group` / `show_interim_dm` 配置。群聊开启时，适配器会在 turn 进入 Hermes 前先发送一次中文“收到、正在查资料”回执；这条回执不进入 session transcript，发送失败也不阻塞 Agent。最终回复不受影响，永远发送。
@@ -82,8 +82,8 @@ hermes plugins install notnotype/hermes-plugin-onebot11
 | `ONEBOT11_QUEUE_DB` | Hermes home | SQLite 队列路径；未配置时使用 Hermes home 下的 `onebot11/queue.sqlite3` |
 | `ONEBOT11_HOME_CHANNEL` | 空 | 定时任务目标 ID；必须同时在 `platforms.onebot11.extra.home_channel_type` 指定 `group` 或 `dm` |
 | `ONEBOT11_HOME_CHANNEL_TYPE` | 空 | 定时任务目标类型：`group` 或 `dm`；不会根据 QQ 号形状猜测 |
-| `ONEBOT11_LLM_TRIGGER_PROVIDER` | YAML 可替代 | 旁路 provider；启用时必须明确配置 |
-| `ONEBOT11_LLM_TRIGGER_MODEL` | YAML 可替代 | 旁路 model；启用时必须明确配置 |
+| `ONEBOT11_LLM_TRIGGER_PROVIDER` | `deepseek` | 旁路 provider；启用时可用默认官方 provider，仍需 API key 环境变量 |
+| `ONEBOT11_LLM_TRIGGER_MODEL` | `deepseek-v4-flash` | 旁路 model；启用时使用该官方模型 |
 | `ONEBOT11_LLM_TRIGGER_BASE_URL` | 空 | 自定义 provider 的 HTTP/HTTPS OpenAI-compatible 地址 |
 | `ONEBOT11_LLM_TRIGGER_API_KEY_ENV` | 空 | API key 的环境变量名，不是密钥值 |
 | `ONEBOT11_LLM_TRIGGER_GROUPS` | 空 | 允许调用 selector 的群号列表 |
@@ -132,7 +132,7 @@ platforms:
         input_bytes: 12000
         concurrency: 2
         max_failures: 3
-        trigger_debounce_seconds: 5
+        trigger_debounce_seconds: 2
         engaged_idle_seconds: 60
         engaged_max_seconds: 300
         engaged_max_arbitrations: 2
@@ -198,7 +198,7 @@ roles:
 启动、`validate_config` 和 `/onebot reload` 都使用同一解析路径；文件不存在则回退到
 config.yaml，行为不变。文件必须是合法 YAML mapping，未知键会直接拒绝启动（fail-closed）。
 
-LLM trigger 默认关闭，启用时必须同时配置明确的 `provider`、`model` 和群 allowlist；每群最多一个判断任务，使用 5 秒 debounce 和全局并发上限。判断由插件自有 Node helper 通过固定版本 `@earendil-works/pi-ai` 发起，不经过 Hermes auxiliary，不回退 Hermes 主 Agent，也不主动切换 provider。`api_key_env` 只保存环境变量名，密钥值不会进入 YAML、命令行、日志或 SQLite。Node、依赖缺失、超时、非法 JSON 或模型失败都按不触发处理，消息继续留在 pending。
+ LLM trigger 默认关闭；启用时可使用官方 `deepseek` / `deepseek-v4-flash` 默认值，但仍必须配置群 allowlist 和 `api_key_env` 对应的进程环境变量；自定义 provider 仍需明确填写 `provider`、`model`、`base_url` 和 `api_key_env`。每群最多一个判断任务，使用 2 秒 debounce 和全局并发上限。判断由插件自有 Node helper 通过固定版本 `@earendil-works/pi-ai` 发起，不经过 Hermes auxiliary，不回退 Hermes 主 Agent，也不主动切换 provider。`api_key_env` 只保存环境变量名，密钥值不会进入 YAML、命令行、日志或 SQLite。Node、依赖缺失、超时、非法 JSON 或模型失败都按不触发处理，消息继续留在 pending。
 旁路模型只接受 `{"decision":"trigger","anchor_seq":123}`、`{"decision":"wait","anchor_seq":null}` 或 `{"decision":"ignore","anchor_seq":null}`；`trigger` 必须选择真实 pending 消息的 seq，权限完全继承该消息。非法结果、超时或模型失败按不触发处理，并按持久化退避等待后续判断。
 
 #### Engage 分级预算
