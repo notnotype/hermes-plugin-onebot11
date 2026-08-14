@@ -7927,7 +7927,16 @@ def _require_hermes_hook_capabilities(ctx: Any) -> Any:
 
 
 def register(ctx: Any) -> None:
-    """注册平台、全角色工具和权限 hooks。"""
+    """注册平台、全角色工具、权限 hooks 和通用仓库调研 Skill。"""
+    register_skill = getattr(ctx, "register_skill", None)
+    if callable(register_skill):
+        register_skill(
+            "repository-research",
+            Path(__file__).resolve().parent / "skills" / "repository-research" / "SKILL.md",
+            "跨项目高级仓库调研与运行证据 SOP",
+        )
+    else:
+        logger.warning("Hermes context 不支持 register_skill；repository-research capability unavailable")
     register_hook = _require_hermes_hook_capabilities(ctx)
     ctx.register_platform(
         name="onebot11",

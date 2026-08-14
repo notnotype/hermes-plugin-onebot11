@@ -6761,6 +6761,7 @@ def test_register注册平台与工具():
             self.platform_kwargs = None
             self.tools: list[dict] = []
             self.hooks: dict[str, object] = {}
+            self.skills: list[tuple[str, object, str]] = []
 
         def register_platform(self, **kwargs):
             self.platform_kwargs = kwargs
@@ -6771,7 +6772,23 @@ def test_register注册平台与工具():
         def register_hook(self, name, callback):
             self.hooks[name] = callback
 
+        def register_skill(self, name, path, description):
+            self.skills.append((name, path, description))
+
     ctx = FakeCtx()
+    register(ctx)
+    assert len(ctx.skills) == 1
+    name, skill_path, description = ctx.skills[0]
+    assert name == "repository-research"
+    assert skill_path.exists()
+    text = skill_path.read_text(encoding="utf-8")
+    assert "name: repository-research" in text
+    assert "ONEBOT11_" not in text
+    assert "qq_" not in text
+    assert "NeuroBook" not in text
+    assert description
+
+    assert ctx.platform_kwargs is not None
     register(ctx)
     assert ctx.platform_kwargs["name"] == "onebot11"
     assert ctx.platform_kwargs["cron_deliver_env_var"] == "ONEBOT11_HOME_CHANNEL"
