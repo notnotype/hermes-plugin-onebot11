@@ -5375,8 +5375,8 @@ async def test_内部completion不提升原用户权限且重复事件只保留�
     metadata = {
         "gateway_session_id": "session-parent",
         "onebot11_authority": {
-            "role": "user",
-            "allowed_tools": [],
+            "role": "super_admin",
+            "allowed_tools": sorted(adapter.role_tools["super_admin"]),
             "self_id": "1",
         },
     }
@@ -5396,9 +5396,44 @@ async def test_内部completion不提升原用户权限且重复事件只保留�
     assert status["pending_trigger_requests"] == 1
     assert notifications == ["888", "888"]
     trigger = adapter._queue.recover_trigger_requests({"888"})[0]
-    assert trigger.authority_tools == adapter.role_tools["user"]
-    assert "qq_set_group_whole_ban" not in trigger.authority_tools
+    assert trigger.authority_role == "user"
+    assert trigger.authority_tools == frozenset()
     await adapter.disconnect()
+async def test_缺失completion权限快照仍以最小权限恢复(monkeypatch, tmp_path):
+    """重启恢复的 completion 不得从当前超级管理员身份继承工具。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_SUPER_ADMINS="123",
+        ONEBOT11_QUEUE_DB=str(tmp_path / "queue.sqlite3"),
+    )
+    adapter._queue.enqueue(
+        QueueMessage(
+            chat_id="888",
+            chat_type="group",
+            message_id="",
+            user_id="123",
+            user_name="管理员",
+            text="[ASYNC DELEGATION COMPLETE — deleg_missing]\\n结果",
+            metadata={"gateway_session_id": "session-parent"},
+            message_key="hash:missing-authority-completion",
+        )
+    )
+    notifications: list[str] = []
+
+    async def fake_notify(chat_id: str) -> bool:
+        notifications.append(str(chat_id))
+        return True
+
+    monkeypatch.setattr(adapter._dispatcher, "notify", fake_notify)
+    await adapter._recover_internal_completion_triggers()
+    trigger = adapter._queue.recover_trigger_requests({"888"})[0]
+    assert trigger.authority_role == "user"
+    assert trigger.authority_tools == frozenset()
+    assert notifications == ["888"]
+    await adapter.disconnect()
+
 
 
 async def test_未开始OneBot请求的turn成功也release(monkeypatch):

@@ -2453,36 +2453,47 @@ class OneBot11Adapter(BasePlatformAdapter):
             )
         )
 
-    def _completion_authority_for_message(self, message: QueueMessage) -> CallerContext:
-        """恢复内部 completion 时优先使用快照，否则按原用户当前角色降权。"""
-        authority = self._authority_for_queued_message(message)
-        if authority.role in ROLE_NAMES and authority.self_id == self.self_id:
-            return authority
-        role = role_for_user(message.user_id, self.super_admins, self.trusted_users)
+    def _restricted_completion_authority(
+        self,
+        *,
+        user_id: str,
+        chat_type: str,
+        chat_id: str,
+    ) -> CallerContext:
+        """为内部 completion 建立不含 OneBot 工具的最小权限快照。"""
         return CallerContext(
-            user_id=message.user_id,
-            chat_type=message.chat_type,
-            chat_id=message.chat_id,
-            role=role,
-            allowed_tools=self.role_tools.get(role, frozenset()),
+            user_id=str(user_id),
+            chat_type=str(chat_type),
+            chat_id=str(chat_id),
+            role="user",
+            allowed_tools=frozenset(),
             self_id=self.self_id,
             adapter_epoch=self._adapter_epoch,
         )
 
-    async def _enqueue_internal_completion(
-        self,
-        event: MessageEvent,
-        caller: CallerContext,
-    ) -> None:
-        """将内部 completion 原子入队并创建直接恢复 anchor。"""
+    def _completion_authority_for_message(self, message: QueueMessage) -> CallerContext:
+        """恢复内部 completion 时绝不信任原用户或持久化权限快照。"""
+        return self._restricted_completion_authority(
+            user_id=message.user_id,
+            chat_type=message.chat_type,
+            chat_id=message.chat_id,
+        )
+
+    async def _enqueue_internal_completion(self, event: MessageEvent) -> None:
+        """将内部 completion 原子入队并创建无 OneBot 工具的恢复 anchor。"""
         source = event.source
         chat_id = str(source.chat_id)
+        caller = self._restricted_completion_authority(
+            user_id=str(source.user_id or ""),
+            chat_type="group",
+            chat_id=chat_id,
+        )
         metadata = dict(event.metadata or {})
         metadata["onebot11_mentioned_self"] = False
         metadata["onebot11_internal_completion"] = True
         metadata["onebot11_authority"] = {
             "role": caller.role,
-            "allowed_tools": sorted(caller.allowed_tools),
+            "allowed_tools": [],
             "self_id": caller.self_id,
         }
         message_id = self._stable_message_id(
@@ -2601,12 +2612,11 @@ class OneBot11Adapter(BasePlatformAdapter):
                 },
             )
             return
-        caller = self._caller_for_event(source)
-        event.metadata = dict(event.metadata or {})
-        event.metadata["onebot11_caller_context"] = _serializable_caller(caller)
         if source.chat_type == "group" and self._is_async_completion_event(event):
-            await self._enqueue_internal_completion(event, caller)
+            await self._enqueue_internal_completion(event)
             return
+        caller = self._caller_for_event(source)
+        event.metadata["onebot11_caller_context"] = _serializable_caller(caller)
         if source.chat_type == "dm":
             event_token = _CURRENT_EVENT.set(event)
             token = _CURRENT_CALLER.set(caller)
