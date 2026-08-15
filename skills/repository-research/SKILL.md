@@ -44,7 +44,7 @@ metadata:
 ## 阶段五：证据
 
 保存以下证据：命令摘要、版本与 commit、服务 mode/ready、浏览器 executable 与 viewport、console/page error、关键资源失败、截图、媒体路径和版本化 manifest。截图必须来自真实 adapter entry path；focused test 不能冒充真实浏览器或真人证据。
-
+同一 manifest 中，`manifest.evidence.files` 只表示保留在 evidence 目录的证据文件名，不能作为 `MEDIA:` 路径；只有 `manifest.evidence.mediaFiles` 中的安全绝对路径才允许逐行回传。不得从 `repository.root`、截图文件名或 evidence 路径自行重构媒体路径；`mediaFiles` 缺失或为空时报告未验证/阻塞，不输出 `MEDIA:`。
 manifest 是回传事实的唯一来源。凭据、token、完整启动 nonce、原始命令参数和真实 Project 内容不进入 manifest、日志或最终正文。
 
 ## 阶段六：判定

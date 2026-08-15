@@ -4511,6 +4511,30 @@ async def test_send_image_file使用base64segment并保留reply(monkeypatch, fak
         assert segments[2] == {"type": "text", "data": {"text": "图片说明"}}
     finally:
         await adapter.disconnect()
+async def test_validate_media_delivery_path拒绝仓库证据并接受Hermes媒体缓存(
+    monkeypatch, tmp_path
+):
+    """MEDIA 只能引用 Hermes 媒体缓存，不能直接发送仓库 evidence 源文件。"""
+    hermes_home = tmp_path / "hermes-home"
+    cache_root = hermes_home / "cache" / "images"
+    cache_root.mkdir(parents=True)
+    source_path = tmp_path / "repo" / "evidence" / "evidence-settings-mobile.png"
+    source_path.parent.mkdir(parents=True)
+    payload = b"\x89PNG\r\n\x1a\nmedia-contract"
+    source_path.write_bytes(payload)
+    cache_path = cache_root / "run-mobile.png"
+    cache_path.write_bytes(payload)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    try:
+        assert adapter.validate_media_delivery_path(str(source_path)) is None
+        assert adapter.validate_media_delivery_path(str(cache_path)) == str(cache_path.resolve())
+    finally:
+        await adapter.disconnect()
 
 
 async def test_send默认转换为纯文本并记录marker不可用(monkeypatch, fake_http_server):

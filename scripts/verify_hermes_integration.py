@@ -152,6 +152,8 @@ async def _smoke(
     skill_text = skill_path.read_text(encoding="utf-8")
     if "name: repository-research" not in skill_text or not skill_description:
         raise AssertionError("repository-research Skill frontmatter 或描述无效")
+    if "manifest.evidence.mediaFiles" not in skill_text or "manifest.evidence.files" not in skill_text:
+        raise AssertionError("repository-research Skill 未声明唯一媒体路径来源")
     queue_db = hermes_home / "onebot11" / "integration.sqlite3"
     config = PlatformConfig(
         enabled=True,
