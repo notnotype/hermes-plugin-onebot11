@@ -242,6 +242,25 @@ def test_子代理继承shell但不继承OneBot和编排权限():
     ) is not None
 
 
+def test_子代理截图提示只允许manifest媒体事实来源():
+    """delegated child 不得把 stdout、evidence 或裸路径伪装成 MEDIA。"""
+    context = CallerContext(
+        user_id="1259901822",
+        chat_type="group",
+        chat_id="942513604",
+        role="user",
+        allowed_tools=frozenset(),
+        self_id="3101482118",
+    )
+    prompt = role_prompt(context, delegated_child=True)
+    assert "repository-research-adapter profile" in prompt
+    assert "严格执行其 command" in prompt
+    assert "manifest 是唯一事实来源" in prompt
+    assert "manifest.evidence.mediaFiles" in prompt
+    assert "runner stdout 都不能直接改写成 MEDIA:" in prompt
+    assert "mediaFiles 缺失或校验失败时不得输出 MEDIA:" in prompt
+
+
 def test_search_files覆盖grep和glob说明():
     """权限提示明确告诉模型 search_files 是只读 Grep/Glob 替代。"""
     context = CallerContext(
@@ -349,6 +368,28 @@ def test_客服只读提示要求先复用经验并自动后台委派():
     assert "不要声称自己拥有未出现在当前允许工具列表中的浏览器" in prompt
     assert "不得声称截图已完成或服务已启动" in prompt
 
+
+def test_客服媒体提示禁止裸路径改写为MEDIA():
+    """提示词必须要求 manifest 媒体根复制和复核，拒绝裸截图路径。"""
+    context = CallerContext(
+        user_id="1259901822",
+        chat_type="group",
+        chat_id="942513604",
+        role="user",
+        allowed_tools=frozenset({"read_file", "search_files", "delegate_task"}),
+        self_id="3101482118",
+    )
+    prompt = role_prompt(context, main_agent_read_only=True)
+    assert "读取项目 adapter 的 manifest" in prompt
+    assert "manifest 是媒体回传事实的唯一来源" in prompt
+    assert "只有 manifest.evidence.mediaFiles 中明确给出的安全绝对路径" in prompt
+    assert "重新检查 PNG 魔数、大小和 realpath" in prompt
+    assert "runner stdout、manifest.evidence.files、仓库路径、evidence 路径、截图文件名或任意裸路径都不是媒体授权来源" in prompt
+    assert "不能改写成 MEDIA:" in prompt
+    assert "mediaFiles 缺失或为空" in prompt
+    assert "先调用 skill_view 查看 repository-research" in prompt
+    assert "严格执行 profile 的 command" in prompt
+    assert "禁止临时拼接 bun run dev、product:start、裸 Playwright 或后台 shell" in prompt
 
 def test_terminal写敏感配置被拦截():
     """terminal 写 config.yaml/roles.yaml/.env 等必须被 OneBot 侧拒绝。"""
