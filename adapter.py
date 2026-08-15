@@ -3884,7 +3884,10 @@ class OneBot11Adapter(BasePlatformAdapter):
                 "OneBot11 anchor authority self_id 属于其他机器人",
             )
             raise PermissionError("OneBot11 durable anchor authority self_id 不匹配")
-        if trigger.anchor_kind not in {"operator", "admin_flush"}:
+        if trigger.anchor_kind not in {"operator", "admin_flush"} and not all(
+            bool(message.metadata.get("onebot11_internal_completion"))
+            for message in lease.messages
+        ):
             message_authority = self._authority_for_queued_message(anchor_message)
             trigger_tools = frozenset(
                 tool
