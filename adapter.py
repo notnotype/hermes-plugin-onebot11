@@ -2200,6 +2200,110 @@ class OneBot11Adapter(BasePlatformAdapter):
             return None
         return str(candidate)
 
+    def _manifest_media_paths(self) -> frozenset[str]:
+        """读取已通过收口校验的仓库调研 manifest 媒体路径。"""
+        evidence_root = (self._hermes_home / "evidence").resolve(strict=False)
+        if not evidence_root.is_dir():
+            return frozenset()
+        approved: set[str] = set()
+        try:
+            manifests = list(evidence_root.rglob("repository-research-run.json"))
+        except OSError:
+            return frozenset()
+        for manifest_path in manifests[:256]:
+            try:
+                resolved_manifest = manifest_path.resolve(strict=True)
+                if not (
+                    resolved_manifest == evidence_root
+                    or evidence_root in resolved_manifest.parents
+                ):
+                    continue
+                if resolved_manifest.stat().st_size > 1_048_576:
+                    continue
+                payload = json.loads(resolved_manifest.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, Mapping):
+                continue
+            if payload.get("schema") != "nbook.repository-research-run/v1":
+                continue
+            result = payload.get("result")
+            cleanup = payload.get("cleanup")
+            evidence = payload.get("evidence")
+            if not (
+                isinstance(result, Mapping)
+                and result.get("status") == "passed"
+                and isinstance(cleanup, Mapping)
+                and cleanup.get("browser") in {"closed", "killed"}
+                and cleanup.get("service") in {"graceful", "forced"}
+                and cleanup.get("portClosed") is True
+                and cleanup.get("ownedTempRootsRemoved") is True
+                and cleanup.get("sharedCachePreserved") is True
+                and isinstance(evidence, Mapping)
+            ):
+                continue
+            media_files = evidence.get("mediaFiles")
+            if not isinstance(media_files, list):
+                continue
+            for raw_path in media_files[:4]:
+                if not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
+                    continue
+                safe_path = self._validate_manifest_media_path(raw_path)
+                if safe_path is not None:
+                    approved.add(safe_path)
+        return frozenset(approved)
+
+    def _validate_manifest_media_path(self, raw_path: str) -> str | None:
+        """校验 manifest 中的绝对图片路径、魔数和受控根目录。"""
+        safe_path = self.validate_media_delivery_path(raw_path)
+        if safe_path is None:
+            return None
+        path = Path(safe_path)
+        if path.suffix.casefold() not in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+            return None
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return None
+        if len(data) > self._api.max_media_bytes:
+            return None
+        return safe_path if matches_image_magic(data, "", path.name) else None
+
+    def filter_media_delivery_paths(self, media_files: Any) -> list[tuple[str, bool]]:
+        """只允许 manifest.evidence.mediaFiles 中的安全路径进入 MEDIA 出站。"""
+        approved = self._manifest_media_paths()
+        safe_media: list[tuple[str, bool]] = []
+        for item in media_files or []:
+            try:
+                raw_path, is_voice = item
+            except (TypeError, ValueError):
+                continue
+            safe_path = self.validate_media_delivery_path(str(raw_path))
+            if safe_path is not None and safe_path in approved:
+                safe_media.append((safe_path, bool(is_voice)))
+            else:
+                logger.warning(
+                    "OneBot11 拒绝非 manifest 媒体路径: basename=%s",
+                    Path(str(raw_path)).name[:128],
+                )
+        return safe_media
+
+    def filter_local_delivery_paths(self, file_paths: Any) -> list[str]:
+        """阻止裸本地路径绕过 MEDIA manifest 合同进入原生附件出站。"""
+        approved = self._manifest_media_paths()
+        safe_paths: list[str] = []
+        for raw_path in file_paths or []:
+            safe_path = self.validate_media_delivery_path(str(raw_path))
+            if safe_path is not None and safe_path in approved:
+                safe_paths.append(safe_path)
+            else:
+                logger.warning(
+                    "OneBot11 拒绝非 manifest 裸媒体路径: basename=%s",
+                    Path(str(raw_path)).name[:128],
+                )
+        return safe_paths
+
+
     def _supports_channel_prompt(self) -> bool:
         """检测当前 Hermes 的 MessageEvent 是否支持临时 channel_prompt。"""
         if self._channel_prompt_supported is not None:

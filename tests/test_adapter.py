@@ -4537,6 +4537,54 @@ async def test_validate_media_delivery_path拒绝仓库证据并接受Hermes媒�
         await adapter.disconnect()
 
 
+async def test_filter_media_delivery_paths只接受manifest中的安全媒体(
+    monkeypatch, tmp_path
+):
+    """MEDIA 和裸路径都不能把缓存内未获 manifest 授权的文件带出。"""
+    hermes_home = tmp_path / "hermes-home"
+    cache_root = hermes_home / "cache" / "images"
+    evidence_root = hermes_home / "evidence" / "run-1"
+    cache_root.mkdir(parents=True)
+    evidence_root.mkdir(parents=True)
+    approved_path = cache_root / "approved.png"
+    unapproved_path = cache_root / "unapproved.png"
+    payload = b"\x89PNG\r\n\x1a\napproved"
+    approved_path.write_bytes(payload)
+    unapproved_path.write_bytes(payload)
+    (evidence_root / "repository-research-run.json").write_text(
+        json.dumps(
+            {
+                "schema": "nbook.repository-research-run/v1",
+                "result": {"status": "passed"},
+                "cleanup": {
+                    "browser": "closed",
+                    "service": "forced",
+                    "portClosed": True,
+                    "ownedTempRootsRemoved": True,
+                    "sharedCachePreserved": True,
+                },
+                "evidence": {"mediaFiles": [str(approved_path)]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    try:
+        assert adapter.filter_media_delivery_paths(
+            [(str(approved_path), False), (str(unapproved_path), False)]
+        ) == [(str(approved_path.resolve()), False)]
+        assert adapter.filter_local_delivery_paths(
+            [str(approved_path), str(unapproved_path)]
+        ) == [str(approved_path.resolve())]
+    finally:
+        await adapter.disconnect()
+
+
 async def test_send默认转换为纯文本并记录marker不可用(monkeypatch, fake_http_server):
     """OneBot 出站不应把 Markdown 语法或图片 marker 原样发送。"""
     base, calls = fake_http_server
