@@ -776,6 +776,7 @@ class OneBot11Adapter(BasePlatformAdapter):
             max_inflight=self._ws_max_inflight,
         )
         await self._ws.start()
+        await self._recover_internal_completion_triggers()
         await self._dispatcher.recover()
         if self.trigger_config.llm_enabled:
             pending_chats = await asyncio.to_thread(self._queue.pending_chat_ids)
@@ -2420,6 +2421,168 @@ class OneBot11Adapter(BasePlatformAdapter):
         if should_notify:
             await self._dispatcher.notify(chat_id)
 
+    @staticmethod
+    def _is_async_completion_event(event: MessageEvent) -> bool:
+        """只识别 Hermes 明确标记的内部异步委派完成事件。"""
+        if not bool(getattr(event, "internal", False)):
+            return False
+        metadata = getattr(event, "metadata", None) or {}
+        if not str(metadata.get("gateway_session_id") or "").strip():
+            return False
+        text = str(getattr(event, "text", "") or "").lstrip()
+        return text.startswith(
+            (
+                "[ASYNC DELEGATION COMPLETE — ",
+                "[ASYNC DELEGATION BATCH COMPLETE — ",
+            )
+        )
+
+    @staticmethod
+    def _is_persisted_async_completion(message: QueueMessage) -> bool:
+        """识别重启前已入队、但尚未创建 anchor 的内部 completion。"""
+        metadata = message.metadata
+        if not str(metadata.get("gateway_session_id") or "").strip():
+            return False
+        if bool(metadata.get("onebot11_internal_completion")):
+            return True
+        text = str(message.text or "").lstrip()
+        return text.startswith(
+            (
+                "[ASYNC DELEGATION COMPLETE — ",
+                "[ASYNC DELEGATION BATCH COMPLETE — ",
+            )
+        )
+
+    def _completion_authority_for_message(self, message: QueueMessage) -> CallerContext:
+        """恢复内部 completion 时优先使用快照，否则按原用户当前角色降权。"""
+        authority = self._authority_for_queued_message(message)
+        if authority.role in ROLE_NAMES and authority.self_id == self.self_id:
+            return authority
+        role = role_for_user(message.user_id, self.super_admins, self.trusted_users)
+        return CallerContext(
+            user_id=message.user_id,
+            chat_type=message.chat_type,
+            chat_id=message.chat_id,
+            role=role,
+            allowed_tools=self.role_tools.get(role, frozenset()),
+            self_id=self.self_id,
+            adapter_epoch=self._adapter_epoch,
+        )
+
+    async def _enqueue_internal_completion(
+        self,
+        event: MessageEvent,
+        caller: CallerContext,
+    ) -> None:
+        """将内部 completion 原子入队并创建直接恢复 anchor。"""
+        source = event.source
+        chat_id = str(source.chat_id)
+        metadata = dict(event.metadata or {})
+        metadata["onebot11_mentioned_self"] = False
+        metadata["onebot11_internal_completion"] = True
+        metadata["onebot11_authority"] = {
+            "role": caller.role,
+            "allowed_tools": sorted(caller.allowed_tools),
+            "self_id": caller.self_id,
+        }
+        message_id = self._stable_message_id(
+            event.message_id,
+            chat_id=chat_id,
+            text=event.text,
+            metadata=metadata,
+        )
+        message_key = self._stable_message_key(
+            event.message_id,
+            chat_type="group",
+            chat_id=chat_id,
+            text=event.text,
+            metadata=metadata,
+        )
+        message = QueueMessage(
+            chat_id=chat_id,
+            chat_type="group",
+            message_id=message_id,
+            user_id=str(source.user_id or caller.user_id),
+            user_name=str(source.user_name or source.user_id or caller.user_id),
+            text=event.text,
+            raw_text=event.text,
+            metadata=metadata,
+            message_key=message_key,
+        )
+        trigger = TriggerRequest.create(
+            chat_id,
+            message_key,
+            "completion_recovery",
+            caller.user_id,
+            str(source.user_name or caller.user_id),
+            anchor_kind="recovery",
+            authority_role=caller.role,
+            authority_tools=caller.allowed_tools,
+            authority_self_id=caller.self_id,
+        )
+        async with self._trigger_lock_for(chat_id):
+            state = self._trigger_states.get(chat_id)
+            if state is not None:
+                state.invalidate_judgement()
+            result = await asyncio.to_thread(
+                self._queue.enqueue,
+                message,
+                trigger,
+            )
+        self._cancel_llm_judgement(chat_id)
+        self._schedule_clear_queued_reaction(chat_id)
+        if result.trigger_request_id:
+            await self._dispatcher.notify(chat_id)
+
+    async def _recover_internal_completion_triggers(self) -> None:
+        """重启时为旧内部 completion 补齐缺失的 durable anchor。"""
+        try:
+            pending_chat_ids = await asyncio.to_thread(self._queue.pending_chat_ids)
+        except QueueError:
+            return
+        for chat_id in pending_chat_ids:
+            normalized = str(chat_id)
+            if not self._chat_access_allowed("group", normalized):
+                continue
+            try:
+                status = await asyncio.to_thread(self._queue.status, normalized)
+                if (
+                    status.get("paused")
+                    or int(status.get("pending_trigger_requests", 0) or 0) > 0
+                    or int(status.get("uncertain", 0) or 0) > 0
+                    or int(status.get("failed", 0) or 0) > 0
+                ):
+                    continue
+                messages = await asyncio.to_thread(
+                    self._queue.peek,
+                    normalized,
+                    include_backoff=True,
+                )
+            except QueueError:
+                continue
+            completion = next(
+                (message for message in messages if self._is_persisted_async_completion(message)),
+                None,
+            )
+            if completion is None:
+                continue
+            authority = self._completion_authority_for_message(completion)
+            request_id = await asyncio.to_thread(
+                self._queue.create_trigger,
+                normalized,
+                "completion_recovery",
+                completion.user_id,
+                completion.user_name,
+                str(completion.message_key),
+                anchor_kind="recovery",
+                authority_role=authority.role,
+                authority_tools=authority.allowed_tools,
+                authority_self_id=authority.self_id,
+                triggered_at=time.time(),
+            )
+            if request_id:
+                await self._dispatcher.notify(normalized)
+
     async def handle_message(self, event: MessageEvent) -> None:
         """群消息入队并按触发结果 dispatch；私聊沿用 Hermes 直接 turn。"""
         source = event.source
@@ -2441,6 +2604,9 @@ class OneBot11Adapter(BasePlatformAdapter):
         caller = self._caller_for_event(source)
         event.metadata = dict(event.metadata or {})
         event.metadata["onebot11_caller_context"] = _serializable_caller(caller)
+        if source.chat_type == "group" and self._is_async_completion_event(event):
+            await self._enqueue_internal_completion(event, caller)
+            return
         if source.chat_type == "dm":
             event_token = _CURRENT_EVENT.set(event)
             token = _CURRENT_CALLER.set(caller)

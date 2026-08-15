@@ -5273,6 +5273,132 @@ async def test_直接handle_message仍执行访问策略(monkeypatch):
     await adapter.handle_message(event)
     assert called is False
     await adapter.disconnect()
+async def test_内部completion绕过普通群触发直接创建恢复trigger(monkeypatch):
+    """Hermes 异步 completion 不能因没有 @ 机器人而永久停在 pending。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    notifications: list[str] = []
+
+    async def fake_notify(chat_id: str) -> bool:
+        notifications.append(str(chat_id))
+        return True
+
+    monkeypatch.setattr(adapter._dispatcher, "notify", fake_notify)
+    event = MessageEvent(
+        text="[ASYNC DELEGATION BATCH COMPLETE — deleg_test]\\n截图任务结果",
+        message_type="text",
+        source=adapter.build_source(
+            chat_id="888",
+            chat_name="888",
+            chat_type="group",
+            user_id="123",
+            user_name="小明",
+            role_authorized=True,
+        ),
+        internal=True,
+        metadata={"gateway_session_id": "session-parent"},
+    )
+    await adapter.handle_message(event)
+
+    status = adapter._queue.status("888")
+    assert status["pending"] == 1
+    assert status["pending_trigger_requests"] == 1
+    assert notifications == ["888"]
+    trigger = adapter._queue.recover_trigger_requests({"888"})[0]
+    assert trigger.reason == "completion_recovery"
+    assert trigger.anchor_kind == "recovery"
+    await adapter.disconnect()
+
+
+async def test_重启为已入队内部completion补建trigger(monkeypatch, tmp_path):
+    """旧 Hermes 已把 completion 入队但进程重启时仍必须自动唤醒。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_QUEUE_DB=str(tmp_path / "queue.sqlite3"),
+    )
+    message = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="",
+        user_id="123",
+        user_name="小明",
+        text="[ASYNC DELEGATION COMPLETE — deleg_old]\\n未完成截图",
+        metadata={"gateway_session_id": "session-parent", "onebot11_images": []},
+        message_key="hash:old-completion",
+    )
+    adapter._queue.enqueue(message)
+    notifications: list[str] = []
+
+    async def fake_notify(chat_id: str) -> bool:
+        notifications.append(str(chat_id))
+        return True
+
+    monkeypatch.setattr(adapter._dispatcher, "notify", fake_notify)
+    await adapter._recover_internal_completion_triggers()
+
+    status = adapter._queue.status("888")
+    assert status["pending"] == 1
+    assert status["pending_trigger_requests"] == 1
+    assert notifications == ["888"]
+    trigger = adapter._queue.recover_trigger_requests({"888"})[0]
+    assert trigger.reason == "completion_recovery"
+    await adapter.disconnect()
+
+async def test_内部completion不提升原用户权限且重复事件只保留一个trigger(monkeypatch):
+    """内部回流只能使用原消息快照，重复投递不得制造第二个 anchor。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_SUPER_ADMINS="999",
+    )
+    notifications: list[str] = []
+
+    async def fake_notify(chat_id: str) -> bool:
+        notifications.append(str(chat_id))
+        return True
+
+    monkeypatch.setattr(adapter._dispatcher, "notify", fake_notify)
+    source = adapter.build_source(
+        chat_id="888",
+        chat_name="888",
+        chat_type="group",
+        user_id="123",
+        user_name="普通用户",
+        role_authorized=True,
+    )
+    metadata = {
+        "gateway_session_id": "session-parent",
+        "onebot11_authority": {
+            "role": "user",
+            "allowed_tools": [],
+            "self_id": "1",
+        },
+    }
+    for _ in range(2):
+        await adapter.handle_message(
+            MessageEvent(
+                text="[ASYNC DELEGATION COMPLETE — deleg_duplicate]\\n结果",
+                message_type="text",
+                source=source,
+                internal=True,
+                metadata=dict(metadata),
+            )
+        )
+
+    status = adapter._queue.status("888")
+    assert status["pending"] == 1
+    assert status["pending_trigger_requests"] == 1
+    assert notifications == ["888", "888"]
+    trigger = adapter._queue.recover_trigger_requests({"888"})[0]
+    assert trigger.authority_tools == adapter.role_tools["user"]
+    assert "qq_set_group_whole_ban" not in trigger.authority_tools
+    await adapter.disconnect()
 
 
 async def test_未开始OneBot请求的turn成功也release(monkeypatch):
