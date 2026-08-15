@@ -143,9 +143,7 @@ _TOOL_PROGRESS_LABELS = {
     "cronjob": "正在安排任务",
     "clarify": "正在等待补充信息",
 }
-_TURN_START_ACK_TEXT = (
-    "收到，我先查一下已有资料；有现成答案我会直接回复，需要进一步验证的部分再后台处理。"
-)
+_MAX_LONG_RUNNING_NOTICES = 3
 _CURRENT_CALLER: contextvars.ContextVar[CallerContext | None] = contextvars.ContextVar(
     "onebot11_current_caller", default=None
 )
@@ -557,7 +555,8 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._control_plane_sent_scopes: set[str] = set()
         self._long_running_notice_tasks: dict[str, asyncio.Task[None]] = {}
         self._long_running_notice_events: dict[str, Any] = {}
-        self._turn_start_ack_sent: set[str] = set()
+        self._long_running_notice_counts: dict[str, int] = {}
+        self._long_running_notice_started_at: dict[str, float] = {}
         self._outbound_gate = asyncio.Lock()
         self._aux_event_count = 0
         self._adapter_epoch = 0
@@ -843,7 +842,8 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._control_plane_sent_scopes.clear()
         self._long_running_notice_tasks.clear()
         self._long_running_notice_events.clear()
-        self._turn_start_ack_sent.clear()
+        self._long_running_notice_counts.clear()
+        self._long_running_notice_started_at.clear()
         self._bindings.clear()
 
     def _policy_config_signature(self) -> tuple[object, ...] | None:
@@ -1973,16 +1973,21 @@ class OneBot11Adapter(BasePlatformAdapter):
         return f"{scope}:control:{kind}"
 
     def _schedule_long_running_notice(self, event: Any, lease_id: str) -> None:
-        """为一个活动群 turn 安排一次性长时间处理提示（保存 event 供重置复用）。"""
+        """为活动群 turn 安排最多三次有界长任务进度提示。"""
         delay = float(self.policy_snapshot.long_running_notice_seconds)
         normalized_lease_id = str(lease_id or "").strip()
         if self._closed or delay <= 0 or not normalized_lease_id:
+            return
+        if self._long_running_notice_counts.get(normalized_lease_id, 0) >= _MAX_LONG_RUNNING_NOTICES:
             return
         current = self._long_running_notice_tasks.get(normalized_lease_id)
         if current is not None and not current.done():
             return
         try:
+            loop = asyncio.get_running_loop()
             self._long_running_notice_events[normalized_lease_id] = event
+            self._long_running_notice_counts.setdefault(normalized_lease_id, 0)
+            self._long_running_notice_started_at.setdefault(normalized_lease_id, loop.time())
             task = asyncio.create_task(
                 self._send_long_running_notice_after_delay(
                     event,
@@ -1996,7 +2001,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._long_running_notice_tasks[normalized_lease_id] = task
 
     def _reset_long_running_notice(self, chat_id: str) -> None:
-        """中间正文成功发送后重置当前活动 turn 的长时间处理计时器。"""
+        """中间正文成功发送后重置计时器，但不重置本 turn 的总次数上限。"""
         normalized = str(chat_id or "").strip()
         if self._closed or not normalized:
             return
@@ -2008,11 +2013,15 @@ class OneBot11Adapter(BasePlatformAdapter):
             return
         current = self._long_running_notice_tasks.pop(lease_id, None)
         if current is not None and not current.done():
-            # 只有取消一个仍在等待的计时器才重新排程；提示已经发出后
-            # （task 已完成）不再重建，避免同一 turn 反复出现"仍在处理中"。
+            # 只取消仍在等待的计时器；已经发送的次数保留，避免中间正文不断
+            # 重置计时器时突破同一 turn 的三次上限。
             current.cancel()
             event = self._long_running_notice_events.get(lease_id)
-            if event is not None:
+            if (
+                event is not None
+                and self._long_running_notice_counts.get(lease_id, 0)
+                < _MAX_LONG_RUNNING_NOTICES
+            ):
                 self._schedule_long_running_notice(event, lease_id)
 
     async def _send_long_running_notice_after_delay(
@@ -2021,51 +2030,63 @@ class OneBot11Adapter(BasePlatformAdapter):
         lease_id: str,
         delay: float,
     ) -> None:
-        """等待指定时间后发送一次控制面提示，不改变业务出站阶段。"""
+        """按固定间隔发送最多三次状态提示，不改变业务出站阶段。"""
         try:
-            await asyncio.sleep(max(0.0, float(delay)))
-            if self._closed or lease_id in self._fenced_leases:
-                return
-            if not self._lease_is_current(lease_id):
-                return
-            metadata = dict(getattr(event, "metadata", None) or {})
-            target = metadata.get("onebot11_target")
-            if not isinstance(target, Mapping):
-                return
-            chat_id = str(target.get("chat_id") or "")
-            if not chat_id or not self._chat_access_allowed("group", chat_id):
-                return
-            # 控制面通知不需要 Hermes turn binding：lease 与访问策略已在
-            # 上方校验，直接走 OneBot API 发送，避免 worker 线程 binding
-            # 恢复失败导致提示永远发不出去。
-            result = await self._send_notice_message(
-                chat_id,
-                "仍在处理中，请稍候…",
-                reply_to=str(metadata.get("onebot11_anchor_message_id") or "") or None,
-                lease_id=lease_id,
-            )
-            if not result.success:
-                logger.info(
-                    "OneBot11 长时间处理提示未发送: lease=%s error=%s",
-                    lease_id,
-                    result.error,
+            loop = asyncio.get_running_loop()
+            for _ in range(_MAX_LONG_RUNNING_NOTICES):
+                await asyncio.sleep(max(0.0, float(delay)))
+                if self._closed or lease_id in self._fenced_leases:
+                    return
+                if not self._lease_is_current(lease_id):
+                    return
+                completed = self._long_running_notice_counts.get(lease_id, 0)
+                if completed >= _MAX_LONG_RUNNING_NOTICES:
+                    return
+                metadata = dict(getattr(event, "metadata", None) or {})
+                target = metadata.get("onebot11_target")
+                if not isinstance(target, Mapping):
+                    return
+                chat_id = str(target.get("chat_id") or "")
+                if not chat_id or not self._chat_access_allowed("group", chat_id):
+                    return
+                notice_index = completed + 1
+                started_at = self._long_running_notice_started_at.get(lease_id, loop.time())
+                elapsed_seconds = max(1, round(loop.time() - started_at))
+                content = (
+                    f"后台任务已运行约 {elapsed_seconds} 秒，仍在执行；"
+                    "完成后会继续回复。"
                 )
-                self._audit.record(
-                    "long_running_notice",
-                    {
-                        "chat_id": chat_id,
-                        "lease_id": lease_id,
-                        "sent": False,
-                        "error": str(result.error or "")[:200],
-                    },
+                result = await self._send_notice_message(
+                    chat_id,
+                    content,
+                    reply_to=str(metadata.get("onebot11_anchor_message_id") or "") or None,
+                    lease_id=lease_id,
                 )
-            else:
+                if not result.success:
+                    logger.info(
+                        "OneBot11 长时间处理提示未发送: lease=%s error=%s",
+                        lease_id,
+                        result.error,
+                    )
+                    self._audit.record(
+                        "long_running_notice",
+                        {
+                            "chat_id": chat_id,
+                            "lease_id": lease_id,
+                            "sent": False,
+                            "notice_index": notice_index,
+                            "error": str(result.error or "")[:200],
+                        },
+                    )
+                    return
+                self._long_running_notice_counts[lease_id] = notice_index
                 self._audit.record(
                     "long_running_notice",
                     {
                         "chat_id": chat_id,
                         "lease_id": lease_id,
                         "sent": True,
+                        "notice_index": notice_index,
                     },
                 )
         except asyncio.CancelledError:
@@ -2080,6 +2101,12 @@ class OneBot11Adapter(BasePlatformAdapter):
             current = self._long_running_notice_tasks.get(lease_id)
             if current is asyncio.current_task():
                 self._long_running_notice_tasks.pop(lease_id, None)
+                if self._long_running_notice_counts.get(lease_id, 0) >= _MAX_LONG_RUNNING_NOTICES:
+                    self._long_running_notice_events.pop(lease_id, None)
+                    self._long_running_notice_counts.pop(lease_id, None)
+                    self._long_running_notice_started_at.pop(lease_id, None)
+
+
 
     async def _send_notice_message(
         self,
@@ -2125,9 +2152,11 @@ class OneBot11Adapter(BasePlatformAdapter):
             )
 
     async def _cancel_long_running_notice(self, lease_id: str) -> None:
-        """取消一个 turn 的一次性长时间提示。"""
+        """取消一个 turn 尚未完成的有界长任务提示。"""
         normalized = str(lease_id)
         self._long_running_notice_events.pop(normalized, None)
+        self._long_running_notice_counts.pop(normalized, None)
+        self._long_running_notice_started_at.pop(normalized, None)
         task = self._long_running_notice_tasks.pop(normalized, None)
         if task is None or task is asyncio.current_task():
             return
@@ -2139,6 +2168,8 @@ class OneBot11Adapter(BasePlatformAdapter):
         tasks = list(self._long_running_notice_tasks.values())
         self._long_running_notice_tasks.clear()
         self._long_running_notice_events.clear()
+        self._long_running_notice_counts.clear()
+        self._long_running_notice_started_at.clear()
         for task in tasks:
             task.cancel()
         if tasks:
@@ -3940,35 +3971,6 @@ class OneBot11Adapter(BasePlatformAdapter):
         media_dir = self._new_media_dir() if has_images else self._media_dir
         handed_off = False
         try:
-            # 客服群开启中间反馈时，先发送确定性的中文回执，再进入媒体、模型
-            # 和工具循环；这条控制面消息不进入 Hermes transcript。
-            if self.show_interim_group and lease.lease_id not in self._turn_start_ack_sent:
-                self._turn_start_ack_sent.add(lease.lease_id)
-                try:
-                    ack_result = await self._send_notice_message(
-                        lease.chat_id,
-                        _TURN_START_ACK_TEXT,
-                        reply_to=reply_id,
-                        lease_id=lease.lease_id,
-                    )
-                except Exception as exc:
-                    # 首条回执是体验增强，不得把 OneBot 控制面故障升级成
-                    # Hermes turn 启动失败；业务 turn 仍继续执行。
-                    ack_result = SendResult(
-                        False,
-                        error=f"首条回执发送异常: {type(exc).__name__}",
-                        error_kind="unknown",
-                    )
-                _safe_audit(
-                    self,
-                    "turn_start_ack",
-                    {
-                        "chat_id": lease.chat_id,
-                        "lease_id": lease.lease_id,
-                        "sent": bool(ack_result.success),
-                        "error_kind": ack_result.error_kind,
-                    },
-                )
             reaction_message_id = await self._set_processing_reaction(lease, enabled=True)
             if reaction_message_id is not None:
                 self._processing_reaction_message_ids[lease.lease_id] = reaction_message_id
@@ -4143,7 +4145,6 @@ class OneBot11Adapter(BasePlatformAdapter):
                 _CURRENT_EVENT.reset(event_token)
         finally:
             if not handed_off:
-                self._turn_start_ack_sent.discard(lease.lease_id)
                 self._lease_session_keys.pop(lease.lease_id, None)
                 await self._clear_processing_reaction(lease.lease_id)
                 self._cleanup_media(
@@ -5084,7 +5085,6 @@ class OneBot11Adapter(BasePlatformAdapter):
                         exc_info=True,
                     )
             self._unknown_leases.discard(lease_id)
-            self._turn_start_ack_sent.discard(lease_id)
             self._outbound_started.discard(lease_id)
             self._outbound_successful.discard(lease_id)
             self._outbound_known_failure.discard(lease_id)

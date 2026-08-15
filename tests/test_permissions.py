@@ -346,6 +346,8 @@ def test_客服只读提示要求先复用经验并自动后台委派():
     assert "已有客服 evidence、项目 skill 和项目文档" in prompt
     assert "不要默认调用 skill_manage" in prompt
     assert "目录不可写时" in prompt
+    assert "不要声称自己拥有未出现在当前允许工具列表中的浏览器" in prompt
+    assert "不得声称截图已完成或服务已启动" in prompt
 
 
 def test_terminal写敏感配置被拦截():

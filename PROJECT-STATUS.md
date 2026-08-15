@@ -23,7 +23,7 @@
 | `onebot11/media.py` | 完成 | 当前 turn 内按规范化来源和内容 hash 做防御性媒体去重，不跨 turn/重启承诺 exactly-once |
 | `onebot11/formatting.py` | 完成 | OneBot 默认纯文本转换、Markdown image marker 清理和不可用 renderer 审计 |
 | `onebot11/tools.py` | 完成 | 当前群/私聊范围查询和群管理写工具；写操作必须确认 |
-| `adapter.py` | 完成代码收口 | Hermes glue、shared session、入站访问策略、generic/OneBot 工具 hooks、群级 slash/context command、工具 handler、群 turn 💬 正在回复指示器（默认 `128172`，可配置）、selector 候选 👀 查看提示（含候选替换/清理）、一次性长时间提示（默认 60s，直接发送不依赖 turn binding，成功/失败写审计）、Agent 最终回复的文本/图片出站生命周期、base64 segment、同轮媒体去重、纯文本、显式控制面消息、运行时 policy snapshot/reload、媒体回收、统一配置解析、raw self_id、消息身份/上下文注入、operation resolve、pi-ai selector、按 event metadata 恢复精确 binding、`_reply_asks_user`（回复问句/请求短语收尾标记 bot_asked）、`_message_replies_to_bot`（reply 目标等于 bot 最后消息时视为引用）；通用 `send_message`/cron plugin media 不是本轮可靠性合同 |
+| `adapter.py` | 完成代码收口 | Hermes glue、shared session、入站访问策略、generic/OneBot 工具 hooks、群级 slash/context command、工具 handler、群 turn 💬 正在回复指示器（默认 `128172`，可配置）、selector 候选 👀 查看提示（含候选替换/清理）、最多三次长任务提示（默认 60s，直接发送不依赖 turn binding，成功/失败写审计）、不再发送泛化自动回执、Agent 最终回复的文本/图片出站生命周期、base64 segment、同轮媒体去重、纯文本、显式控制面消息、运行时 policy snapshot/reload、媒体回收、统一配置解析、raw self_id、消息身份/上下文注入、operation resolve、pi-ai selector、按 event metadata 恢复精确 binding、`_reply_asks_user`（回复问句/请求短语收尾标记 bot_asked）、`_message_replies_to_bot`（reply 目标等于 bot 最后消息时视为引用）；通用 `send_message`/cron plugin media 不是本轮可靠性合同
 | `onebot11/pi_ai.py` + `scripts/onebot11-pi-trigger.mjs` | 完成 | 零 Hermes 依赖的 Python/Node 短生命周期旁路客户端，固定 pi-ai 版本、环境变量密钥、无语义重试和失败分类 |
 | 文档/ADR | 完成 | README、权限、状态、Task 2/3/5/6/7 walkthrough、pi-ai、reconnect、operation ledger、TurnAnchor、session command 和验收边界同步到当前合同 |
 
@@ -61,7 +61,7 @@ Arch 当前生产 queue schema 现场未在本轮改写；本轮未直接编辑�
 
 当前仍需单独完成：
 
-- 取得目标客服群 `942513604` 的真人客户端入站消息，验证中文即时回执、固定工具进度、后台 delegated child completion 和最终回复在 QQ 上的可见顺序。
+- 取得目标客服群 `942513604` 的真人客户端入站消息，验证 Hermes 中间正文、最多三次有界长任务状态提示、后台 delegated child completion 和最终回复在 QQ 上的可见顺序。
 - 在真人链路可用后，验证两名真人群成员同时 @、selector/engage 窗口和图片-only/文字+图片场景。
 - 制造并人工处理非幂等出站 `unknown` 与 `resolve action retry|discard`；不执行真实禁言、踢人、撤回或全员禁言。
 - LLBot 当前请求日志会打印 Bearer header；插件不会把 token 发送到外部媒体地址，但部署侧应在生产前关闭该日志或轮换 token。未在本轮擅自修改 LLBot 凭据。
@@ -75,7 +75,7 @@ Arch 当前生产 queue schema 现场未在本轮改写；本轮未直接编辑�
 - 消息处理是至少一次语义；OneBot 11 非幂等请求无法提供 exactly-once，因此未知结果不自动重试。
 - Agent 最终回复图片是主要出站媒体场景；`send_message`、cron 和 standalone plugin media 的结果合同不在本轮收口范围，按安全降级处理。
 - 不自动迁移旧的群 `per_user` session 历史到新的 shared session；需要人工决定是否清理旧历史。
-- 本轮不纳入 OneBot 12、语音转写、复杂管理后台、RAG/向量库、运行时自优化和强制语义摘要模型。⏳ 只是 selector 等待提示（best-effort、内存登记），不是周期性心跳，也不纳入崩溃后 exactly-once 清理承诺；长时间运行提示仍只保留一次性状态提示。
+- 本轮不纳入 OneBot 12、语音转写、复杂管理后台、RAG/向量库、运行时自优化和强制语义摘要模型。⏳ 只是 selector 等待提示（best-effort、内存登记），不是周期性心跳，也不纳入崩溃后 exactly-once 清理承诺；长任务提示最多发送三次，完成、取消、lease 失效或发送失败即停止。
 - `trusted_user` 不能使用 OneBot 群管理写工具；Hermes generic 高风险工具仍必须在
   `roles.trusted_user.tools` 中逐项显式配置。权限、白名单和角色变化不由 Agent 运行时修改。
 - `/onebot reload` 只热更新策略字段；连接、凭据、self_id、队列路径和 session 模式仍需重启。环境变量继续覆盖 YAML。

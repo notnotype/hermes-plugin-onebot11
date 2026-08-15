@@ -4618,10 +4618,10 @@ async def test_控制面通知同一turn只发送一次并兼容系统错误meta
         await adapter.disconnect()
 
 
-async def test_长时间运行提示只发送一次且不污染业务marker(
+async def test_长时间运行提示最多发送三次且不污染业务marker(
     monkeypatch, fake_http_server
 ):
-    """活动 turn 超过延迟后只发送一次控制面提示。"""
+    """活动 turn 超过延迟后最多发送三次有界状态提示。"""
     base, calls = fake_http_server
     adapter = _make_adapter(
         monkeypatch,
@@ -4658,19 +4658,50 @@ async def test_长时间运行提示只发送一次且不污染业务marker(
     )
     try:
         adapter._schedule_long_running_notice(event, "long-running-lease")
-        await asyncio.sleep(0.05)
-        adapter._schedule_long_running_notice(event, "long-running-lease")
-        await asyncio.sleep(0)
-        assert len(calls) == 1
-        assert calls[0]["params"]["message"][1]["data"]["text"] == (
-            "仍在处理中，请稍候…"
-        )
+        await asyncio.sleep(0.08)
+        sent_texts = [
+            segment.get("data", {}).get("text", "")
+            for call in calls
+            for segment in call["params"].get("message", [])
+            if segment.get("type") == "text"
+        ]
+        assert len(sent_texts) == 3
+        assert all("后台任务已运行约" in text for text in sent_texts)
         assert adapter._outbound_started == set()
         assert adapter.SUPPORTS_MESSAGE_EDITING is False
         assert adapter.format_tool_event({"kind": "tool"}) is None
     finally:
         adapter._bindings.clear()
         await adapter.disconnect()
+async def test_中间正文重置不突破长任务提示上限(monkeypatch, fake_http_server):
+    """达到三条提示后，中间正文重置计时器不能重新排程。"""
+    base, _calls = fake_http_server
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API=base,
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_LONG_RUNNING_NOTICE_SECONDS="0.01",
+    )
+    await adapter.connect()
+    adapter._chat_types["888"] = "group"
+    adapter._targets["888"] = adapter_module.ChatTarget("group", "888")
+    adapter._dispatcher._active["888"] = SimpleNamespace(
+        lease=SimpleNamespace(lease_id="reset-cap-lease")
+    )
+    adapter._long_running_notice_counts["reset-cap-lease"] = 3
+    adapter._long_running_notice_events["reset-cap-lease"] = SimpleNamespace(metadata={})
+    pending_task = asyncio.create_task(asyncio.sleep(60))
+    adapter._long_running_notice_tasks["reset-cap-lease"] = pending_task
+    try:
+        adapter._reset_long_running_notice("888")
+        await asyncio.sleep(0)
+        assert pending_task.done()
+        assert "reset-cap-lease" not in adapter._long_running_notice_tasks
+        assert adapter._long_running_notice_counts["reset-cap-lease"] == 3
+    finally:
+        adapter._dispatcher._active.pop("888", None)
+        await adapter.disconnect()
+
 
 
 async def test_中间正文发送后重置长时间提示计时器(monkeypatch, fake_http_server):
@@ -5811,8 +5842,8 @@ async def test_群聊中间正文可配置为展示(monkeypatch, fake_http_serve
         await adapter.disconnect()
 
 
-async def test_队列turn在Hermes启动前发送即时确认(monkeypatch, fake_http_server):
-    """客服群 turn 必须先收到适配器确认，再进入 Hermes 工具/模型循环。"""
+async def test_队列turn在Hermes启动前不发送自动确认(monkeypatch, fake_http_server):
+    """客服群 turn 不应由适配器额外发送泛化收到回执。"""
     base, calls = fake_http_server
     adapter = _make_adapter(
         monkeypatch,
@@ -5857,19 +5888,14 @@ async def test_队列turn在Hermes启动前发送即时确认(monkeypatch, fake_
     observed: list[str] = []
 
     async def capture_handle(_adapter, _event) -> None:
-        assert calls, "Hermes handoff 前必须已经完成即时回执"
-        assert "收到" not in _event.text
+        assert calls == []
         observed.append("hermes")
 
     monkeypatch.setattr(BasePlatformAdapter, "handle_message", capture_handle)
     try:
         await adapter._start_queue_turn(lease)
         assert observed == ["hermes"]
-        assert calls
-        assert calls[0]["path"] == "/send_group_msg"
-        first_message = calls[0]["params"]["message"]
-        assert first_message[0]["type"] == "reply"
-        assert "收到" in first_message[1]["data"]["text"]
+        assert calls == []
     finally:
         await adapter.disconnect()
 

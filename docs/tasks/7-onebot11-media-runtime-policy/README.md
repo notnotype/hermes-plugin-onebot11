@@ -92,7 +92,7 @@
   write_file/patch 的工作交给 delegated child；子代理若丢失父 binding 仍拒绝，且不能
   调用 QQ 工具、send_message、cronjob 或再次委派。
 
-本轮新增客服收口：delegated child 在父 QQ turn 结束后仍可继续使用项目工具，但不继承 QQ 出站、QQ 查询、cronjob 或再次委派权限；复杂问题先发送固定中文回执，再由后台委派执行。Hermes 工具事件只映射为固定中文摘要，不把参数、路径、URL 或工具正文发送到 QQ。该行为已经由交接时的 delegated-child 回归测试、Hermes 组合 smoke 和 Arch 现场审计共同核对。
+本轮新增客服收口：delegated child 在父 QQ turn 结束后仍可继续使用项目工具，但不继承 QQ 出站、QQ 查询、cronjob 或再次委派权限；不再由适配器发送固定中文收到回执，长任务状态提示最多发送三次且受 turn 生命周期约束。Hermes 工具事件只映射为固定中文摘要，不把参数、路径、URL 或工具正文发送到 QQ。该行为已经由交接时的 delegated-child 回归测试、Hermes 组合 smoke 和 Arch 现场审计共同核对。
 
 Arch 现场使用插件 checkout `e05e4b0f25d7be9aef706dde1d16849f06c742a5`，容器为 `running healthy`，当前白名单为群 `942513604`、超级管理员 `2056963663`、机器人 `3101482118`。LLBot 与 Hermes 反向 WS/HTTP 配置和 `get_status`/`get_login_info` 已核对；白名单外真实 QQ 群消息产生 `access_denied` 且未进入队列。目标客服群的历史真实消息曾完成 `inbound message -> response ready -> Sending response`，但本轮没有取得该群的真人客户端入站消息，因此不把 HTTP 出站探针或历史记录写成当前真人 QQ Agent pipeline 通过。
 
@@ -107,7 +107,7 @@ PYTHONPATH=C:\Users\notnotype\AppData\Local\hermes\hermes-agent;C:\Users\notnoty
 
 纯插件门禁为 `247 passed, 1 skipped`；skip 是 `tests/test_adapter.py` 因缺少 Hermes `gateway`。本轮完整 Hermes 环境测试实际运行了 adapter 集成测试；Windows asyncio subprocess transport 关闭期产生 4 条警告，无测试失败。
 
-`ruff check .`、`node --check scripts/onebot11-pi-trigger.mjs` 和 `git diff --check` 通过。`scripts/verify_hermes_integration.py` 在临时 `HERMES_HOME` 下通过，测试部分为 `419 passed, 4 warnings`，随后输出 `tools=9 hooks=5 pi_ai_trigger=True reconnect=True slash_commands=True`。测试数字以对应实际命令结果为准。
+`ruff check .`、`node --check scripts/onebot11-pi-trigger.mjs` 和 `git diff --check` 通过。`scripts/verify_hermes_integration.py` 在临时 `HERMES_HOME` 下通过，测试部分以最新实际命令结果为准；本轮完整插件门禁为 `425 passed, 4 warnings`，并覆盖最多三次长任务提示、无自动回执和浏览器能力提示。
 
 Arch 组合证据：容器 `hermes-support-support-hermes-1` 为 `running healthy`，插件 checkout 与目标 commit 一致，反向 WS 监听 `0.0.0.0:18880`，LLBot HTTP `get_status` 为 `online=true, good=true`，`get_login_info` 返回机器人 QQ `3101482118`。历史目标群 Agent 日志包含 `inbound message`、`response ready` 和 `Sending response`；本轮白名单外真实群入站只形成 `access_denied`，目标客服群真人入站未取得，故真人 QQ Agent pipeline 标记为未验证。
 
@@ -115,7 +115,7 @@ Arch 联调固定记录为群 `942513604`、超级管理员 `2056963663`、机�
 
 ## 后续
 
-- 获取目标客服群 `942513604` 的真人客户端入站后，验证中文即时回执、固定工具进度、后台 delegated child completion 和最终回复在 QQ 上的顺序；
+- 获取目标客服群 `942513604` 的真人客户端入站后，验证 Hermes 中间正文、最多三次有界长任务状态提示、后台 delegated child completion 和最终回复在 QQ 上的顺序；不再把固定中文收到回执列为验收项。
 - 在真人链路可用后，验证两名真人同时 @、selector/engage 窗口、图片-only/文字+图片、多媒体去重和管理写动作预览；
 - 制造并人工处理非幂等出站 `unknown` 与 `resolve action retry|discard`；不执行真实禁言、踢人、撤回或全员禁言；
 - Hermes 上游增加明确的 long-running/system-error control-plane metadata 后，再开启 OneBot 控制面通知的真实 heartbeat 联调；

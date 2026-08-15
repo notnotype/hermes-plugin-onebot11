@@ -18,7 +18,7 @@
 
 群消息即使没有 @、关键词或 `always` trigger，也会先写入 SQLite 队列；这保证触发时能拿到上次触发以来的上下文。没有 trigger 不会启动 Agent turn。
 
-群 turn 认领后，若开启 `show_interim_group`，插件会先发送一次不进入 Hermes transcript 的中文收到回执，再使用 LLBot 的 `set_msg_emoji_like` 扩展给触发消息添加 `emoji_id=128172`（💬，表示正在回复这一条，可通过 `processing_reaction_emoji_id` 配置），Hermes turn 收尾时发送 `set=false` 移除。问句/记忆候选进入旁路 selector 判断时，先给候选消息添加 `emoji_id=128064`（👀，表示 bot 正在看这条消息），判断结束（触发、忽略、超时或 wait 到期）后移除。两个指示器都只作用于当前群的真实消息 ID；内部 hash、私聊消息或 lease 已失效时跳过。reaction 是 best-effort UI 提示，失败或结果未知不会阻断 Agent 回复、队列 ack，也不会重放 `set=true`。清理记录持久化在队列 SQLite 中，启动恢复最多有限次数地尝试 `unset`；达到上限后只在状态/审计中保留，不会无限刷屏。进程硬崩溃遗留的远端 💬/👀 不纳入清理承诺。emoji ID 说明：`9203`（⏳）与 `8971` 在 QQ reaction API 上显示异常，因此回复阶段默认使用实测可用的 `128172`（💬）。
+群 turn 认领后，适配器不会发送泛化的中文收到回执；若开启 `show_interim_group`，Hermes 自己产生的中间正文仍按群聊显示策略发送。长任务超过 `long_running_notice_seconds` 后，适配器最多发送三次有界状态提示，完成、取消、lease 失效或发送失败即停止；提示不进入 Hermes transcript，也不标记业务 `outbound_started`。随后使用 LLBot 的 `set_msg_emoji_like` 扩展给触发消息添加 `emoji_id=128172`（💬，表示正在回复这一条，可通过 `processing_reaction_emoji_id` 配置），Hermes turn 收尾时发送 `set=false` 移除。问句/记忆候选进入旁路 selector 判断时，先给候选消息添加 `emoji_id=128064`（👀，表示 bot 正在看这条消息），判断结束（触发、忽略、超时或 wait 到期）后移除。两个指示器都只作用于当前群的真实消息 ID；内部 hash、私聊消息或 lease 已失效时跳过。reaction 是 best-effort UI 提示，失败或结果未知不会阻断 Agent 回复、队列 ack，也不会重放 `set=true`。清理记录持久化在队列 SQLite 中，启动恢复最多有限次数地尝试 `unset`；达到上限后只在状态/审计中保留，不会无限刷屏。进程硬崩溃遗留的远端 💬/👀 不纳入清理承诺。emoji ID 说明：`9203`（⏳）与 `8971` 在 QQ reaction API 上显示异常，因此回复阶段默认使用实测可用的 `128172`（💬）。
 
 ## 角色与工具
 
@@ -114,7 +114,7 @@ configuration loader 读取已经合并过的 `platforms.onebot11.extra`，再�
 所以如果某个白名单字段由环境变量提供，YAML reload 不能覆盖它。
 
 可热更新：`allowed_groups`、DM 白名单/策略、`super_admins`、`trusted_users`、
-`roles.*.tools`、关键词/always/LLM trigger、cooldown、reaction、一次性长时间提示延迟
+`roles.*.tools`、关键词/always/LLM trigger、cooldown、reaction、最多三次长任务提示的延迟
 和纯文本显示配置。
 不可热更新：HTTP/WS 地址、token、self_id、队列数据库路径、session 模式以及其它
 连接/协议边界；这些变化会返回“需要重启”并保留旧 snapshot。解析失败也保留旧
