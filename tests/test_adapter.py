@@ -5433,6 +5433,56 @@ async def test_缺失completion权限快照仍以最小权限恢复(monkeypatch,
     assert trigger.authority_tools == frozenset()
     assert notifications == ["888"]
     await adapter.disconnect()
+async def test_legacy_completion恢复turn跳过用户authority比对(monkeypatch, tmp_path):
+    """旧 Hermes completion 缺少标记时仍只按受限 recovery anchor 执行。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_QUEUE_DB=str(tmp_path / "queue.sqlite3"),
+    )
+    adapter._processing_reaction_enabled = False
+    adapter.show_interim_group = False
+    message = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="",
+        user_id="123",
+        user_name="普通用户",
+        text="[ASYNC DELEGATION COMPLETE — deleg_legacy]\\n结果",
+        metadata={"gateway_session_id": "session-parent", "onebot11_images": []},
+        message_key="hash:legacy-completion",
+    )
+    adapter._queue.enqueue(
+        message,
+        adapter_module.TriggerRequest.create(
+            "888",
+            message.message_key,
+            "completion_recovery",
+            "123",
+            "普通用户",
+            anchor_kind="recovery",
+            authority_role="user",
+            authority_tools=(),
+            authority_self_id="1",
+        ),
+    )
+    captured: list[object] = []
+
+    async def capture_handle(_adapter, event) -> None:
+        captured.append(event)
+
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", capture_handle)
+    lease = adapter._queue.claim("888")
+    assert lease is not None
+    try:
+        await adapter._start_queue_turn(lease)
+        assert captured
+        assert captured[0].metadata["onebot11_caller_context"]["role"] == "user"
+        assert captured[0].metadata["onebot11_caller_context"]["allowed_tools"] == []
+    finally:
+        adapter._queue.release(lease, reason="test cleanup")
+        await adapter.disconnect()
 
 
 
