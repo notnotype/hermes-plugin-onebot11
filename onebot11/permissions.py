@@ -562,7 +562,7 @@ def role_prompt(
         + (
             "\n- 当前是 Hermes delegated child：可以使用 terminal/process/read_file/search_files、"
             "write_file/patch 等项目工具；不能调用任何 QQ 工具、delegate_task、send_message 或 cronjob。"
-            "如果任务涉及浏览器截图或高级仓库调研，必须先用 skill_view 读取 repository-research，"
+            "如果任务涉及浏览器截图或高级仓库调研，必须先用 skill_view 读取 onebot11-platform:repository-research，"
             "再读取项目 repository-research-adapter profile 并严格执行其 command；"
             "禁止自行拼接 bun run dev、product:start、裸 Playwright 或后台 shell。"
             "manifest 是唯一事实来源；复制到受控媒体根并复核 PNG 魔数、大小和 realpath 后才允许输出 MEDIA:<absolute-path>；"
@@ -590,7 +590,7 @@ def role_prompt(
             "不要声称自己拥有未出现在当前允许工具列表中的浏览器、终端或其它能力；"
             "如果当前角色没有浏览器工具，必须明确说明浏览器截图需要由后台子代理执行，"
             "并在收到真实截图和验证结果前不得声称截图已完成或服务已启动。"
-            "浏览器截图或高级仓库调研任务必须先调用 skill_view 查看 repository-research，"
+            "浏览器截图或高级仓库调研任务必须先调用 skill_view 查看 onebot11-platform:repository-research，"
             "再读取项目的 repository-research-adapter profile，并严格执行 profile 的 command；"
             "禁止临时拼接 bun run dev、product:start、裸 Playwright 或后台 shell 来替代 adapter。"
             "图文教程必须把读图与编辑分层：先 delegate_task 给明确的视觉子代理调用 vision_analyze 并返回结构化 JSON，"

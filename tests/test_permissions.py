@@ -397,7 +397,7 @@ def test_客服媒体提示禁止裸路径改写为MEDIA():
     assert "禁止子代理用 terminal 的 cp/mv/install/rsync" in prompt
     assert "不能改写成 MEDIA:" in prompt
     assert "mediaFiles 缺失或为空" in prompt
-    assert "先调用 skill_view 查看 repository-research" in prompt
+    assert "先调用 skill_view 查看 onebot11-platform:repository-research" in prompt
     assert "严格执行 profile 的 command" in prompt
     assert "禁止临时拼接 bun run dev、product:start、裸 Playwright 或后台 shell" in prompt
     assert "视觉子代理调用 vision_analyze" in prompt
