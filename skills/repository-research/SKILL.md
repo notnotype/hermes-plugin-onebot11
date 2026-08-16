@@ -42,6 +42,8 @@ metadata:
 运行前加载本 Skill 和项目 profile。child 使用前台 terminal 调用 profile command；不要把服务或浏览器交给裸后台 shell 常驻。
 截图或媒体交付任务每次当前 turn 都必须重新执行匹配 profile command；不得从 `session_search`、旧 delegation、旧 manifest 或旧 evidence 复用截图，也不得用 terminal 的 `cp`/`mv`/`install`/`rsync` 手工复制或重命名媒体。项目 adapter command 失败时报告阻塞，不以手工复制替代。
 
+生产 Hermes 部署中，profile 的 `mediaRootEnv` 必须原样解析为 `${HERMES_HOME}/cache/images`；`--media-dir` 不得替换为仓库 `.agent/tmp` 或任意任务临时目录。`--evidence-dir` 必须位于 `${HERMES_HOME}/evidence` 下，运行态 State/Cache 才能继续使用任务隔离根。标注完成后，重新读取该 evidence 根内的当前 manifest，并把 adapter 成功输出的每一条 `MEDIA:` 原样保留在 completion 回执中；只在 manifest `evidence.mediaFiles` 非空且逐条通过 OneBot 媒体门禁时才交付。
+
 ### API 配置教程的视觉分支
 
 当用户要求“图文教程”、在截图上画箭头/框选/文字，或要求判断表单区域时，主 agent 将任务明确委派给视觉子代理；主 agent 只负责需求理解、步骤编排和最终中文说明。视觉子代理必须：
