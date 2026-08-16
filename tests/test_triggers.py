@@ -202,6 +202,91 @@ def test_selector默认客服参数与疑似问句候选():
         assert action.kind == "schedule"
         state.invalidate_judgement()
 
+def test_问句范围门控要求bot关联和兴趣词():
+    """配置门控后，普通问句不进 selector，范围内问句仍保留候选。"""
+    config = TriggerConfig(
+        question_bot_words=("机器人", "助手"),
+        question_interest_words=("项目", "配置"),
+        debounce_seconds=5,
+    )
+    state = LayeredTriggerState(config)
+    out_of_scope = state.observe_message(
+        chat_type="group",
+        text="今天吃什么？",
+        mentioned_self=False,
+        has_context=False,
+        revision=1,
+        now=0,
+    )
+    assert out_of_scope.kind == "none"
+    assert out_of_scope.reason == "question_out_of_scope"
+    assert state.llm_calls == 0
+
+    in_scope = state.observe_message(
+        chat_type="group",
+        text="机器人，项目配置怎么改？",
+        mentioned_self=False,
+        has_context=False,
+        revision=2,
+        now=1,
+    )
+    assert in_scope.kind == "schedule"
+    assert in_scope.candidate_type == "question"
+
+
+def test_问句范围门控保留引用bot和bot提问后的同用户追问():
+    """引用 bot 或回复 bot 的同一用户可绕过 bot 词，但仍命中兴趣词。"""
+    config = TriggerConfig(
+        question_bot_words=("机器人",),
+        question_interest_words=("配置",),
+        debounce_seconds=5,
+    )
+    state = LayeredTriggerState(config)
+    quoted = state.observe_message(
+        chat_type="group",
+        text="配置怎么改？",
+        mentioned_self=False,
+        has_context=False,
+        revision=1,
+        now=0,
+        reply_to_bot=True,
+    )
+    assert quoted.kind == "schedule"
+    assert quoted.candidate_type == "question"
+
+    state = LayeredTriggerState(config)
+    state.on_turn_complete(
+        success=True,
+        now=0,
+        bot_asked=True,
+        anchor_user_id="u1",
+    )
+    follow_up = state.observe_message(
+        chat_type="group",
+        text="配置怎么改？",
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=1,
+        user_id="u1",
+    )
+    assert follow_up.kind == "schedule"
+    assert follow_up.candidate_type == "question"
+
+
+def test_问句范围门控配置必须成对出现():
+    """半配置会 fail-closed，避免只限制一侧造成误触发。"""
+    with pytest.raises(ValueError):
+        build_trigger_config({"question_bot_words": ["机器人"]})
+    config = build_trigger_config(
+        {
+            "question_bot_words": ["机器人"],
+            "question_interest_words": ["项目"],
+        }
+    )
+    assert config.question_bot_words == ("机器人",)
+    assert config.question_interest_words == ("项目",)
+
 
 def test_selector提示词不会把疑问词当作必答触发():
     """疑问词只能提供候选信号，群成员闲聊仍明确默认 ignore。"""

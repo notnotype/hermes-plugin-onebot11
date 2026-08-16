@@ -936,6 +936,8 @@ class OneBot11Adapter(BasePlatformAdapter):
             "trigger_cooldown",
             "require_mention",
             "question_trigger_enabled",
+            "question_bot_words",
+            "question_interest_words",
             "memory_trigger_enabled",
             "memory_trigger_words",
             "trigger_debounce_seconds",

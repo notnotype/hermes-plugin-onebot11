@@ -94,6 +94,10 @@ class TriggerConfig:
         "帮忙",
         "帮我看看",
     )
+    # 配置后，问句候选必须同时具备 bot 关联信号和兴趣词；两个列表都为空时
+    # 保持兼容行为，不改变未启用范围门控的旧部署。
+    question_bot_words: tuple[str, ...] = ()
+    question_interest_words: tuple[str, ...] = ()
     # engaged 中短消息（≤ 该字数）且 bot 未提问、非问句、无回指、未引用
     # bot 时本地判 ignore，不进 selector，省成本并让群聊更安静。
     # 默认 0 = 关闭：短确认词仍统一交给 selector（既有合同），需要更安静
@@ -249,10 +253,19 @@ class LayeredTriggerState:
                 if self.arbitration_count >= self._window_arbitration_limit:
                     return TriggerAction("none", reason="arbitration_limit")
                 if self.config.question_enabled and is_question(text):
-                    # 连续对话中的问句仍按 question 候选处理：本地词表能识别
-                    # 不带问号的问句（如"你吃饭了吗"），避免低价模型在 engaged
-                    # 提示词里漏判。
-                    return self._schedule("question", revision, now, gap=gap)
+                    # 配置范围门控后，闲聊问句直接忽略；有上下文的回指仍
+                    # 保留 memory 候选，避免收紧问句时破坏连续任务。
+                    if self._question_in_scope(
+                        text,
+                        same_user=same_user,
+                        reply_to_bot=reply_to_bot,
+                    ):
+                        return self._schedule("question", revision, now, gap=gap)
+                    if self.config.memory_enabled and has_context and memory_matches(
+                        text, self.config.memory_words
+                    ):
+                        return self._schedule("memory", revision, now, gap=gap)
+                    return TriggerAction("none", reason="question_out_of_scope")
                 if self._short_rule_ignore(text):
                     return TriggerAction("none", reason="short_rule_ignore")
                 # deep 档同用户 follow-up 立即判，不等 trailing debounce。
@@ -287,8 +300,19 @@ class LayeredTriggerState:
                 self._candidate_type or "candidate", revision, now, gap=gap
             )
 
-        candidate_type = self._candidate_type_for(text, has_context)
+        candidate_type = self._candidate_type_for(
+            text,
+            has_context,
+            same_user=same_user,
+            reply_to_bot=reply_to_bot,
+        )
         if not candidate_type:
+            if self.config.question_enabled and is_question(text) and not self._question_in_scope(
+                text,
+                same_user=same_user,
+                reply_to_bot=reply_to_bot,
+            ):
+                return TriggerAction("none", reason="question_out_of_scope")
             return TriggerAction("none", reason="non_candidate")
         return self._schedule(candidate_type, revision, now, gap=gap)
 
@@ -589,11 +613,46 @@ class LayeredTriggerState:
         if memory_matches(text, self.config.memory_words):
             return False
         return True
+    def _question_in_scope(
+        self,
+        text: str,
+        *,
+        same_user: bool,
+        reply_to_bot: bool,
+    ) -> bool:
+        """判断问句是否同时关联 bot 且命中配置的兴趣范围。"""
+        bot_words = self.config.question_bot_words
+        interest_words = self.config.question_interest_words
+        if not bot_words and not interest_words:
+            return True
+        if reply_to_bot or (same_user and self.bot_asked):
+            bot_related = True
+        else:
+            bot_related = keyword_matches(text, bot_words)
+        return bot_related and keyword_matches(text, interest_words)
 
-    def _candidate_type_for(self, text: str, has_context: bool) -> str:
-        """按 balanced 策略识别问句和有上下文的记忆回指。"""
+
+    def _candidate_type_for(
+        self,
+        text: str,
+        has_context: bool,
+        *,
+        same_user: bool,
+        reply_to_bot: bool,
+    ) -> str:
+        """按问句范围和有上下文的记忆回指识别候选。"""
         if self.config.question_enabled and is_question(text):
-            return "question"
+            if self._question_in_scope(
+                text,
+                same_user=same_user,
+                reply_to_bot=reply_to_bot,
+            ):
+                return "question"
+            if self.config.memory_enabled and has_context and memory_matches(
+                text, self.config.memory_words
+            ):
+                return "memory"
+            return ""
         if self.config.memory_enabled and has_context and memory_matches(
             text, self.config.memory_words
         ):
@@ -1094,6 +1153,14 @@ def build_trigger_config(extra: dict[str, Any]) -> TriggerConfig:
         minimum=0,
         maximum=32,
     )
+    memory_words = _parse_keywords(
+        _setting(
+            extra,
+            raw_llm,
+            "memory_trigger_words",
+            ("之前", "上次", "刚才", "那个", "继续", "接着"),
+        )
+    )
     bot_asked_words = _parse_keywords(
         _setting(
             extra,
@@ -1152,14 +1219,26 @@ def build_trigger_config(extra: dict[str, Any]) -> TriggerConfig:
         default=True,
         name="memory_trigger_enabled",
     )
-    memory_words = _parse_keywords(
+    question_bot_words = _parse_keywords(
         _setting(
             extra,
             raw_llm,
-            "memory_trigger_words",
-            ("之前", "上次", "刚才", "那个", "继续", "接着"),
+            "question_bot_words",
+            (),
         )
     )
+    question_interest_words = _parse_keywords(
+        _setting(
+            extra,
+            raw_llm,
+            "question_interest_words",
+            (),
+        )
+    )
+    if bool(question_bot_words) != bool(question_interest_words):
+        raise ValueError(
+            "question_bot_words 和 question_interest_words 必须同时配置或同时留空"
+        )
     return TriggerConfig(
         require_mention=parse_bool(extra.get("require_mention"), default=True, name="require_mention"),
         keywords=_parse_keywords(extra.get("trigger_keywords", extra.get("keywords"))),
@@ -1178,6 +1257,8 @@ def build_trigger_config(extra: dict[str, Any]) -> TriggerConfig:
         question_enabled=question_enabled,
         memory_enabled=memory_enabled,
         memory_words=memory_words,
+        question_bot_words=question_bot_words,
+        question_interest_words=question_interest_words,
         debounce_seconds=debounce,
         engaged_idle_seconds=engaged_idle,
         engaged_max_seconds=engaged_max,
