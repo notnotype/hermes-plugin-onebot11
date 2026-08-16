@@ -4209,7 +4209,105 @@ async def test_deferred_completion不提前清理媒体(monkeypatch):
         assert not media_dir.exists()
     finally:
         await adapter.disconnect()
+async def test_内部completion媒体即使主模型省略MEDIA也会补发(monkeypatch, tmp_path):
+    """completion 文本未被主模型复述时，adapter 仍只补发当前 manifest 媒体。"""
+    hermes_home = tmp_path / "hermes-home"
+    cache_root = hermes_home / "cache" / "images"
+    evidence_root = hermes_home / "evidence" / "run-1"
+    cache_root.mkdir(parents=True)
+    evidence_root.mkdir(parents=True)
+    image_path = cache_root / "tutorial-step.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\ncompletion-media")
+    (evidence_root / "repository-research-run.json").write_text(
+        json.dumps({
+            "schema": "nbook.repository-research-run/v1",
+            "result": {"status": "passed"},
+            "cleanup": {
+                "browser": "closed",
+                "service": "forced",
+                "portClosed": True,
+                "ownedTempRootsRemoved": True,
+                "sharedCachePreserved": True,
+            },
+            "evidence": {"mediaFiles": [str(image_path)]},
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    sent: list[tuple[str, list[tuple[str, str]], dict]] = []
 
+    async def fake_send_multiple_images(chat_id, images, metadata=None, human_delay=0.0):
+        del human_delay
+        sent.append((str(chat_id), list(images), dict(metadata or {})))
+        return [SendResult(True, message_id=str(index + 1)) for index, _image in enumerate(images)]
+
+    monkeypatch.setattr(adapter, "send_multiple_images", fake_send_multiple_images)
+    event = SimpleNamespace(
+        source=adapter.build_source(
+            chat_id="888",
+            chat_name="888",
+            chat_type="group",
+            user_id="123",
+            user_name="小明",
+            role_authorized=True,
+        ),
+        metadata={
+            "onebot11_lease_id": "completion-lease",
+            "onebot11_defer_completion": True,
+            "onebot11_completion_media_paths": [str(image_path)],
+        },
+        media_urls=[],
+    )
+    try:
+        await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+        assert len(sent) == 1
+        assert sent[0][0] == "888"
+        assert sent[0][1][0][0].startswith("file://")
+        assert sent[0][1][0][0].endswith("tutorial-step.png")
+    finally:
+        await adapter.disconnect()
+
+async def test_内部completion从MEDIA文本提取授权媒体(monkeypatch):
+    """completion 入队前只保留媒体门禁返回的完整路径。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    path = "/opt/data/cache/images/run/tutorial-step.png"
+    monkeypatch.setattr(
+        adapter,
+        "filter_media_delivery_paths",
+        lambda values: [(path, False) for _raw, _voice in values],
+    )
+    async def fake_notify(_chat_id: str) -> bool:
+        return True
+    monkeypatch.setattr(adapter._dispatcher, "notify", fake_notify)
+    event = MessageEvent(
+        text="[ASYNC DELEGATION COMPLETE — deleg_media]\nMEDIA:" + path,
+        message_type="text",
+        source=adapter.build_source(
+            chat_id="888",
+            chat_name="888",
+            chat_type="group",
+            user_id="123",
+            user_name="小明",
+            role_authorized=True,
+        ),
+        internal=True,
+        metadata={"gateway_session_id": "session-parent"},
+    )
+    try:
+        await adapter.handle_message(event)
+        queued = adapter._queue.peek("888")
+        assert queued[0].metadata["onebot11_completion_media_paths"] == [path]
+    finally:
+        await adapter.disconnect()
 
 async def test_群聊at机器人放行(monkeypatch):
     """@ 了机器人的群消息正常进入会话。"""
@@ -4551,6 +4649,27 @@ async def test_filter_media_delivery_paths只接受manifest中的安全媒体(
     payload = b"\x89PNG\r\n\x1a\napproved"
     approved_path.write_bytes(payload)
     unapproved_path.write_bytes(payload)
+    old_root = hermes_home / "evidence" / "old-run"
+    old_root.mkdir(parents=True)
+    old_path = cache_root / "old-approved.png"
+    old_path.write_bytes(payload)
+    old_manifest = old_root / "repository-research-run.json"
+    old_manifest.write_text(
+        json.dumps({
+            "schema": "nbook.repository-research-run/v1",
+            "result": {"status": "passed"},
+            "cleanup": {
+                "browser": "closed",
+                "service": "forced",
+                "portClosed": True,
+                "ownedTempRootsRemoved": True,
+                "sharedCachePreserved": True,
+            },
+            "evidence": {"mediaFiles": [str(old_path)]},
+        }),
+        encoding="utf-8",
+    )
+    os.utime(old_manifest, ns=(1, 1))
     (evidence_root / "repository-research-run.json").write_text(
         json.dumps(
             {
@@ -4576,10 +4695,10 @@ async def test_filter_media_delivery_paths只接受manifest中的安全媒体(
     )
     try:
         assert adapter.filter_media_delivery_paths(
-            [(str(approved_path), False), (str(unapproved_path), False)]
+            [(str(approved_path), False), (str(unapproved_path), False), (str(old_path), False)]
         ) == [(str(approved_path.resolve()), False)]
         assert adapter.filter_local_delivery_paths(
-            [str(approved_path), str(unapproved_path)]
+            [str(approved_path), str(unapproved_path), str(old_path)]
         ) == [str(approved_path.resolve())]
     finally:
         await adapter.disconnect()

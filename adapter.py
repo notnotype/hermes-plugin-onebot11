@@ -25,7 +25,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -2235,10 +2235,18 @@ class OneBot11Adapter(BasePlatformAdapter):
             return frozenset()
         approved: set[str] = set()
         try:
-            manifests = list(evidence_root.rglob("repository-research-run.json"))
+            manifests = sorted(
+                (
+                    (manifest_path, manifest_path.stat().st_mtime_ns)
+                    for manifest_path in evidence_root.rglob("repository-research-run.json")
+                ),
+                key=lambda item: item[1],
+                reverse=True,
+            )
         except OSError:
             return frozenset()
-        for manifest_path in manifests[:256]:
+        # 只读取最近一次 adapter 运行回执；旧 manifest 不能继续授权 MEDIA。
+        for manifest_path, _mtime_ns in manifests[:1]:
             try:
                 resolved_manifest = manifest_path.resolve(strict=True)
                 if not (
@@ -2654,6 +2662,12 @@ class OneBot11Adapter(BasePlatformAdapter):
         metadata = dict(event.metadata or {})
         metadata["onebot11_mentioned_self"] = False
         metadata["onebot11_internal_completion"] = True
+        completion_media, _ = self.extract_media(str(event.text or ""))
+        authorized_media = self.filter_media_delivery_paths(completion_media)
+        if authorized_media:
+            metadata["onebot11_completion_media_paths"] = [
+                path for path, is_voice in authorized_media if not is_voice
+            ]
         metadata["onebot11_authority"] = {
             "role": caller.role,
             "allowed_tools": [],
@@ -4101,6 +4115,21 @@ class OneBot11Adapter(BasePlatformAdapter):
             for message in lease.messages
         )
         media_dir = self._new_media_dir() if has_images else self._media_dir
+        completion_media_paths: list[str] = []
+        if is_sandboxed_completion:
+            completion_candidates: list[tuple[str, bool]] = []
+            for message in lease.messages:
+                raw_paths = message.metadata.get("onebot11_completion_media_paths")
+                if isinstance(raw_paths, list):
+                    completion_candidates.extend(
+                        (str(path), False) for path in raw_paths if isinstance(path, str)
+                    )
+            approved_completion = self.filter_media_delivery_paths(completion_candidates)
+            seen_completion: set[str] = set()
+            for path, _is_voice in approved_completion:
+                if path not in seen_completion:
+                    seen_completion.add(path)
+                    completion_media_paths.append(path)
         handed_off = False
         try:
             reaction_message_id = await self._set_processing_reaction(lease, enabled=True)
@@ -4225,6 +4254,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                     "onebot11_summary_mode": summary_mode,
                     "onebot11_defer_completion": True,
                     "onebot11_managed_context": True,
+                    "onebot11_completion_media_paths": list(completion_media_paths),
                 },
             }
             if summary_prompt and summary_mode == "channel_prompt":
@@ -5319,6 +5349,49 @@ class OneBot11Adapter(BasePlatformAdapter):
             _CURRENT_CALLER.reset(caller_token)
             _CURRENT_EVENT.reset(event_token)
 
+    async def _send_completion_media(self, event: MessageEvent) -> None:
+        """在子代理 completion 的主模型回执后补发当前 manifest 授权图片。"""
+        metadata = event.metadata or {}
+        raw_paths = metadata.get("onebot11_completion_media_paths")
+        source = getattr(event, "source", None)
+        if source is None or not isinstance(raw_paths, list):
+            return
+        candidates = [
+            (path, False)
+            for path in raw_paths
+            if isinstance(path, str) and path.strip()
+        ]
+        approved = self.filter_media_delivery_paths(candidates)
+        if not approved:
+            return
+        images = [(f"file://{quote(path)}", "") for path, _is_voice in approved]
+        try:
+            results = await self.send_multiple_images(
+                str(source.chat_id),
+                images,
+                metadata=dict(metadata),
+            )
+        except Exception as exc:
+            self._audit.record(
+                "completion_media_delivery_failed",
+                {
+                    "chat_id": str(source.chat_id),
+                    "count": len(images),
+                    "error_kind": type(exc).__name__,
+                },
+            )
+            return
+        successful = sum(1 for result in results if result.success)
+        self._audit.record(
+            "completion_media_delivery",
+            {
+                "chat_id": str(source.chat_id),
+                "count": len(images),
+                "successful": successful,
+                "failed": len(images) - successful,
+            },
+        )
+
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """按真实 Hermes/QQ 出站结果完成 queue lease。"""
         metadata = event.metadata or {}
@@ -5328,6 +5401,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         try:
             if lease_id:
                 if deferred:
+                    await self._send_completion_media(event)
                     self._pending_completions[lease_id] = (
                         outcome,
                         lease_id in self._unknown_leases,

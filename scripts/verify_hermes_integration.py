@@ -154,6 +154,8 @@ async def _smoke(
         raise AssertionError("repository-research Skill frontmatter 或描述无效")
     if "manifest.evidence.mediaFiles" not in skill_text or "manifest.evidence.files" not in skill_text:
         raise AssertionError("repository-research Skill 未声明唯一媒体路径来源")
+    if "vision_analyze" not in skill_text or "--annotate" not in skill_text:
+        raise AssertionError("repository-research Skill 未声明视觉分析与受控标注流程")
     queue_db = hermes_home / "onebot11" / "integration.sqlite3"
     config = PlatformConfig(
         enabled=True,

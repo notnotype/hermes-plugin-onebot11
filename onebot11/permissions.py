@@ -573,6 +573,9 @@ def role_prompt(
             "mediaFiles 缺失或校验失败时不得输出 MEDIA:，也不得声称图片已发送。"
             "每次截图任务必须在当前 turn 重新执行项目 profile command，禁止子代理用 terminal 的 cp/mv/install/rsync"
             "或 file 工具手工复制、重命名、写入受控媒体根；流程失败时不得输出 MEDIA:，也不得声称图片已发送。"
+            "遇到图文教程、箭头、框选或需要判断表单区域时，视觉子代理必须对当前 manifest.evidence.mediaFiles 逐一调用 vision_analyze，"
+            "只返回 success/profile/regions/tutorialSteps 结构化 JSON；source 使用 evidence 相对路径，marks 只用归一化 arrow/rectangle/label。"
+            "视觉子代理不得输出 MEDIA:、声称已发送或把图片编辑结果冒充完成；由项目 adapter 的 --annotate 命令用 Sharp 生成标注 PNG。"
             if delegated_child
             else ""
         )
@@ -590,6 +593,8 @@ def role_prompt(
             "浏览器截图或高级仓库调研任务必须先调用 skill_view 查看 repository-research，"
             "再读取项目的 repository-research-adapter profile，并严格执行 profile 的 command；"
             "禁止临时拼接 bun run dev、product:start、裸 Playwright 或后台 shell 来替代 adapter。"
+            "图文教程必须把读图与编辑分层：先 delegate_task 给明确的视觉子代理调用 vision_analyze 并返回结构化 JSON，"
+            "再由项目 adapter 的 --annotate 命令生成带箭头/框选/文字的版本化 PNG；视觉失败或计划非法时保持 fail-closed。"
             "不要默认调用 skill_manage 修改自身 skill；只有用户明确要求沉淀经验时才维护 skill。"
             "每个客服任务完成后应由子代理把摘要写入 evidence/documentation；目录不可写时"
             "记录失败但仍继续把已验证结论回复给用户。"

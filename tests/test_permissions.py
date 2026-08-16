@@ -262,6 +262,10 @@ def test_子代理截图提示只允许manifest媒体事实来源():
     assert "禁止子代理用 terminal 的 cp/mv/install/rsync" in prompt
     assert "runner stdout 都不能直接改写成 MEDIA:" in prompt
     assert "mediaFiles 缺失或校验失败时不得输出 MEDIA:" in prompt
+    assert "vision_analyze" in prompt
+    assert "结构化 JSON" in prompt
+    assert "--annotate" in prompt
+    assert "不得输出 MEDIA:" in prompt
 
 
 def test_search_files覆盖grep和glob说明():
@@ -396,6 +400,8 @@ def test_客服媒体提示禁止裸路径改写为MEDIA():
     assert "先调用 skill_view 查看 repository-research" in prompt
     assert "严格执行 profile 的 command" in prompt
     assert "禁止临时拼接 bun run dev、product:start、裸 Playwright 或后台 shell" in prompt
+    assert "视觉子代理调用 vision_analyze" in prompt
+    assert "--annotate" in prompt
 
 def test_terminal写敏感配置被拦截():
     """terminal 写 config.yaml/roles.yaml/.env 等必须被 OneBot 侧拒绝。"""

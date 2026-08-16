@@ -42,6 +42,17 @@ metadata:
 运行前加载本 Skill 和项目 profile。child 使用前台 terminal 调用 profile command；不要把服务或浏览器交给裸后台 shell 常驻。
 截图或媒体交付任务每次当前 turn 都必须重新执行匹配 profile command；不得从 `session_search`、旧 delegation、旧 manifest 或旧 evidence 复用截图，也不得用 terminal 的 `cp`/`mv`/`install`/`rsync` 手工复制或重命名媒体。项目 adapter command 失败时报告阻塞，不以手工复制替代。
 
+### API 配置教程的视觉分支
+
+当用户要求“图文教程”、在截图上画箭头/框选/文字，或要求判断表单区域时，主 agent 将任务明确委派给视觉子代理；主 agent 只负责需求理解、步骤编排和最终中文说明。视觉子代理必须：
+
+1. 重新读取本次运行的 `repository-research-run.json`，逐一使用当前 `evidence.mediaFiles` 的完整绝对路径调用 `vision_analyze`；视觉输入只能来自当前 manifest，不能从文件名或旧证据猜路径。
+2. 只返回结构化 JSON：`success`、`profile`、`regions`（每个区域含唯一 `id`、evidence 相对 `source`、描述和归一化 `arrow`/`rectangle`/`label` marks）以及 `tutorialSteps`（唯一 `id`、`title`、`instruction`、`source`、唯一 `regionId`）。每个教程步骤必须恰好引用一个区域，每个区域必须恰好属于一个步骤；JSON 不得包含凭据、完整 prompt、会话内容、`MEDIA:` 或“已发送”声明。`success=false` 必须带 `failureReason`。
+3. 把 JSON 计划写在本次 evidence 目录，再调用项目 adapter 的受控标注命令（`--annotate --manifest ... --annotation-plan ...`）。图片编辑必须由项目 adapter/Sharp 完成；子代理不使用 terminal/file 工具写入或复制 Hermes 媒体根。adapter 必须按 `tutorialSteps` 逐步生成独立 PNG，即使多个步骤共用同一 source，也不能复用输出媒体。
+4. 标注命令成功后重新读取同一 manifest。只有更新后的 `evidence.mediaFiles` 才能逐字生成 `MEDIA:`；视觉分析失败、计划非法、标注失败或 mediaFiles 为空时，保持 fail-closed，不输出媒体。
+
+`vision_analyze` 负责读图，adapter 负责确定性编辑，OneBot adapter 负责最终媒体授权；三者不能互相替代。没有可用视觉路由或本地 PNG 不可读时，报告未验证，不把主模型的猜测写成像素事实。
+
 ## 阶段五：证据
 
 保存以下证据：命令摘要、版本与 commit、服务 mode/ready、浏览器 executable 与 viewport、console/page error、关键资源失败、截图、媒体路径和版本化 manifest。截图必须来自真实 adapter entry path；focused test 不能冒充真实浏览器或真人证据。
