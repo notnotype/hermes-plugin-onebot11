@@ -15,6 +15,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -174,6 +175,33 @@ _TOOL_HANDLERS: dict[str, Any] = {
     "qq_get_group_info": handle_get_group_info,
     "qq_get_group_member_info": handle_get_group_member_info,
 }
+
+_MEDIA_COPY_COMMAND_RE = re.compile(r"(?:^|[;&|])\s*(?:sudo\s+)?(?:cp|mv|install|rsync|copy|robocopy)\b", re.IGNORECASE)
+_MEDIA_HANDOFF_ERROR = "媒体文件必须由项目 repository-research adapter 生成并复制；子代理不能用 terminal 或 file 工具手工写入 Hermes 媒体根"
+
+
+def _mentions_media_root(value: str) -> bool:
+    normalized = str(value or "").replace("\\", "/").casefold()
+    return any(
+        marker in normalized
+        for marker in ("cache/images", "image_cache", "browser_screenshots")
+    )
+
+
+def terminal_writes_media_root(command: str) -> str | None:
+    """阻止子代理绕过项目 adapter 手工复制或重命名媒体文件。"""
+    normalized = str(command or "").replace("\\", "/").casefold()
+    if not _MEDIA_COPY_COMMAND_RE.search(normalized) or not _mentions_media_root(normalized):
+        return None
+    return _MEDIA_HANDOFF_ERROR
+
+
+def file_tool_writes_media_root(path: str) -> str | None:
+    """阻止子代理用 Hermes file 工具直接写入受控媒体根。"""
+    if not _mentions_media_root(path):
+        return None
+    return _MEDIA_HANDOFF_ERROR
+
 
 
 @dataclass(frozen=True)
@@ -7921,6 +7949,21 @@ def _pre_tool_call_hook(
         # 这里对 OneBot turn 的 terminal 命令做统一兜底，禁止写安全敏感配置。
         if normalized_tool_name == "terminal":
             raw_command = (args or {}).get("command")
+            if isinstance(raw_command, str) and delegated_child:
+                media_error = terminal_writes_media_root(raw_command)
+                if media_error:
+                    _safe_audit(
+                        adapter,
+                        "permission_denied",
+                        {
+                            "tool": normalized_tool_name,
+                            "user_id": binding.caller.user_id,
+                            "chat_type": binding.caller.chat_type,
+                            "chat_id": binding.caller.chat_id,
+                            "reason": media_error,
+                        },
+                    )
+                    return {"action": "block", "message": f"权限错误: {media_error}"}
             if isinstance(raw_command, str):
                 config_error = terminal_writes_sensitive_config(raw_command)
                 if config_error:
@@ -7944,6 +7987,21 @@ def _pre_tool_call_hook(
             # 白名单文件，必须在这里同样 fail-closed，防止 write_file/patch
             # 绕过 terminal 兜底。
             raw_path = (args or {}).get("path")
+            if isinstance(raw_path, str) and delegated_child:
+                media_error = file_tool_writes_media_root(raw_path)
+                if media_error:
+                    _safe_audit(
+                        adapter,
+                        "permission_denied",
+                        {
+                            "tool": normalized_tool_name,
+                            "user_id": binding.caller.user_id,
+                            "chat_type": binding.caller.chat_type,
+                            "chat_id": binding.caller.chat_id,
+                            "reason": media_error,
+                        },
+                    )
+                    return {"action": "block", "message": f"权限错误: {media_error}"}
             config_error = (
                 file_tool_writes_sensitive_config(str(raw_path))
                 if isinstance(raw_path, str)

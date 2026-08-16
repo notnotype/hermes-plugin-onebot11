@@ -40,6 +40,7 @@ metadata:
 服务生命周期只认识五个能力：`start`、`ready`、`browserEntry`、`evidenceDir`、`stop`。服务必须由项目 adapter 持有；浏览器和临时根必须进入 finally。浏览器使用真实 executable；不存在时不下载、不修改系统安装。
 
 运行前加载本 Skill 和项目 profile。child 使用前台 terminal 调用 profile command；不要把服务或浏览器交给裸后台 shell 常驻。
+截图或媒体交付任务每次当前 turn 都必须重新执行匹配 profile command；不得从 `session_search`、旧 delegation、旧 manifest 或旧 evidence 复用截图，也不得用 terminal 的 `cp`/`mv`/`install`/`rsync` 手工复制或重命名媒体。项目 adapter command 失败时报告阻塞，不以手工复制替代。
 
 ## 阶段五：证据
 

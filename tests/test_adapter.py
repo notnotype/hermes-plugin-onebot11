@@ -6395,6 +6395,26 @@ async def test_delegated_child只允许项目工具且拒绝QQ(monkeypatch):
                 turn_id="child-turn",
                 args={"command": "rg -n TODO ."},
             ) is None
+            blocked_media = adapter_module._pre_tool_call_hook(
+                tool_name="terminal",
+                session_id="child-session",
+                turn_id="child-turn",
+                args={"command": "cp /tmp/settings-desktop.png /opt/data/cache/images/settings-desktop.png"},
+            )
+            assert blocked_media == {
+                "action": "block",
+                "message": "权限错误: 媒体文件必须由项目 repository-research adapter 生成并复制；子代理不能用 terminal 或 file 工具手工写入 Hermes 媒体根",
+            }
+            blocked_file = adapter_module._pre_tool_call_hook(
+                tool_name="write_file",
+                session_id="child-session",
+                turn_id="child-turn",
+                args={"path": "/opt/data/cache/images/settings-mobile.png", "content": "not-a-png"},
+            )
+            assert blocked_file == {
+                "action": "block",
+                "message": "权限错误: 媒体文件必须由项目 repository-research adapter 生成并复制；子代理不能用 terminal 或 file 工具手工写入 Hermes 媒体根",
+            }
             blocked = adapter_module._pre_tool_call_hook(
                 tool_name="qq_get_message",
                 session_id="child-session",
