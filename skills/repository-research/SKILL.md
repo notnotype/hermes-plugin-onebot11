@@ -44,9 +44,12 @@ metadata:
 
 生产 Hermes 部署中，profile 的 `mediaRootEnv` 必须原样解析为 `${HERMES_HOME}/cache/images`；`--media-dir` 不得替换为仓库 `.agent/tmp` 或任意任务临时目录。`--evidence-dir` 必须位于 `${HERMES_HOME}/evidence` 下，运行态 State/Cache 才能继续使用任务隔离根。标注完成后，重新读取该 evidence 根内的当前 manifest，并把 adapter 成功输出的每一条 `MEDIA:` 原样保留在 completion 回执中；只在 manifest `evidence.mediaFiles` 非空且逐条通过 OneBot 媒体门禁时才交付。
 
+异步 `delegate_task` 的 repository-research worker 必须在同一次 delegated turn 内完成 capture → `vision_analyze` → 受控 `--annotate` → manifest 复读；不能只返回“两张原始截图”，再把视觉标注留给父 agent。completion 回执会以无工具 sandbox turn 进入父会话，父 agent 不能在该回执中补派 `delegate_task`、terminal 或 file；因此 worker 若没有 `delegate_task` 权限，必须直接调用可用的 `vision_analyze`，不能把权限错误当成教程已完成。
+只有当最新 manifest 已包含 `annotations`、`tutorialSteps` 和逐步独立的 `evidence.mediaFiles` 时，worker 才能报告教程完成；capture-only manifest 必须报告未验证/阻塞，不生成或复述原始截图的 `MEDIA:`。
+
 ### API 配置教程的视觉分支
 
-当用户要求“图文教程”、在截图上画箭头/框选/文字，或要求判断表单区域时，主 agent 将任务明确委派给视觉子代理；主 agent 只负责需求理解、步骤编排和最终中文说明。视觉子代理必须：
+当用户要求“图文教程”、在截图上画箭头/框选/文字，或要求判断表单区域时，repository-research worker 必须在当前 delegated turn 内完成视觉分析、标注和媒体回执；父 agent 只负责需求理解和最终中文说明。worker 必须：
 
 1. 重新读取本次运行的 `repository-research-run.json`，逐一使用当前 `evidence.mediaFiles` 的完整绝对路径调用 `vision_analyze`；视觉输入只能来自当前 manifest，不能从文件名或旧证据猜路径。
 2. 只返回结构化 JSON：`success`、`profile`、`regions`（每个区域含唯一 `id`、evidence 相对 `source`、描述和归一化 `arrow`/`rectangle`/`label` marks）以及 `tutorialSteps`（唯一 `id`、`title`、`instruction`、`source`、唯一 `regionId`）。每个教程步骤必须恰好引用一个区域，每个区域必须恰好属于一个步骤；JSON 不得包含凭据、完整 prompt、会话内容、`MEDIA:` 或“已发送”声明。`success=false` 必须带 `failureReason`。
