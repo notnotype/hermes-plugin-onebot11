@@ -2065,6 +2065,71 @@ async def test_LLM候选入队不会在群触发锁上死锁(monkeypatch):
     finally:
         await adapter.disconnect()
 
+async def test_上下文求助使用入队前pending状态进入selector(monkeypatch):
+    """第一条省略主题的求助不唤醒，已有群消息后同句进入 selector。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "groups": ["888"],
+                    "question_interest_words": ["AI", "项目"],
+                },
+            },
+        )
+    )
+    caller = adapter_module.CallerContext(
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+        role="user",
+        allowed_tools=adapter_module.READ_ONLY_TOOLS,
+        self_id="1",
+    )
+    first = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="context-before",
+        user_id="123",
+        user_name="小明",
+        text="正在配置 AI provider",
+        message_key="group:context-before",
+    )
+    second = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="context-help",
+        user_id="456",
+        user_name="小红",
+        text="有没有大佬解惑一下",
+        message_key="group:context-help",
+    )
+    try:
+        await adapter._enqueue_group_message(
+            first,
+            mentioned_self=False,
+            caller=caller,
+            user_name="小明",
+        )
+        state = adapter._trigger_states["888"]
+        assert state.mode == "idle"
+        assert state.llm_calls == 0
+        await adapter._enqueue_group_message(
+            second,
+            mentioned_self=False,
+            caller=caller,
+            user_name="小红",
+        )
+        assert state.mode == "debounce"
+        assert state.last_candidate_type == "question"
+    finally:
+        await adapter.disconnect()
+
 
 async def test_engaged短确认词统一走selector不创建trigger(monkeypatch):
     """活跃窗口中的短确认词没有特例，进入 selector 且不直接创建 trigger。"""

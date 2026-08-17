@@ -199,7 +199,7 @@ cron 和 standalone sender 的 plugin media 不在本轮可靠性合同内。
 群消息的触发顺序是“硬触发优先，候选消息再仲裁”：
 
 - @、关键词、`always` 和管理员命令直接创建持久 trigger，不调用 LLM。
-- 空闲状态先用本地显著性门槛筛选：问号、明确求助/检索短语，或“主题词 + 强疑问词”才进入候选；普通闲聊问句（如“大家吃饭了吗”）直接静默，不调用 LLM。显著问句再由 `question_interest_words` 限定 AI、人工智能、大模型、资料、搜索、研究、论文、文档、技术、代码、编程、项目等主题。`question_bot_words` 非空时再要求问句命中 bot 词、引用 bot 或 bot 刚向同一用户提问；为空则允许其他群成员的相关问句进入 selector。只配置 bot 词而没有兴趣词直接拒绝配置，两组都为空时保持兼容行为。`is_question` 的宽松识别只供内部 bot 问句状态使用，不等于会调用 LLM。@、显式关键词等硬触发不受此门控影响。
+- 空闲状态先用本地显著性门槛筛选：问号、明确求助/检索短语，或“主题词 + 强疑问词”才进入候选；普通闲聊问句（如“大家吃饭了吗”）直接静默，不调用 LLM。像“有没有大佬解惑一下”“求解”这类省略主题的求助句，只有存在同群摘要或同批上下文时才交给 selector，并要求模型结合前文判断。显著问句再由 `question_interest_words` 限定 AI、人工智能、大模型、资料、搜索、研究、论文、文档、技术、代码、编程、项目等主题。`question_bot_words` 非空时再要求问句命中 bot 词、引用 bot 或 bot 刚向同一用户提问；为空则允许其他群成员的相关问句进入 selector。只配置 bot 词而没有兴趣词直接拒绝配置，两组都为空时保持兼容行为。`is_question` 的宽松识别只供内部 bot 问句状态使用，不等于会调用 LLM。@、显式关键词等硬触发不受此门控影响。
 - 候选消息使用 5 秒 trailing debounce；每群最多一个判断任务，冷却期间不创建判断。
 - 旁路模型必须显式配置 provider、model 和群 allowlist。判断由插件自有 Node/pi-ai helper 发起，不经过 Hermes auxiliary，不调用主 Agent 作为隐式 fallback，也不主动切换 provider。`api_key_env` 只保存环境变量名，密钥值只从进程环境读取。
 - 启用旁路判断需要 Node.js ≥22.19 和插件目录中的 `npm ci --omit=dev`；Node、依赖、provider/model、超时或模型结果异常时按 `ignore`，消息保留在 pending。

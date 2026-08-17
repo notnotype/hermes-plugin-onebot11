@@ -11,6 +11,7 @@ from onebot11.triggers import (
     build_llm_trigger_input,
     build_trigger_config,
     is_question,
+    is_significant_question,
     memory_matches,
     parse_llm_decision,
     should_trigger,
@@ -327,6 +328,37 @@ def test_无bot关联的AI和资料问句进入selector():
     )
     assert research_question.kind == "schedule"
     assert research_question.candidate_type == "question"
+
+def test_有上下文的解惑请求进入selector():
+    """当前句省略主题时，明确求助短语可交给 selector 结合上下文判断。"""
+    config = TriggerConfig(
+        question_interest_words=("AI", "资料", "技术", "项目"),
+        debounce_seconds=5,
+    )
+    no_context = LayeredTriggerState(config).observe_message(
+        chat_type="group",
+        text="有没有大佬解惑一下",
+        mentioned_self=False,
+        has_context=False,
+        revision=1,
+        now=0,
+        user_id="other-user",
+    )
+    assert no_context.kind == "none"
+    assert no_context.reason == "question_out_of_scope"
+
+    state = LayeredTriggerState(config)
+    action = state.observe_message(
+        chat_type="group",
+        text="有没有大佬解惑一下",
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=0,
+        user_id="other-user",
+    )
+    assert action.kind == "schedule"
+    assert action.candidate_type == "question"
 
 
 def test_selector提示词不会把疑问词当作必答触发():
@@ -923,6 +955,38 @@ def test_llm输入预算严格成立且保留最新消息():
     assert len(prompt.encode("utf-8")) <= 128
     assert "最新问题？" in prompt
 
+def test_selector输入包含群摘要和当前队列():
+    """selector 同时看到历史摘要、较早消息和最新求助句。"""
+    messages = (
+        QueueMessage(
+            chat_id="287447372",
+            chat_type="group",
+            message_id="old",
+            user_id="1",
+            user_name="前文用户",
+            text="正在配置 AI provider，能接中转吗？",
+            seq=1,
+        ),
+        QueueMessage(
+            chat_id="287447372",
+            chat_type="group",
+            message_id="latest",
+            user_id="2",
+            user_name="当前用户",
+            text="有没有大佬解惑一下",
+            seq=2,
+        ),
+    )
+    prompt = build_llm_trigger_input(
+        "群里此前讨论了模型 provider 和中转接口",
+        messages,
+        max_bytes=12_000,
+        candidate_type="question",
+    )
+    assert "历史摘要：群里此前讨论了模型 provider 和中转接口" in prompt
+    assert "#1 [前文用户] 正在配置 AI provider，能接中转吗？" in prompt
+    assert "#2 [当前用户] 有没有大佬解惑一下" in prompt
+    assert "当前队列和历史摘要" in prompt
 
 def test_llm输入预算小于提示词仍不超限():
     """直接调用者传入极小预算时也不能返回超限字符串。"""
@@ -974,6 +1038,9 @@ def test_is_question词表覆盖常见中文问句():
     assert is_question("你能不能帮我")
     assert is_question("帮我找资料")
     assert is_question("查一下 AI 的资料")
+    assert is_question("有没有大佬解惑一下")
+    assert is_significant_question("有没有大佬解惑一下")
+    assert not is_significant_question("大家吃饭了吗")
 
 
 def test_is_question不误报非提问消息():

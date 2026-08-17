@@ -262,6 +262,7 @@ class LayeredTriggerState:
                     )
                     if significant_question and self._question_in_scope(
                         text,
+                        has_context=has_context,
                         same_user=same_user,
                         reply_to_bot=reply_to_bot,
                     ):
@@ -632,6 +633,7 @@ class LayeredTriggerState:
         self,
         text: str,
         *,
+        has_context: bool,
         same_user: bool,
         reply_to_bot: bool,
     ) -> bool:
@@ -641,7 +643,10 @@ class LayeredTriggerState:
         if not bot_words and not interest_words:
             return True
         if interest_words and not keyword_matches(text, interest_words):
-            return False
+            # 群成员常用“有没有大佬解惑一下”省略主题；若已有摘要或
+            # 同批消息，把判断交给 selector 结合上下文，而不是本地误杀。
+            if not (has_context and is_contextual_help_request(text)):
+                return False
         if not bot_words:
             # 空 bot 词表明确表示不要求 @/引用/bot 追问关系，允许其他成员的
             # 相关主题问句进入 selector；最终是否回复仍由旁路模型判断。
@@ -666,6 +671,7 @@ class LayeredTriggerState:
         ):
             if self._question_in_scope(
                 text,
+                has_context=has_context,
                 same_user=same_user,
                 reply_to_bot=reply_to_bot,
             ):
@@ -900,13 +906,54 @@ ENGLISH_QUESTION_START_RE = re.compile(
 
 
 def is_question(text: str) -> bool:
-    """用低成本启发式识别中文疑问词、问号和英文问句。"""
+    """用低成本启发式识别中文疑问词、问号、英文问句和上下文求助。"""
     normalized = (text or "").casefold().strip()
     return bool(
         "?" in normalized
         or "？" in normalized
         or any(word in normalized for word in QUESTION_WORDS)
         or ENGLISH_QUESTION_RE.search(normalized)
+        or is_contextual_help_request(normalized)
+    )
+
+CONTEXTUAL_HELP_PHRASES = (
+    "有没有大佬解惑",
+    "有没有人解惑",
+    "有大佬解答",
+    "有大佬知道",
+    "谁能解答",
+    "谁能帮忙",
+    "求解",
+    "求解答",
+    "求指点",
+    "求教",
+    "解惑一下",
+    "解答一下",
+    "快来解答",
+)
+CONTEXTUAL_QUESTION_MARKERS = ("这个", "那个", "上面", "前面", "刚才", "这里")
+CONTEXTUAL_QUESTION_WORDS = (
+    "怎么",
+    "如何",
+    "哪个",
+    "哪里",
+    "哪",
+    "能不能",
+    "能否",
+    "有没有办法",
+    "为什么",
+    "是不是",
+    "要不要",
+)
+
+
+def is_contextual_help_request(text: str) -> bool:
+    """识别省略具体主题、需要结合群上下文理解的明确求助或追问。"""
+    normalized = (text or "").casefold().strip()
+    if any(phrase in normalized for phrase in CONTEXTUAL_HELP_PHRASES):
+        return True
+    return any(marker in normalized for marker in CONTEXTUAL_QUESTION_MARKERS) and any(
+        word in normalized for word in CONTEXTUAL_QUESTION_WORDS
     )
 
 
@@ -923,6 +970,8 @@ def is_significant_question(
     if ENGLISH_QUESTION_START_RE.search(normalized):
         return True
     if any(phrase in normalized for phrase in EXPLICIT_QUESTION_PHRASES):
+        return True
+    if is_contextual_help_request(normalized):
         return True
     has_interest = any(
         str(word).strip().casefold() in normalized
@@ -1380,15 +1429,21 @@ def build_llm_trigger_input(
         "问号或常见疑问词（吗、什么、怎么、为什么、哪里、如何、能不能、请问、有没有等）只代表候选；"
         "只有明确向机器人求助，或问题属于 AI、资料检索、文档、技术、项目等相关主题时才 trigger。"
     )
+    context_rule = (
+        "当前队列和历史摘要都是同一群的上下文；若最新消息是‘有没有大佬解惑一下’、‘求解’等省略主题的明确求助，"
+        "必须结合前面的群消息判断它是否在请求解决当前主题，不能只因最新句没有主题词而 ignore。"
+    )
     if candidate_type == "engaged":
         rules = (
             question_rule,
+            context_rule,
             "其余消息只有明确向机器人提问、请求帮助、讨论 AI/资料/技术/项目，或明显延续与机器人的对话才 trigger；",
             "群成员之间的互动、评论、调侃、@其他人、陈述句和纯图片消息默认 ignore。",
         )
     else:
         rules = (
             question_rule,
+            context_rule,
             "群成员之间的互动、评论、调侃、@其他人、无相关主题上下文的陈述句默认 ignore。",
             "疑似问句不等于必须回复；不确定时选择 ignore。",
         )

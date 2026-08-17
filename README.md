@@ -212,7 +212,7 @@ config.yaml，行为不变。文件必须是合法 YAML mapping，未知键会�
 - `normal`（默认）：现状 60s/300s、2 次仲裁、超时 30s、输入 12KB。
 - `shallow`（省 token）：连续 2 次 ignore 后降级。窗口 30s/120s、1 次仲裁、超时 12s、输入 6KB。开启 `short_rule_max_chars` 后，shallow 档无信号的短消息（≤ N 字、非问句、无回指、未引用 bot、bot 未提问）本地判 ignore，不进 selector。
 
-问句候选先经过本地显著性门槛：问号、明确求助/检索短语，或命中配置主题且包含较强疑问结构才进入 selector；“大家吃饭了吗”这类普通闲聊问句不调用 LLM。`is_question` 仍保留为宽松共享识别，仅用于 bot 回复是否在提问等内部状态。显著问句再通过 `question_interest_words` 限定主题范围；`question_bot_words` 非空时再要求命中 bot 词、引用 bot 或 bot 刚向同一用户提问。`question_bot_words` 为空表示不要求显式关联 bot，其他群成员的相关问句也会进入 selector。两组都为空时保持兼容行为；只配置 bot 词而没有兴趣词会 fail-closed。@、显式关键词等硬触发不受此门控影响。
+问句候选先经过本地显著性门槛：问号、明确求助/检索短语，或命中配置主题且包含较强疑问结构才进入 selector；“大家吃饭了吗”这类普通闲聊问句不调用 LLM。像“有没有大佬解惑一下”“求解”这类省略主题的求助句，只有在存在同群摘要或同批上下文时才进入 selector，由模型结合前文判断。`is_question` 仍保留为宽松共享识别，仅用于 bot 回复是否在提问等内部状态。显著问句再通过 `question_interest_words` 限定主题范围；`question_bot_words` 非空时再要求命中 bot 词、引用 bot 或 bot 刚向同一用户提问。`question_bot_words` 为空表示不要求显式关联 bot，其他群成员的相关问句也会进入 selector。两组都为空时保持兼容行为；只配置 bot 词而没有兴趣词会 fail-closed。@、显式关键词等硬触发不受此门控影响。
 `media_orphan_ttl_seconds` 到期后由下一次 adapter 启动或 turn 收尾清理遗留媒体目录。
 `processing_reaction_enabled` 默认开启；它使用 LLBot 的 `set_msg_emoji_like` 扩展，只作用于群聊真实消息 ID。回复阶段的 💬 使用 `processing_reaction_emoji_id`（默认 `128172`）；selector 判断阶段的 👀 使用固定 ID `128064`（LLBot/QQ 已验证支持；`9203` 即 ⏳ 与 `8971` 在 QQ reaction API 上显示异常）。添加或移除 reaction 的未知结果不会重放 Agent turn，也不会阻断队列 ack。
 

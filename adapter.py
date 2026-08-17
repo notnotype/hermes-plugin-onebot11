@@ -2553,7 +2553,9 @@ class OneBot11Adapter(BasePlatformAdapter):
                         chat_type="group",
                         text=message.text,
                         mentioned_self=mentioned_self,
-                        has_context=bool(before.get("summary") or int(status.get("pending", 0)) > 0),
+                        has_context=bool(
+                            before.get("summary") or int(before.get("pending", 0)) > 0
+                        ),
                         revision=int(status.get("revision", 0)),
                         now=now,
                         last_trigger_at=previous_trigger_at,
