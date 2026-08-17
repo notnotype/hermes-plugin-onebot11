@@ -344,29 +344,32 @@ def test_selector提示词不会把疑问词当作必答触发():
     assert "群成员之间的互动" in prompt
 
 
-def test_分层状态机只让候选消息进入仲裁():
-    """普通闲聊不消耗旁路 LLM，问句和有上下文回指才安排 debounce。"""
+def test_分层状态机只让显著问句进入仲裁():
+    """普通闲聊问句不消耗旁路 LLM，明确主题问题才安排 debounce。"""
     config = TriggerConfig(debounce_seconds=5)
     state = LayeredTriggerState(config)
-    assert state.observe_message(
+    weak = state.observe_message(
         chat_type="group",
         text="大家吃饭了吗",
         mentioned_self=False,
         has_context=False,
         revision=1,
         now=0,
-    ).kind == "schedule"
+    )
+    assert weak.kind == "none"
+    assert weak.reason == "weak_question"
+    assert state.llm_calls == 0
 
-    state = LayeredTriggerState(config)
-    assert state.observe_message(
+    strong = LayeredTriggerState(config).observe_message(
         chat_type="group",
-        text="今天天气不错",
+        text="AI 模型怎么选？",
         mentioned_self=False,
         has_context=False,
         revision=1,
         now=0,
-    ).reason == "non_candidate"
-    assert state.llm_calls == 0
+    )
+    assert strong.kind == "schedule"
+    assert strong.candidate_type == "question"
     assert is_question("Can you help me?")
     assert memory_matches("继续刚才的话题", config.memory_words)
 
@@ -686,22 +689,40 @@ def test_engaged问句优先走question候选():
     assert state.llm_calls == 0
 
 
-def test_engaged无问号问句识别():
-    """不带问号的问句（你吃饭了吗、你是不是爱吃饭）也能在活跃对话中触发。"""
-    for text in ("你吃饭了吗", "你是不是爱吃饭", "明天星期几"):
-        state = LayeredTriggerState(TriggerConfig(debounce_seconds=5))
-        state.on_turn_complete(success=True, now=0)
-        action = state.observe_message(
-            chat_type="group",
-            text=text,
-            mentioned_self=False,
-            has_context=True,
-            revision=1,
-            now=1,
+def test_engaged普通无主题问句不进入selector():
+    """活跃窗口也过滤普通闲聊问句，主题问题才进入 question 候选。"""
+    state = LayeredTriggerState(TriggerConfig(debounce_seconds=5))
+    state.on_turn_complete(success=True, now=0)
+    weak = state.observe_message(
+        chat_type="group",
+        text="你吃饭了吗",
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=1,
+    )
+    assert weak.kind == "none"
+    assert weak.reason == "weak_question"
+    assert state.llm_calls == 0
+
+    state = LayeredTriggerState(
+        TriggerConfig(
+            question_interest_words=("AI", "项目"),
+            debounce_seconds=5,
         )
-        assert action.kind == "schedule", text
-        assert action.candidate_type == "question", text
-        assert state.llm_calls == 0, text
+    )
+    state.on_turn_complete(success=True, now=0)
+    strong = state.observe_message(
+        chat_type="group",
+        text="AI 模型怎么选",
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=1,
+    )
+    assert strong.kind == "schedule"
+    assert strong.candidate_type == "question"
+    assert state.llm_calls == 0
 
 
 def test_idle短确认词不直接唤醒():

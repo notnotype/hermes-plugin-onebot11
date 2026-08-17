@@ -254,9 +254,13 @@ class LayeredTriggerState:
                 if self.arbitration_count >= self._window_arbitration_limit:
                     return TriggerAction("none", reason="arbitration_limit")
                 if self.config.question_enabled and is_question(text):
-                    # 配置范围门控后，闲聊问句直接忽略；有上下文的回指仍
-                    # 保留 memory 候选，避免收紧问句时破坏连续任务。
-                    if self._question_in_scope(
+                    # `is_question` 保留宽松语义供 bot 问句识别；只有显著问句
+                    # 才能消耗一次旁路 LLM，弱问句直接静默忽略。
+                    significant_question = is_significant_question(
+                        text,
+                        self.config.question_interest_words,
+                    )
+                    if significant_question and self._question_in_scope(
                         text,
                         same_user=same_user,
                         reply_to_bot=reply_to_bot,
@@ -266,7 +270,10 @@ class LayeredTriggerState:
                         text, self.config.memory_words
                     ):
                         return self._schedule("memory", revision, now, gap=gap)
-                    return TriggerAction("none", reason="question_out_of_scope")
+                    return TriggerAction(
+                        "none",
+                        reason=("question_out_of_scope" if significant_question else "weak_question"),
+                    )
                 if self._short_rule_ignore(text):
                     return TriggerAction("none", reason="short_rule_ignore")
                 # deep 档同用户 follow-up 立即判，不等 trailing debounce。
@@ -308,12 +315,19 @@ class LayeredTriggerState:
             reply_to_bot=reply_to_bot,
         )
         if not candidate_type:
-            if self.config.question_enabled and is_question(text) and not self._question_in_scope(
-                text,
-                same_user=same_user,
-                reply_to_bot=reply_to_bot,
-            ):
-                return TriggerAction("none", reason="question_out_of_scope")
+            if self.config.question_enabled and is_question(text):
+                significant_question = is_significant_question(
+                    text,
+                    self.config.question_interest_words,
+                )
+                return TriggerAction(
+                    "none",
+                    reason=(
+                        "question_out_of_scope"
+                        if significant_question
+                        else "weak_question"
+                    ),
+                )
             return TriggerAction("none", reason="non_candidate")
         return self._schedule(candidate_type, revision, now, gap=gap)
 
@@ -645,8 +659,11 @@ class LayeredTriggerState:
         same_user: bool,
         reply_to_bot: bool,
     ) -> str:
-        """按问句范围和有上下文的记忆回指识别候选。"""
-        if self.config.question_enabled and is_question(text):
+        """按显著问句范围和有上下文的记忆回指识别候选。"""
+        if self.config.question_enabled and is_significant_question(
+            text,
+            self.config.question_interest_words,
+        ):
             if self._question_in_scope(
                 text,
                 same_user=same_user,
@@ -847,8 +864,37 @@ QUESTION_WORDS = (
     "有没有办法",
     "这个正常吗",
 )
+# 问号、明确求助短语，或“主题词 + 强疑问词”才消耗旁路 LLM。
+# 单独的“吗/几”以及脱离主题的闲聊疑问词不进入 selector。
+SIGNIFICANT_QUESTION_WORDS = tuple(
+    word for word in QUESTION_WORDS if word not in {"吗", "几"}
+)
+EXPLICIT_QUESTION_PHRASES = (
+    "请问",
+    "请教",
+    "想问",
+    "帮我",
+    "帮忙",
+    "找资料",
+    "查资料",
+    "查一下",
+    "搜一下",
+    "搜索一下",
+    "检索",
+    "推荐一下",
+    "介绍一下",
+    "解释一下",
+    "能不能帮",
+    "有没有办法",
+    "这个怎么弄",
+    "这个正常吗",
+)
 ENGLISH_QUESTION_RE = re.compile(
     r"\b(?:who|what|when|where|why|how|can|could|would|should|do|does|did|is|are|will)\b",
+    re.IGNORECASE,
+)
+ENGLISH_QUESTION_START_RE = re.compile(
+    r"^(?:who|what|when|where|why|how|can|could|would|should|do|does|did|is|are|will)\b",
     re.IGNORECASE,
 )
 
@@ -861,6 +907,31 @@ def is_question(text: str) -> bool:
         or "？" in normalized
         or any(word in normalized for word in QUESTION_WORDS)
         or ENGLISH_QUESTION_RE.search(normalized)
+    )
+
+
+def is_significant_question(
+    text: str,
+    interest_words: Iterable[str] = (),
+) -> bool:
+    """只放行足够明确、值得消耗一次 LLM 仲裁的问句。"""
+    normalized = (text or "").casefold().strip()
+    if not normalized:
+        return False
+    if "?" in normalized or "？" in normalized:
+        return True
+    if ENGLISH_QUESTION_START_RE.search(normalized):
+        return True
+    if any(phrase in normalized for phrase in EXPLICIT_QUESTION_PHRASES):
+        return True
+    has_interest = any(
+        str(word).strip().casefold() in normalized
+        for word in interest_words
+        if str(word).strip()
+    )
+    # 无问号的疑问词只在命中已配置主题时放行，避免把群聊闲谈送进 LLM。
+    return has_interest and any(
+        word.casefold() in normalized for word in SIGNIFICANT_QUESTION_WORDS
     )
 
 
