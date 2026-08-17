@@ -94,8 +94,9 @@ class TriggerConfig:
         "帮忙",
         "帮我看看",
     )
-    # 配置后，问句候选必须同时具备 bot 关联信号和兴趣词；两个列表都为空时
-    # 保持兼容行为，不改变未启用范围门控的旧部署。
+    # `question_interest_words` 非空时定义主题范围；`question_bot_words` 可选。
+    # bot 词非空表示仍要求显式关联 bot，bot 词为空表示允许群内其他成员的
+    # 相关主题问句进入 selector；两组都为空时保持兼容行为，不做本地主题门控。
     question_bot_words: tuple[str, ...] = ()
     question_interest_words: tuple[str, ...] = ()
     # engaged 中短消息（≤ 该字数）且 bot 未提问、非问句、无回指、未引用
@@ -620,16 +621,20 @@ class LayeredTriggerState:
         same_user: bool,
         reply_to_bot: bool,
     ) -> bool:
-        """判断问句是否同时关联 bot 且命中配置的兴趣范围。"""
+        """判断问句是否命中主题范围，并按配置决定是否要求关联 bot。"""
         bot_words = self.config.question_bot_words
         interest_words = self.config.question_interest_words
         if not bot_words and not interest_words:
             return True
+        if interest_words and not keyword_matches(text, interest_words):
+            return False
+        if not bot_words:
+            # 空 bot 词表明确表示不要求 @/引用/bot 追问关系，允许其他成员的
+            # 相关主题问句进入 selector；最终是否回复仍由旁路模型判断。
+            return True
         if reply_to_bot or (same_user and self.bot_asked):
-            bot_related = True
-        else:
-            bot_related = keyword_matches(text, bot_words)
-        return bot_related and keyword_matches(text, interest_words)
+            return True
+        return keyword_matches(text, bot_words)
 
 
     def _candidate_type_for(
@@ -811,6 +816,16 @@ QUESTION_WORDS = (
     "可以吗",
     "请问",
     "帮我",
+    "帮我找",
+    "找资料",
+    "查资料",
+    "查一下",
+    "搜一下",
+    "搜索一下",
+    "检索",
+    "推荐一下",
+    "介绍一下",
+    "解释一下",
     "几",
     "多少",
     "啥",
@@ -1235,9 +1250,10 @@ def build_trigger_config(extra: dict[str, Any]) -> TriggerConfig:
             (),
         )
     )
-    if bool(question_bot_words) != bool(question_interest_words):
+    if question_bot_words and not question_interest_words:
         raise ValueError(
-            "question_bot_words 和 question_interest_words 必须同时配置或同时留空"
+            "配置 question_bot_words 时必须同时配置 question_interest_words；"
+            "仅配置兴趣词时不要求关联 bot"
         )
     return TriggerConfig(
         require_mention=parse_bool(extra.get("require_mention"), default=True, name="require_mention"),
@@ -1291,18 +1307,18 @@ def build_llm_trigger_input(
     latest = queued[-1] if queued else None
     question_rule = (
         "问号或常见疑问词（吗、什么、怎么、为什么、哪里、如何、能不能、请问、有没有等）只代表候选；"
-        "只有明确向机器人求助或问题与项目上下文相关时才 trigger。"
+        "只有明确向机器人求助，或问题属于 AI、资料检索、文档、技术、项目等相关主题时才 trigger。"
     )
     if candidate_type == "engaged":
         rules = (
             question_rule,
-            "其余消息只有明确向机器人提问、请求帮助或明显延续与机器人的对话才 trigger；",
+            "其余消息只有明确向机器人提问、请求帮助、讨论 AI/资料/技术/项目，或明显延续与机器人的对话才 trigger；",
             "群成员之间的互动、评论、调侃、@其他人、陈述句和纯图片消息默认 ignore。",
         )
     else:
         rules = (
             question_rule,
-            "群成员之间的互动、评论、调侃、@其他人、无项目上下文的陈述句默认 ignore。",
+            "群成员之间的互动、评论、调侃、@其他人、无相关主题上下文的陈述句默认 ignore。",
             "疑似问句不等于必须回复；不确定时选择 ignore。",
         )
     contract = "\n".join(
@@ -1364,7 +1380,7 @@ def build_llm_trigger_input(
     compact_prefix = "\n".join(
         (
             f"OneBot11 selector；候选类型：{candidate_type}。",
-            "问句只代表候选；明确向机器人求助、项目上下文或延续与机器人的对话才 trigger；",
+            "问句只代表候选；明确向机器人求助，或 AI/资料/文档/技术/项目主题相关时才 trigger；",
             "群成员之间的互动默认 ignore；疑似问句不等于必须回复；不确定时选择 ignore。",
             'trigger={"decision":"trigger","anchor_seq":123}',
             'wait={"decision":"wait","anchor_seq":null}',

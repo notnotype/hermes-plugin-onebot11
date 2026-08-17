@@ -199,7 +199,7 @@ cron 和 standalone sender 的 plugin media 不在本轮可靠性合同内。
 群消息的触发顺序是“硬触发优先，候选消息再仲裁”：
 
 - @、关键词、`always` 和管理员命令直接创建持久 trigger，不调用 LLM。
-- 空闲状态默认只把问句或带有“之前/上次/刚才/继续”等回指词送入候选；生产可用 `question_bot_words` + `question_interest_words` 要求问句同时关联 bot 和兴趣范围。引用 bot、bot 刚向同一用户提问可满足 bot 关联；两组只配置一组直接拒绝配置。
+- 空闲状态默认只把问句或带有“之前/上次/刚才/继续”等回指词送入候选；生产可用 `question_interest_words` 限定 AI、人工智能、大模型、资料、搜索、研究、论文、文档、技术、代码、编程、项目等主题。`question_bot_words` 非空时再要求问句命中 bot 词、引用 bot 或 bot 刚向同一用户提问；为空则允许其他群成员的相关问句进入 selector。只配置 bot 词而没有兴趣词直接拒绝配置，两组都为空时保持兼容行为。@、显式关键词等硬触发不受此门控影响。
 - 候选消息使用 5 秒 trailing debounce；每群最多一个判断任务，冷却期间不创建判断。
 - 旁路模型必须显式配置 provider、model 和群 allowlist。判断由插件自有 Node/pi-ai helper 发起，不经过 Hermes auxiliary，不调用主 Agent 作为隐式 fallback，也不主动切换 provider。`api_key_env` 只保存环境变量名，密钥值只从进程环境读取。
 - 启用旁路判断需要 Node.js ≥22.19 和插件目录中的 `npm ci --omit=dev`；Node、依赖、provider/model、超时或模型结果异常时按 `ignore`，消息保留在 pending。

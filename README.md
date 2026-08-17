@@ -152,9 +152,9 @@ platforms:
             input_bytes: 20000
             wait_messages: 2             # waiting 攒满 2 条新消息立即判
         short_rule_max_chars: 0          # 0=关闭；>0 时 shallow 档短消息本地 ignore
-        # 问句旁路门控（两组同时配置时生效）：必须关联 bot 且命中兴趣词
-        question_bot_words: [机器人, 助手]
-        question_interest_words: [项目, 配置, 报错]
+        # 问句旁路门控：兴趣词非空时筛选相关主题；bot 词可选
+        question_bot_words: []            # 空 = 不要求提到 bot，允许其他成员的相关问句
+        question_interest_words: [AI, 人工智能, 大模型, LLM, GPT, Claude, Gemini, Agent, MCP, 机器学习, 深度学习, 资料, 搜索, 研究, 论文, 教程, 文档, 信息, 知识, 技术, 代码, 编程, 开发, 项目]
       processing_reaction_enabled: true
       processing_reaction_emoji_id: "128172"  # LLBot 的 💬，表示正在回复
       show_interim_group: false   # 群聊隐藏 Hermes 中间正文（commentary/进度）；最终回复仍发送
@@ -212,8 +212,7 @@ config.yaml，行为不变。文件必须是合法 YAML mapping，未知键会�
 - `normal`（默认）：现状 60s/300s、2 次仲裁、超时 30s、输入 12KB。
 - `shallow`（省 token）：连续 2 次 ignore 后降级。窗口 30s/120s、1 次仲裁、超时 12s、输入 6KB。开启 `short_rule_max_chars` 后，shallow 档无信号的短消息（≤ N 字、非问句、无回指、未引用 bot、bot 未提问）本地判 ignore，不进 selector。
 
-`bot_asked` 只由成功回复文本决定：回复以问句或明确的请求短语（"复现一下/发我/贴一下"等，只检查尾部 80 字）收尾时，bot 下一条同用户消息获得 deep 预算。他人插话不享受 deep，回落 normal。重启后所有档位回到 idle/normal，不持久化。
-问句候选可通过 `question_bot_words` 与 `question_interest_words` 收紧：两组同时非空时，空闲/活跃窗口内的问句只有在文本命中兴趣词且明确关联 bot（命中 bot 词、引用 bot，或 bot 刚向同一用户提问）才进入 selector；@、显式关键词等硬触发不受此门控影响。两组只配置一组会 fail-closed。
+问句候选可通过 `question_interest_words` 限定主题范围；`question_bot_words` 非空时再要求命中 bot 词、引用 bot 或 bot 刚向同一用户提问。`question_bot_words` 为空表示不要求显式关联 bot，其他群成员的相关问句也会进入 selector。两组都为空时保持兼容行为；只配置 bot 词而没有兴趣词会 fail-closed。@、显式关键词等硬触发不受此门控影响。
 `media_orphan_ttl_seconds` 到期后由下一次 adapter 启动或 turn 收尾清理遗留媒体目录。
 `processing_reaction_enabled` 默认开启；它使用 LLBot 的 `set_msg_emoji_like` 扩展，只作用于群聊真实消息 ID。回复阶段的 💬 使用 `processing_reaction_emoji_id`（默认 `128172`）；selector 判断阶段的 👀 使用固定 ID `128064`（LLBot/QQ 已验证支持；`9203` 即 ⏳ 与 `8971` 在 QQ reaction API 上显示异常）。添加或移除 reaction 的未知结果不会重放 Agent turn，也不会阻断队列 ack。
 

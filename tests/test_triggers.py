@@ -274,18 +274,59 @@ def test_问句范围门控保留引用bot和bot提问后的同用户追问():
     assert follow_up.candidate_type == "question"
 
 
-def test_问句范围门控配置必须成对出现():
-    """半配置会 fail-closed，避免只限制一侧造成误触发。"""
+def test_问句范围门控允许兴趣词独立配置():
+    """兴趣词可独立启用，让其他成员的相关问句进入 selector；bot 词仍可收紧范围。"""
     with pytest.raises(ValueError):
         build_trigger_config({"question_bot_words": ["机器人"]})
-    config = build_trigger_config(
+
+    topic_only = build_trigger_config(
+        {"question_interest_words": ["AI", "资料"]}
+    )
+    assert topic_only.question_bot_words == ()
+    assert topic_only.question_interest_words == ("ai", "资料")
+
+    strict = build_trigger_config(
         {
             "question_bot_words": ["机器人"],
             "question_interest_words": ["项目"],
         }
     )
-    assert config.question_bot_words == ("机器人",)
-    assert config.question_interest_words == ("项目",)
+    assert strict.question_bot_words == ("机器人",)
+    assert strict.question_interest_words == ("项目",)
+
+def test_无bot关联的AI和资料问句进入selector():
+    """放宽 bot 关联后，其他群成员的 AI/资料问题也应成为候选。"""
+    config = TriggerConfig(
+        question_bot_words=(),
+        question_interest_words=("AI", "资料", "搜索"),
+        debounce_seconds=5,
+    )
+    state = LayeredTriggerState(config)
+
+    ai_question = state.observe_message(
+        chat_type="group",
+        text="AI 模型怎么选？",
+        mentioned_self=False,
+        has_context=False,
+        revision=1,
+        now=0,
+        user_id="other-user",
+    )
+    assert ai_question.kind == "schedule"
+    assert ai_question.candidate_type == "question"
+
+    state.invalidate_judgement()
+    research_question = state.observe_message(
+        chat_type="group",
+        text="能帮我找资料和搜索文档吗？",
+        mentioned_self=False,
+        has_context=False,
+        revision=2,
+        now=1,
+        user_id="another-user",
+    )
+    assert research_question.kind == "schedule"
+    assert research_question.candidate_type == "question"
 
 
 def test_selector提示词不会把疑问词当作必答触发():
@@ -299,6 +340,7 @@ def test_selector提示词不会把疑问词当作必答触发():
     assert "必须 trigger" not in prompt
     assert "只代表候选" in prompt
     assert "明确向机器人求助" in prompt
+    assert "AI、资料检索、文档、技术、项目" in prompt
     assert "群成员之间的互动" in prompt
 
 
@@ -909,6 +951,8 @@ def test_is_question词表覆盖常见中文问句():
     assert is_question("什么时候出发")
     assert is_question("是不是该走了")
     assert is_question("你能不能帮我")
+    assert is_question("帮我找资料")
+    assert is_question("查一下 AI 的资料")
 
 
 def test_is_question不误报非提问消息():
