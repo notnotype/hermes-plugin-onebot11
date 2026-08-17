@@ -81,6 +81,16 @@ send_message、cronjob 或再次委派。`trusted_user` 或 `user` 要开放 gen
 `read_file` 用于读取文件。只有实际修改、运行测试或执行 shell 工作才交给
 `delegate_task` 子代理。
 
+## 客服响应 SOP
+
+客服请求先分流为：纯功能解释、复用已有客服 evidence、需要新的问题调查或运行证据。先查已有 evidence、项目文档和 Skill；已有结论足够时直接复用，不新建记录，也不向用户展示分流理由。
+同批次与当前产品问题无关的闲聊、价格、token 费用或图片话题静默忽略，不逐条回应。
+
+若结论依赖 NeuroBook 版本、commit、构建号或 provider 实现，而当前消息和已有 evidence 没有精确版本标识，必须先询问版本/构建号并暂停调研、网页搜索、adapter 启动和后台委派；版本补齐后再把它纳入验证证据。
+归档是按需的内部证据动作。需要新记录时，主 agent 只读不能直接写文件，必须委派 child 实际写入 `HERMES_HOME/evidence` 或规定的 documentation 路径，并重新读取或 stat 证明落盘；没有写入和复读证明，不得声称已归档。目录不可写时记录内部阻塞，但仍可回复已验证结论。
+用户可见回复只保留当前问题的结论、必要证据和下一步，不展示内部 triage、无关闲聊筛选、归档决策、权限快照或中间推理。
+## 只读与媒体交付
+
 只读不限制 QQ 群管理写工具：撤回、禁言、踢人、全员禁言仍由 super_admin + 当前群 +
 `/onebot confirm` 确认令牌把关。主 agent 的 `read_file` 不能读取 `.env`、
 `auth.json`、`auth.lock` 等凭据文件，避免密钥进入模型上下文；
@@ -101,9 +111,8 @@ send_message、cronjob 或再次委派。`trusted_user` 或 `user` 要开放 gen
 
 Hermes 在 ReAct 过程中产生的 AI 中间评论（commentary）、工具进度和状态提示会直调 adapter 的
 `send()`；OneBot 插件用 `_send_with_retry`（最终回复）与直调 `send()`（中间消息）区分二者。
-默认私聊展示中间正文；群聊默认隐藏（避免刷屏），但可设置 `show_interim_group: true`
-开启（长任务如"生成一张图片"时能实时看到进度）。`show_interim_group` / `show_interim_dm`
-配置热更新生效。最终回复始终发送，不受该配置影响；
+生产群建议保持 `show_interim_group: false`，避免把内部进度和工具过程刷到群里；需要实时进度时才显式开启。
+默认私聊展示中间正文；`show_interim_group` / `show_interim_dm` 配置热更新生效。最终回复始终发送，不受该配置影响；
 Hermes cron 或系统通知若直发到群，也会按群聊中间正文规则处理，请按需配置。
 
 ## 运行时 reload

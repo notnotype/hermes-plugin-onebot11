@@ -267,6 +267,42 @@ def test_子代理截图提示只允许manifest媒体事实来源():
     assert "--annotate" in prompt
     assert "不得输出 MEDIA:" in prompt
 
+def test_子代理提示不混入主agent只读门控():
+    """delegated child 只能看到项目执行合同，不能收到主 agent 的只读委派指令。"""
+    context = CallerContext(
+        user_id="1259901822",
+        chat_type="group",
+        chat_id="942513604",
+        role="user",
+        allowed_tools=frozenset(),
+        self_id="3101482118",
+    )
+    prompt = role_prompt(context, delegated_child=True)
+    assert "当前是 Hermes delegated child" in prompt
+    assert "当前是 Hermes 主 agent 的只读模式" not in prompt
+    assert "客服问题必须先查已有客服 evidence" not in prompt
+    assert "需要 terminal、process、" not in prompt
+    assert "如果任务涉及浏览器截图或高级仓库调研，必须先用 skill_view 读取 onebot11-platform:repository-research" in prompt
+
+
+def test_主agent提示保留版本和用户可见回执门控():
+    """主 agent 必须先做版本/分流判断，并隐藏内部归档和闲聊筛选。"""
+    context = CallerContext(
+        user_id="1259901822",
+        chat_type="group",
+        chat_id="942513604",
+        role="user",
+        allowed_tools=frozenset({"read_file", "search_files", "delegate_task"}),
+        self_id="3101482118",
+    )
+    prompt = role_prompt(context, main_agent_read_only=True)
+    assert "凡结论依赖 NeuroBook 版本" in prompt
+    assert "暂停调研和委派" in prompt
+    assert "同批次其他无关闲聊" in prompt
+    assert "最终用户可见回复只包含当前问题的结论" in prompt
+    assert "当前是 Hermes delegated child" not in prompt
+    assert "当前 child 直接调用 vision_analyze" not in prompt
+
 
 def test_search_files覆盖grep和glob说明():
     """权限提示明确告诉模型 search_files 是只读 Grep/Glob 替代。"""
@@ -374,6 +410,12 @@ def test_客服只读提示要求先复用经验并自动后台委派():
     assert "目录不可写时" in prompt
     assert "不要声称自己拥有未出现在当前允许工具列表中的浏览器" in prompt
     assert "不得声称截图已完成或服务已启动" in prompt
+    assert "缺少精确版本" in prompt
+    assert "暂停调研" in prompt
+    assert "归档是按需的内部证据动作" in prompt
+    assert "纯功能解释" in prompt
+    assert "同批次其他无关闲聊" in prompt
+    assert "不能声称已归档" in prompt
 
 
 def test_客服媒体提示禁止裸路径改写为MEDIA():

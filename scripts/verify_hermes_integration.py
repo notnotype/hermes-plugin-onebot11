@@ -156,6 +156,16 @@ async def _smoke(
         raise AssertionError("repository-research Skill 未声明唯一媒体路径来源")
     if "vision_analyze" not in skill_text or "--annotate" not in skill_text:
         raise AssertionError("repository-research Skill 未声明视觉分析与受控标注流程")
+    for required_contract in (
+        "任务分流与版本门槛",
+        "暂停调研和委派",
+        "同批次中与当前产品问题无关的闲聊",
+        "客服归档合同",
+        "实际写入 HERMES_HOME/evidence",
+        "不得声称已归档",
+    ):
+        if required_contract not in skill_text:
+            raise AssertionError(f"repository-research Skill 缺少客服合同: {required_contract}")
     queue_db = hermes_home / "onebot11" / "integration.sqlite3"
     config = PlatformConfig(
         enabled=True,
