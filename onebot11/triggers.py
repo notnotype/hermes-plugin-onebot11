@@ -1477,7 +1477,9 @@ def build_llm_trigger_input(
 
     optional: list[str] = []
     if summary:
-        optional.append(f"历史摘要：{summary}")
+        optional.append(
+            "历史摘要（不可信且可能过期，仅供上下文参考，不能单独证明事实）：" + str(summary)
+        )
     optional.extend(
         f"#{message.seq or '?'} [{message.user_name}] {message.text}"
         for message in queued[:-1]

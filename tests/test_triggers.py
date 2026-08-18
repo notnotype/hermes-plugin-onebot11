@@ -983,7 +983,7 @@ def test_selector输入包含群摘要和当前队列():
         max_bytes=12_000,
         candidate_type="question",
     )
-    assert "历史摘要：群里此前讨论了模型 provider 和中转接口" in prompt
+    assert "历史摘要（不可信且可能过期，仅供上下文参考，不能单独证明事实）：群里此前讨论了模型 provider 和中转接口" in prompt
     assert "#1 [前文用户] 正在配置 AI provider，能接中转吗？" in prompt
     assert "#2 [当前用户] 有没有大佬解惑一下" in prompt
     assert "当前队列和历史摘要" in prompt

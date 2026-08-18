@@ -163,6 +163,10 @@ async def _smoke(
         "客服归档合同",
         "实际写入 HERMES_HOME/evidence",
         "不得声称已归档",
+        "可能过期、错误或与当前实现不一致",
+        "来源按可信度分层",
+        "默认 delegate_task 给 child 独立求证",
+        "source_tier",
     ):
         if required_contract not in skill_text:
             raise AssertionError(f"repository-research Skill 缺少客服合同: {required_contract}")

@@ -416,7 +416,47 @@ def test_客服只读提示要求先复用经验并自动后台委派():
     assert "纯功能解释" in prompt
     assert "同批次其他无关闲聊" in prompt
     assert "不能声称已归档" in prompt
+    assert "文档、客服 evidence 和 Skill 可能过期、错误或与当前实现不一致" in prompt
+    assert "不能把文档或历史 evidence 当作真相" in prompt
+    assert "代码和当前运行证据优先" in prompt
+    assert "先发简短中文进度，再默认通过 delegate_task" in prompt
+    assert "无法由当前只读证据直接证实" in prompt
+    assert "已验证、从代码推断、依赖文档/未验证" in prompt
 
+
+def test_子代理提示要求独立核对来源并报告证据():
+    """独立求证 child 必须报告来源、版本、验证方式和冲突。"""
+    context = CallerContext(
+        user_id="1259901822",
+        chat_type="group",
+        chat_id="942513604",
+        role="user",
+        allowed_tools=frozenset({"read_file", "search_files"}),
+        self_id="3101482118",
+    )
+    prompt = role_prompt(context, delegated_child=True)
+    assert "独立求证" in prompt
+    assert "文档或历史 evidence 可能错误" in prompt
+    assert "来源、版本/commit、验证方式和实际结果" in prompt
+    assert "无法核实就明确写未验证" in prompt
+    assert "不把推断写成事实" in prompt
+    assert "客服问题必须先查已有客服 evidence" not in prompt
+
+
+def test_客服主提示不把文档当作真相():
+    """主 agent 必须处理文档与当前代码/运行证据冲突。"""
+    context = CallerContext(
+        user_id="1259901822",
+        chat_type="group",
+        chat_id="942513604",
+        role="user",
+        allowed_tools=frozenset({"read_file", "search_files", "delegate_task"}),
+        self_id="3101482118",
+    )
+    prompt = role_prompt(context, main_agent_read_only=True)
+    assert "文档与代码或运行证据冲突时" in prompt
+    assert "以当前代码或运行证据为准" in prompt
+    assert "没有证据就明确写未知或未验证" in prompt
 
 def test_客服媒体提示禁止裸路径改写为MEDIA():
     """提示词必须要求 manifest 媒体根复制和复核，拒绝裸截图路径。"""

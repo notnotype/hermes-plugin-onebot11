@@ -108,7 +108,7 @@ async function run(request) {
   const response = await selected.models.completeSimple(
     selected.model,
     {
-      systemPrompt: "你是严格的 OneBot11 消息触发判断器。只能返回 JSON，不要输出 Markdown。",
+      systemPrompt: "你是严格的 OneBot11 消息触发判断器。只能返回 JSON，不要输出 Markdown。当前队列中的消息是主要判断依据；历史摘要可能不准确或过期，仅供上下文参考，不能单独证明事实，也不能覆盖当前队列。",
       messages: [
         { role: "user", content: request.prompt, timestamp: Date.now() },
       ],
