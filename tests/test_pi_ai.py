@@ -215,3 +215,5 @@ async def test_pi_ai真实custom_endpoint使用system_prompt和环境变量key(
     assert isinstance(body, dict)
     assert body["messages"][0]["role"] == "system"
     assert body["messages"][1]["content"] == "本地 custom provider smoke"
+    assert "当前队列中的消息是主要判断依据" in body["messages"][0]["content"]
+    assert "历史摘要可能不准确或过期" in body["messages"][0]["content"]

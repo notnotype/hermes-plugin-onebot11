@@ -45,7 +45,7 @@ class TriggerConfig:
         "继续",
         "接着",
     )
-    debounce_seconds: float = 5.0
+    debounce_seconds: float = 2.0
     engaged_idle_seconds: float = 60.0
     engaged_max_seconds: float = 300.0
     engaged_max_arbitrations: int = 2
@@ -94,6 +94,11 @@ class TriggerConfig:
         "帮忙",
         "帮我看看",
     )
+    # `question_interest_words` 非空时定义主题范围；`question_bot_words` 可选。
+    # bot 词非空表示仍要求显式关联 bot，bot 词为空表示允许群内其他成员的
+    # 相关主题问句进入 selector；两组都为空时保持兼容行为，不做本地主题门控。
+    question_bot_words: tuple[str, ...] = ()
+    question_interest_words: tuple[str, ...] = ()
     # engaged 中短消息（≤ 该字数）且 bot 未提问、非问句、无回指、未引用
     # bot 时本地判 ignore，不进 selector，省成本并让群聊更安静。
     # 默认 0 = 关闭：短确认词仍统一交给 selector（既有合同），需要更安静
@@ -249,10 +254,27 @@ class LayeredTriggerState:
                 if self.arbitration_count >= self._window_arbitration_limit:
                     return TriggerAction("none", reason="arbitration_limit")
                 if self.config.question_enabled and is_question(text):
-                    # 连续对话中的问句仍按 question 候选处理：本地词表能识别
-                    # 不带问号的问句（如"你吃饭了吗"），避免低价模型在 engaged
-                    # 提示词里漏判。
-                    return self._schedule("question", revision, now, gap=gap)
+                    # `is_question` 保留宽松语义供 bot 问句识别；只有显著问句
+                    # 才能消耗一次旁路 LLM，弱问句直接静默忽略。
+                    significant_question = is_significant_question(
+                        text,
+                        self.config.question_interest_words,
+                    )
+                    if significant_question and self._question_in_scope(
+                        text,
+                        has_context=has_context,
+                        same_user=same_user,
+                        reply_to_bot=reply_to_bot,
+                    ):
+                        return self._schedule("question", revision, now, gap=gap)
+                    if self.config.memory_enabled and has_context and memory_matches(
+                        text, self.config.memory_words
+                    ):
+                        return self._schedule("memory", revision, now, gap=gap)
+                    return TriggerAction(
+                        "none",
+                        reason=("question_out_of_scope" if significant_question else "weak_question"),
+                    )
                 if self._short_rule_ignore(text):
                     return TriggerAction("none", reason="short_rule_ignore")
                 # deep 档同用户 follow-up 立即判，不等 trailing debounce。
@@ -287,8 +309,26 @@ class LayeredTriggerState:
                 self._candidate_type or "candidate", revision, now, gap=gap
             )
 
-        candidate_type = self._candidate_type_for(text, has_context)
+        candidate_type = self._candidate_type_for(
+            text,
+            has_context,
+            same_user=same_user,
+            reply_to_bot=reply_to_bot,
+        )
         if not candidate_type:
+            if self.config.question_enabled and is_question(text):
+                significant_question = is_significant_question(
+                    text,
+                    self.config.question_interest_words,
+                )
+                return TriggerAction(
+                    "none",
+                    reason=(
+                        "question_out_of_scope"
+                        if significant_question
+                        else "weak_question"
+                    ),
+                )
             return TriggerAction("none", reason="non_candidate")
         return self._schedule(candidate_type, revision, now, gap=gap)
 
@@ -589,11 +629,58 @@ class LayeredTriggerState:
         if memory_matches(text, self.config.memory_words):
             return False
         return True
+    def _question_in_scope(
+        self,
+        text: str,
+        *,
+        has_context: bool,
+        same_user: bool,
+        reply_to_bot: bool,
+    ) -> bool:
+        """判断问句是否命中主题范围，并按配置决定是否要求关联 bot。"""
+        bot_words = self.config.question_bot_words
+        interest_words = self.config.question_interest_words
+        if not bot_words and not interest_words:
+            return True
+        if interest_words and not keyword_matches(text, interest_words):
+            # 群成员常用“有没有大佬解惑一下”省略主题；若已有摘要或
+            # 同批消息，把判断交给 selector 结合上下文，而不是本地误杀。
+            if not (has_context and is_contextual_help_request(text)):
+                return False
+        if not bot_words:
+            # 空 bot 词表明确表示不要求 @/引用/bot 追问关系，允许其他成员的
+            # 相关主题问句进入 selector；最终是否回复仍由旁路模型判断。
+            return True
+        if reply_to_bot or (same_user and self.bot_asked):
+            return True
+        return keyword_matches(text, bot_words)
 
-    def _candidate_type_for(self, text: str, has_context: bool) -> str:
-        """按 balanced 策略识别问句和有上下文的记忆回指。"""
-        if self.config.question_enabled and is_question(text):
-            return "question"
+
+    def _candidate_type_for(
+        self,
+        text: str,
+        has_context: bool,
+        *,
+        same_user: bool,
+        reply_to_bot: bool,
+    ) -> str:
+        """按显著问句范围和有上下文的记忆回指识别候选。"""
+        if self.config.question_enabled and is_significant_question(
+            text,
+            self.config.question_interest_words,
+        ):
+            if self._question_in_scope(
+                text,
+                has_context=has_context,
+                same_user=same_user,
+                reply_to_bot=reply_to_bot,
+            ):
+                return "question"
+            if self.config.memory_enabled and has_context and memory_matches(
+                text, self.config.memory_words
+            ):
+                return "memory"
+            return ""
         if self.config.memory_enabled and has_context and memory_matches(
             text, self.config.memory_words
         ):
@@ -752,6 +839,16 @@ QUESTION_WORDS = (
     "可以吗",
     "请问",
     "帮我",
+    "帮我找",
+    "找资料",
+    "查资料",
+    "查一下",
+    "搜一下",
+    "搜索一下",
+    "检索",
+    "推荐一下",
+    "介绍一下",
+    "解释一下",
     "几",
     "多少",
     "啥",
@@ -764,21 +861,126 @@ QUESTION_WORDS = (
     "多久",
     "几点",
     "什么时候",
+    "有没有",
+    "想问一下",
+    "请教一下",
+    "这个怎么弄",
+    "要放哪",
+    "能不能帮忙",
+    "有没有办法",
+    "这个正常吗",
+)
+# 问号、明确求助短语，或“主题词 + 强疑问词”才消耗旁路 LLM。
+# 单独的“吗/几”以及脱离主题的闲聊疑问词不进入 selector。
+SIGNIFICANT_QUESTION_WORDS = tuple(
+    word for word in QUESTION_WORDS if word not in {"吗", "几"}
+)
+EXPLICIT_QUESTION_PHRASES = (
+    "请问",
+    "请教",
+    "想问",
+    "帮我",
+    "帮忙",
+    "找资料",
+    "查资料",
+    "查一下",
+    "搜一下",
+    "搜索一下",
+    "检索",
+    "推荐一下",
+    "介绍一下",
+    "解释一下",
+    "能不能帮",
+    "有没有办法",
+    "这个怎么弄",
+    "这个正常吗",
 )
 ENGLISH_QUESTION_RE = re.compile(
     r"\b(?:who|what|when|where|why|how|can|could|would|should|do|does|did|is|are|will)\b",
     re.IGNORECASE,
 )
+ENGLISH_QUESTION_START_RE = re.compile(
+    r"^(?:who|what|when|where|why|how|can|could|would|should|do|does|did|is|are|will)\b",
+    re.IGNORECASE,
+)
 
 
 def is_question(text: str) -> bool:
-    """用低成本启发式识别中文疑问词、问号和英文问句。"""
+    """用低成本启发式识别中文疑问词、问号、英文问句和上下文求助。"""
     normalized = (text or "").casefold().strip()
     return bool(
         "?" in normalized
         or "？" in normalized
         or any(word in normalized for word in QUESTION_WORDS)
         or ENGLISH_QUESTION_RE.search(normalized)
+        or is_contextual_help_request(normalized)
+    )
+
+CONTEXTUAL_HELP_PHRASES = (
+    "有没有大佬解惑",
+    "有没有人解惑",
+    "有大佬解答",
+    "有大佬知道",
+    "谁能解答",
+    "谁能帮忙",
+    "求解",
+    "求解答",
+    "求指点",
+    "求教",
+    "解惑一下",
+    "解答一下",
+    "快来解答",
+)
+CONTEXTUAL_QUESTION_MARKERS = ("这个", "那个", "上面", "前面", "刚才", "这里")
+CONTEXTUAL_QUESTION_WORDS = (
+    "怎么",
+    "如何",
+    "哪个",
+    "哪里",
+    "哪",
+    "能不能",
+    "能否",
+    "有没有办法",
+    "为什么",
+    "是不是",
+    "要不要",
+)
+
+
+def is_contextual_help_request(text: str) -> bool:
+    """识别省略具体主题、需要结合群上下文理解的明确求助或追问。"""
+    normalized = (text or "").casefold().strip()
+    if any(phrase in normalized for phrase in CONTEXTUAL_HELP_PHRASES):
+        return True
+    return any(marker in normalized for marker in CONTEXTUAL_QUESTION_MARKERS) and any(
+        word in normalized for word in CONTEXTUAL_QUESTION_WORDS
+    )
+
+
+def is_significant_question(
+    text: str,
+    interest_words: Iterable[str] = (),
+) -> bool:
+    """只放行足够明确、值得消耗一次 LLM 仲裁的问句。"""
+    normalized = (text or "").casefold().strip()
+    if not normalized:
+        return False
+    if "?" in normalized or "？" in normalized:
+        return True
+    if ENGLISH_QUESTION_START_RE.search(normalized):
+        return True
+    if any(phrase in normalized for phrase in EXPLICIT_QUESTION_PHRASES):
+        return True
+    if is_contextual_help_request(normalized):
+        return True
+    has_interest = any(
+        str(word).strip().casefold() in normalized
+        for word in interest_words
+        if str(word).strip()
+    )
+    # 无问号的疑问词只在命中已配置主题时放行，避免把群聊闲谈送进 LLM。
+    return has_interest and any(
+        word.casefold() in normalized for word in SIGNIFICANT_QUESTION_WORDS
     )
 
 
@@ -826,17 +1028,19 @@ def build_trigger_config(extra: dict[str, Any]) -> TriggerConfig:
         default=False,
         name="llm_trigger_enabled",
     )
+    provider_default = "deepseek" if not llm_enabled else ""
+    model_default = "deepseek-v4-flash" if not llm_enabled else ""
     raw_provider = _setting(
         extra,
         raw_llm,
         "llm_trigger_provider",
-        raw_llm.get("provider", ""),
+        raw_llm.get("provider", provider_default),
     )
     raw_model = _setting(
         extra,
         raw_llm,
         "llm_trigger_model",
-        raw_llm.get("model", ""),
+        raw_llm.get("model", model_default),
     )
     if raw_provider is None:
         raw_provider = ""
@@ -918,7 +1122,7 @@ def build_trigger_config(extra: dict[str, Any]) -> TriggerConfig:
         maximum=32,
     )
     debounce = _bounded_float(
-        _setting(extra, raw_llm, "trigger_debounce_seconds", 5),
+        _setting(extra, raw_llm, "trigger_debounce_seconds", 2),
         name="trigger_debounce_seconds",
         minimum=0.1,
         maximum=60.0,
@@ -1084,6 +1288,14 @@ def build_trigger_config(extra: dict[str, Any]) -> TriggerConfig:
         minimum=0,
         maximum=32,
     )
+    memory_words = _parse_keywords(
+        _setting(
+            extra,
+            raw_llm,
+            "memory_trigger_words",
+            ("之前", "上次", "刚才", "那个", "继续", "接着"),
+        )
+    )
     bot_asked_words = _parse_keywords(
         _setting(
             extra,
@@ -1142,14 +1354,27 @@ def build_trigger_config(extra: dict[str, Any]) -> TriggerConfig:
         default=True,
         name="memory_trigger_enabled",
     )
-    memory_words = _parse_keywords(
+    question_bot_words = _parse_keywords(
         _setting(
             extra,
             raw_llm,
-            "memory_trigger_words",
-            ("之前", "上次", "刚才", "那个", "继续", "接着"),
+            "question_bot_words",
+            (),
         )
     )
+    question_interest_words = _parse_keywords(
+        _setting(
+            extra,
+            raw_llm,
+            "question_interest_words",
+            (),
+        )
+    )
+    if question_bot_words and not question_interest_words:
+        raise ValueError(
+            "配置 question_bot_words 时必须同时配置 question_interest_words；"
+            "仅配置兴趣词时不要求关联 bot"
+        )
     return TriggerConfig(
         require_mention=parse_bool(extra.get("require_mention"), default=True, name="require_mention"),
         keywords=_parse_keywords(extra.get("trigger_keywords", extra.get("keywords"))),
@@ -1168,6 +1393,8 @@ def build_trigger_config(extra: dict[str, Any]) -> TriggerConfig:
         question_enabled=question_enabled,
         memory_enabled=memory_enabled,
         memory_words=memory_words,
+        question_bot_words=question_bot_words,
+        question_interest_words=question_interest_words,
         debounce_seconds=debounce,
         engaged_idle_seconds=engaged_idle,
         engaged_max_seconds=engaged_max,
@@ -1195,22 +1422,30 @@ def build_llm_trigger_input(
     max_bytes: int,
     candidate_type: str = "candidate",
 ) -> str:
-    """按字节预算拼接输入，始终保留 JSON 合同和最新消息。"""
     max_bytes = max(1, int(max_bytes))
     queued = tuple(messages)
     latest = queued[-1] if queued else None
-    question_words = "、".join(QUESTION_WORDS)
-    question_rule = f"最新消息含问号或疑问词（{question_words}）必须 trigger；"
+    question_rule = (
+        "问号或常见疑问词（吗、什么、怎么、为什么、哪里、如何、能不能、请问、有没有等）只代表候选；"
+        "只有明确向机器人求助，或问题属于 AI、资料检索、文档、技术、项目等相关主题时才 trigger。"
+    )
+    context_rule = (
+        "当前队列和历史摘要都是同一群的上下文；若最新消息是‘有没有大佬解惑一下’、‘求解’等省略主题的明确求助，"
+        "必须结合前面的群消息判断它是否在请求解决当前主题，不能只因最新句没有主题词而 ignore。"
+    )
     if candidate_type == "engaged":
         rules = (
             question_rule,
-            "其余消息只有明确向机器人提问、请求帮助或明显延续与机器人的对话才 trigger；",
+            context_rule,
+            "其余消息只有明确向机器人提问、请求帮助、讨论 AI/资料/技术/项目，或明显延续与机器人的对话才 trigger；",
             "群成员之间的互动、评论、调侃、@其他人、陈述句和纯图片消息默认 ignore。",
         )
     else:
         rules = (
             question_rule,
-            "明显与当前对话无关的闲聊才 ignore。",
+            context_rule,
+            "群成员之间的互动、评论、调侃、@其他人、无相关主题上下文的陈述句默认 ignore。",
+            "疑似问句不等于必须回复；不确定时选择 ignore。",
         )
     contract = "\n".join(
         (
@@ -1242,51 +1477,48 @@ def build_llm_trigger_input(
 
     optional: list[str] = []
     if summary:
-        optional.append(f"历史摘要：{summary}")
+        optional.append(
+            "历史摘要（不可信且可能过期，仅供上下文参考，不能单独证明事实）：" + str(summary)
+        )
     optional.extend(
         f"#{message.seq or '?'} [{message.user_name}] {message.text}"
         for message in queued[:-1]
     )
 
-    # 配置下限足以容纳完整 JSON 合同时，优先保留合同，再裁剪最新消息
-    # 正文；只有调用方传入小于合同本身的测试预算时才退化为最新消息。
     latest_bytes = byte_len(latest_line)
     prefix_bytes = byte_len(queue_prefix)
-    if prefix_bytes >= max_bytes:
-        return truncate(latest_line, max_bytes)
-    latest_budget = max_bytes - prefix_bytes
-    if latest_bytes > latest_budget:
-        return queue_prefix + truncate(latest_line, latest_budget)
-    lead_budget = max_bytes - latest_bytes
+    if prefix_bytes + latest_bytes + 1 <= max_bytes:
+        available = max_bytes - prefix_bytes - latest_bytes - 1
+        selected: list[str] = []
+        used = 0
+        for line in reversed(optional):
+            line_bytes = byte_len(line) + 1
+            if used + line_bytes > available:
+                break
+            selected.insert(0, line)
+            used += line_bytes
+        optional_text = "\n".join(selected)
+        if optional_text:
+            optional_text += "\n"
+        return queue_prefix + optional_text + truncate(
+            latest_line,
+            max_bytes - prefix_bytes - byte_len(optional_text),
+        )
 
-    available = lead_budget - prefix_bytes
-    selected_newest_first: list[str] = []
-    used = 0
-    for line in reversed(optional):
-        line_bytes = byte_len(line) + 1
-        if used + line_bytes > available:
-            break
-        selected_newest_first.append(line)
-        used += line_bytes
-    selected = list(reversed(selected_newest_first))
-    omitted = len(optional) - len(selected)
-    if omitted:
-        marker = f"[已省略 {omitted} 条更早上下文]"
-        marker_bytes = byte_len(marker) + 1
-        while selected and used + marker_bytes > available:
-            removed = selected.pop(0)
-            used -= byte_len(removed) + 1
-        if used + marker_bytes <= available:
-            selected.insert(0, marker)
-            used += marker_bytes
-    optional_text = ("\n".join(selected) + "\n") if selected else ""
-    result = queue_prefix + optional_text + latest_line
-    if byte_len(result) <= max_bytes:
-        return result
-    # 这是最后一道合同保护：无论调用方传入多小的预算，都不能
-    # 返回超限输入；尾部包含完整或受限的最新消息。
-    return truncate(queue_prefix, max(0, max_bytes - latest_bytes - 1)) + "\n" + latest_line
-
+    compact_prefix = "\n".join(
+        (
+            f"OneBot11 selector；候选类型：{candidate_type}。",
+            "问句只代表候选；明确向机器人求助，或 AI/资料/文档/技术/项目主题相关时才 trigger；",
+            "群成员之间的互动默认 ignore；疑似问句不等于必须回复；不确定时选择 ignore。",
+            'trigger={"decision":"trigger","anchor_seq":123}',
+            'wait={"decision":"wait","anchor_seq":null}',
+            'ignore={"decision":"ignore","anchor_seq":null}',
+        )
+    )
+    compact_bytes = byte_len(compact_prefix)
+    if compact_bytes < max_bytes:
+        return compact_prefix + "\n" + truncate(latest_line, max_bytes - compact_bytes - 1)
+    return truncate(latest_line, max_bytes)
 
 def keyword_matches(text: str, keywords: Iterable[str]) -> bool:
     """使用 Unicode casefold 的普通子串匹配关键词。"""

@@ -4,9 +4,9 @@
 
 ## 当前状态
 
-- **阶段**：master 已合并 Task 7 之前的全部功能并部署 Arch（`0.6.0 / schema 12`）。当前本地收口：移除活跃窗口短确认词特例（统一走 selector）、selector 按候选类型分 prompt（engaged 默认 ignore 成员互动）、纯图片消息不进 selector、旁路模型默认改用 DeepSeek 官方 API（pi-ai 内置 provider，思考关闭）、回复阶段 reaction 改用 💬（`128172`）、`super_admin` 默认拥有全部 Hermes 通用工具、群聊中间正文可配置开启（`show_interim_group`）、一次性长时间提示默认 60s 且改为直接发送（不再依赖 turn binding）、engage 三档分级预算（shallow/normal/deep：bot 提问标记、任务词升级、同用户立即判断、waiting 攒消息数判定、连续 ignore 降档）。
-- **核心合同**：群固定一个共享 session；群消息持久入队；每个真实 TurnAnchor 固定 batch 和 authority，同群按序单 lease follow-up；非幂等出站结果未知时进入 `uncertain`，不自动重放。
-- **本地验证**：协议/状态机测试通过；使用本地 Hermes 源码与其 site-packages 运行 adapter 测试通过。最终门禁命令和环境见“验证证据”。
+- **阶段**：master 已合并 Task 7 之前的全部功能并部署 Arch（`0.6.0 / schema 12`）。本轮客服收口已完成代码、Hermes 组合验证和受控 Arch 联调：delegated child 在父 QQ turn 结束后仍可使用项目工具但不能越权；复杂问题先发送中文回执，再由后台子代理执行；工具进度只发送固定中文摘要；selector/engage 按候选类型和三档预算判定。
+- **核心合同**：群固定一个共享 session；群消息持久入队；每个真实 TurnAnchor 固定 batch 和 authority，同群按序单 lease follow-up；非幂等出站结果未知时进入 `uncertain`，不自动重放。后台委派不延长父 QQ lease，但 delegated child 的项目工具执行不再错误依赖已结束的父 lease；QQ 工具、发送消息、cronjob 和再次委派仍拒绝。
+- **本地验证**：协议/状态机测试和 Hermes 组合验证通过；Arch 容器现场健康、插件 checkout 与目标 commit 一致，受控 OneBot HTTP/WS 与白名单拒绝证据已核对。完整真人 QQ Agent pipeline 仍未完成，原因是本轮只能确认指定客服群外的真实 QQ 群消息与白名单拒绝，未取得指定客服群的真人客户端入站消息。
 
 ## 模块状态
 
@@ -23,23 +23,28 @@
 | `onebot11/media.py` | 完成 | 当前 turn 内按规范化来源和内容 hash 做防御性媒体去重，不跨 turn/重启承诺 exactly-once |
 | `onebot11/formatting.py` | 完成 | OneBot 默认纯文本转换、Markdown image marker 清理和不可用 renderer 审计 |
 | `onebot11/tools.py` | 完成 | 当前群/私聊范围查询和群管理写工具；写操作必须确认 |
-| `adapter.py` | 完成代码收口 | Hermes glue、shared session、入站访问策略、generic/OneBot 工具 hooks、群级 slash/context command、工具 handler、群 turn 💬 正在回复指示器（默认 `128172`，可配置）、selector 候选 👀 查看提示（含候选替换/清理）、一次性长时间提示（默认 60s，直接发送不依赖 turn binding，成功/失败写审计）、Agent 最终回复的文本/图片出站生命周期、base64 segment、同轮媒体去重、纯文本、显式控制面消息、运行时 policy snapshot/reload、媒体回收、统一配置解析、raw self_id、消息身份/上下文注入、operation resolve、pi-ai selector、按 event metadata 恢复精确 binding、`_reply_asks_user`（回复问句/请求短语收尾标记 bot_asked）、`_message_replies_to_bot`（reply 目标等于 bot 最后消息时视为引用）；通用 `send_message`/cron plugin media 不是本轮可靠性合同 |
+| `adapter.py` | 完成代码收口 | Hermes glue、shared session、入站访问策略、generic/OneBot 工具 hooks、群级 slash/context command、工具 handler、群 turn 💬 正在回复指示器（默认 `128172`，可配置）、selector 候选 👀 查看提示（含候选替换/清理）、最多三次长任务提示（默认 60s，直接发送不依赖 turn binding，成功/失败写审计）、不再发送泛化自动回执、Agent 最终回复的文本/图片出站生命周期、base64 segment、同轮媒体去重、纯文本、显式控制面消息、运行时 policy snapshot/reload、媒体回收、统一配置解析、raw self_id、消息身份/上下文注入、operation resolve、pi-ai selector、按 event metadata 恢复精确 binding、`_reply_asks_user`（回复问句/请求短语收尾标记 bot_asked）、`_message_replies_to_bot`（reply 目标等于 bot 最后消息时视为引用）；通用 `send_message`/cron plugin media 不是本轮可靠性合同
 | `onebot11/pi_ai.py` + `scripts/onebot11-pi-trigger.mjs` | 完成 | 零 Hermes 依赖的 Python/Node 短生命周期旁路客户端，固定 pi-ai 版本、环境变量密钥、无语义重试和失败分类 |
 | 文档/ADR | 完成 | README、权限、状态、Task 2/3/5/6/7 walkthrough、pi-ai、reconnect、operation ledger、TurnAnchor、session command 和验收边界同步到当前合同 |
 
 ## 验证证据
 
-- 在本 worktree 设置 `PYTHONPATH=C:\Users\notnotype\AppData\Local\hermes\hermes-agent;C:\Users\notnotype\AppData\Local\hermes\hermes-agent\venv\Lib\site-packages` 后，`pytest -q`：`376 passed`（纯插件环境 `226 passed, 1 skipped`）。唯一 skip 是 `tests/test_pi_ai.py` 缺少 pi-ai npm 依赖；adapter 集成测试没有因缺少 gateway 跳过。新增覆盖：engaged 短确认词统一走 selector、selector 分类型 prompt、纯图片不进 selector、三档 engage 预算（deep 同用户立即判/他人回落/任务词升级/连续 ignore 降档/short_rule/waiting 攒消息）、bot_asked 与 reply-to-bot 信号、长时间提示新发送路径。
+- 在本 worktree 设置 `PYTHONPATH=C:\Users\notnotype\AppData\Local\hermes\hermes-agent;C:\Users\notnotype\AppData\Local\hermes\hermes-agent\venv\Lib\site-packages` 后，`pytest -q`：`419 passed, 4 warnings`（Windows asyncio subprocess transport 关闭期警告，无失败）；纯插件环境为 `247 passed, 1 skipped`，skip 是 `tests/test_adapter.py` 因缺少 Hermes `gateway`。新增覆盖：engaged 短确认词统一走 selector、selector 分类型 prompt、纯图片不进 selector、三档 engage 预算（deep 同用户立即判/他人回落/任务词升级/连续 ignore 降档/short_rule/waiting 攒消息）、bot_asked 与 reply-to-bot 信号、长时间提示新发送路径。
 - focused 验证覆盖：媒体 scope、纯文本/marker、GatewayConfig reload、role catalog、hook capability gate、控制面通知去重、审计失败 fail-closed、shared session、queue recovery、权限和图片出站。
 - `ruff check .`、`node --check scripts/onebot11-pi-trigger.mjs` 和 `git diff --check`：通过。
-- `scripts/verify_hermes_integration.py` 在临时 `HERMES_HOME` 下通过：先运行 `341 passed`，随后输出 `tools=9 hooks=5 pi_ai_trigger=True reconnect=True slash_commands=True`；`node --check scripts/onebot11-pi-trigger.mjs` 也通过。本地 Hermes 集成 smoke 和 Node helper 仍是独立验收证据，不能由本地 pytest 自动推断。
-- 当前未声称本分支已部署 Arch，也未把合成 WS payload 当成真人 QQ Agent pipeline 验收。
+- `scripts/verify_hermes_integration.py` 在临时 `HERMES_HOME` 下通过：测试部分为 `419 passed, 4 warnings`，随后输出 `tools=9 hooks=5 pi_ai_trigger=True reconnect=True slash_commands=True`；`node --check scripts/onebot11-pi-trigger.mjs` 也通过。本地 Hermes 集成 smoke 和 Node helper 仍是独立验收证据，不能由纯插件 pytest 自动推断。
+- delegated child 回归测试新增合同：父 lease 结束后，子代理可以继续使用项目 `terminal`，但 `qq_*` 与 `send_message` 仍拒绝；本轮聚焦验证为 `7 passed, 165 deselected`，纯插件全量门禁为 `247 passed, 1 skipped`，Ruff 通过。skip 是 `tests/test_adapter.py` 因缺少 Hermes `gateway`。
+- Arch 组合现场：`hermes-support-support-hermes-1` 为 `running healthy`；容器内插件 checkout 为 `e05e4b0f25d7be9aef706dde1d16849f06c742a5 fix: ensure support turns acknowledge before agent work`，分支为 `master...origin/master`；`ONEBOT11_ALLOWED_GROUPS=942513604`、`ONEBOT11_SELF_ID=3101482118`、`ONEBOT11_WS_HOST=0.0.0.0`，LLBot HTTP `get_status` 返回 `online=true, good=true`，机器人 QQ 为 `3101482118`。
+- 现场日志确认反向 WS 配置为 LLBot 同网容器 `ws://support-hermes:18880`，Hermes 曾记录 `OneBot11: 反向 WS 已监听 0.0.0.0:18880`；目标群 `942513604` 的历史真实消息曾走过 `inbound message -> response ready -> Sending response`，并且当天受控 HTTP 发消息均收到 `message_id`。白名单外真实 QQ 群 `559332109`、`786830134`、`976967537` 的入站分别产生 `access_denied`，没有进入目标队列或产生 Agent turn。
+- 本轮真人 QQ 边界：没有取得目标客服群 `942513604` 的真人客户端入站消息；向该群发出的 HTTP 探针只证明了 OneBot HTTP 出站，不证明真人 QQ Agent pipeline。没有把这些探针升级为真人验收，也没有执行禁言、踢人、撤回、全员禁言或修改 Arch 配置。
 
 ## 外部联调状态
 
-2026-08-10 通过 `ssh arch` 做只读复核，严格固定机器人 QQ `3101482118`、唯一允许群 `1072992996` 和唯一允许私聊用户 `2056963663`：Arch 插件 checkout 为 `master`、commit `fd246b7`、版本 `0.6.0`，`hermes-gateway.service` 为 active，线上 queue schema 为 `11`。本分支的 Task 7 改动尚未部署；本次复核没有向任何 QQ 发送消息，也没有修改 Arch 配置、SQLite 或 session。
+2026-08-14 通过 `ssh arch` 做只读/受控复核，机器人 QQ 固定为 `3101482118`，当前客服群白名单为 `942513604`，超级管理员为 `2056963663`。容器 `hermes-support-support-hermes-1` 为 `running healthy`，插件 checkout 为 `master`、commit `e05e4b0f25d7be9aef706dde1d16849f06c742a5`，版本 `0.6.0`；没有拉取、切换、重启或修改配置。
 
-此前 2026-08-08 的受控联调备份仍保留在 `/home/notnotype/.hermes/onebot11-backup-20260808-turn-anchor-contract/`，下面的真实 reaction、batch 边界和白名单证据属于历史验收记录，不等同于本分支已经完成真人 Agent pipeline 验收。
+容器与 LLBot 同处 `luckylillia_app_network`；LLBot 配置同时存在 `ws://support-hermes:18880` 和 `ws://host.docker.internal:18880` 两个反向 WS 出口，均启用相同 token。Hermes 监听 `0.0.0.0:18880`，LLBot `get_status` 返回 `online=true, good=true`，`get_login_info` 返回机器人 QQ `3101482118`。现场已分开记录合成 HTTP 出站、真实 QQ 群入站和插件审计：白名单外群真实消息被拒绝；目标客服群只看到既有历史 Agent pipeline 证据，未取得本轮真人客户端入站。
+
+此前 2026-08-08 的受控联调备份仍保留在 `/home/notnotype/.hermes/onebot11-backup-20260808-turn-anchor-contract/`，历史 reaction、batch 边界和白名单证据不等同于本分支已完成真人 Agent pipeline 验收。
 
 此前部署的 PR #8/TurnAnchor 版本已确认：
 
@@ -50,19 +55,19 @@
 - 白名单外群 `999999999` 的事件被拒绝，SQLite 中该群为 0 行，指定群队列未变化，没有产生出站。
 - Arch 配置原有 `roles.super_admin.tools: image_generate`（非 OneBot 工具），在备份后按 fail-closed 合同移除；白名单、token、机器人 QQ 和 LLBot 配置未放宽。
 
-Arch 已部署 `0.6.0` 基线，但本分支的 Task 7 改动尚未部署。通过隔离 queue 和真实 OneBot HTTP/WS adapter smoke 验证了 image-only、文字+图片、多图的 `base64://` segment，以及正负 message id 的 `👀` 添加/移除；这些消息没有经过生产 Agent pipeline，因此真实 QQ Agent 的图片-only、文字+图片、多图、部分成功/unknown、worker-thread final delivery、slash command 和真人并发仍是待验收项。
+Arch 已部署 `0.6.0` 基线和本轮客服收口 commit，但本轮没有以 HTTP 自发消息替代真人 QQ 验收。通过现场健康检查、反向 WS/HTTP 连通性、真实白名单外群拒绝、历史目标群 Agent 回复日志和插件审计核对了组合边界；真实目标群真人 Agent pipeline、两名真人并发、非幂等 `unknown`/`resolve`、图片完整链路和管理写动作仍待专门验收。
 
-Arch 当前生产 live queue 为 schema 11；本分支为 schema 12，仍会在 PR 合并后通过正常启动/迁移路径复核 queue，不直接编辑生产 SQLite，不修改 `PRAGMA user_version` 伪装兼容。
+Arch 当前生产 queue schema 现场未在本轮改写；本轮未直接编辑生产 SQLite，也未修改 `PRAGMA user_version` 伪装兼容。
 
-当前 TurnAnchor 分支仍需单独完成：
+当前仍需单独完成：
 
-- 合并并部署本分支的 Binding 修复，验证 worker thread 建立 binding 后 async final delivery 不再出现 `fenced` 重试。
-- 以上入站仍是受控的反向 WS payload，不等同于 QQ 客户端真人发言；还未完成两名真人群成员同时 @ 时的外部观察。
-- 本分支的非幂等出站 `unknown` 和 `resolve action retry|discard` 尚未在真实 QQ 上制造；联调未执行禁言、踢人、撤回或全员禁言。
+- 取得目标客服群 `942513604` 的真人客户端入站消息，验证 Hermes 中间正文、最多三次有界长任务状态提示、后台 delegated child completion 和最终回复在 QQ 上的可见顺序。
+- 在真人链路可用后，验证两名真人群成员同时 @、selector/engage 窗口和图片-only/文字+图片场景。
+- 制造并人工处理非幂等出站 `unknown` 与 `resolve action retry|discard`；不执行真实禁言、踢人、撤回或全员禁言。
 - LLBot 当前请求日志会打印 Bearer header；插件不会把 token 发送到外部媒体地址，但部署侧应在生产前关闭该日志或轮换 token。未在本轮擅自修改 LLBot 凭据。
 - 未在本轮使用 NapCat，也未把 WS 重连重放行为提升为协议保证。
 - Hermes 全局 SIGTERM 关闭日志仍偶发出现 `onebot11 disconnect timed out after 5.0s`；空 adapter 直测没有复现，日志同时包含 Discord/Weixin 的关闭期错误，当前作为 Hermes 多平台 shutdown 观察项，不据此修改 OneBot 插件。
-- Hermes strict auxiliary 和媒体/unknown 合同不在本轮插件交付范围，也不创建 Hermes PR。旁路判断改由插件自有 pi-ai helper 负责；图片继续在插件侧 best-effort。若未来 `send_message`/cron 图片需要可靠媒体结果，再单独设计通用 Hermes 合同。
+- Hermes strict auxiliary 和媒体/unknown 合同不在本轮插件交付范围，也不创建 Hermes PR。旁路判断由插件自有 pi-ai helper 负责；图片继续在插件侧 best-effort。
 
 ## 约束与取舍
 
@@ -70,7 +75,7 @@ Arch 当前生产 live queue 为 schema 11；本分支为 schema 12，仍会在 
 - 消息处理是至少一次语义；OneBot 11 非幂等请求无法提供 exactly-once，因此未知结果不自动重试。
 - Agent 最终回复图片是主要出站媒体场景；`send_message`、cron 和 standalone plugin media 的结果合同不在本轮收口范围，按安全降级处理。
 - 不自动迁移旧的群 `per_user` session 历史到新的 shared session；需要人工决定是否清理旧历史。
-- 本轮不纳入 OneBot 12、语音转写、复杂管理后台、RAG/向量库、运行时自优化和强制语义摘要模型。⏳ 只是 selector 等待提示（best-effort、内存登记），不是周期性心跳，也不纳入崩溃后 exactly-once 清理承诺；长时间运行提示仍只保留一次性状态提示。
+- 本轮不纳入 OneBot 12、语音转写、复杂管理后台、RAG/向量库、运行时自优化和强制语义摘要模型。⏳ 只是 selector 等待提示（best-effort、内存登记），不是周期性心跳，也不纳入崩溃后 exactly-once 清理承诺；长任务提示最多发送三次，完成、取消、lease 失效或发送失败即停止。
 - `trusted_user` 不能使用 OneBot 群管理写工具；Hermes generic 高风险工具仍必须在
   `roles.trusted_user.tools` 中逐项显式配置。权限、白名单和角色变化不由 Agent 运行时修改。
 - `/onebot reload` 只热更新策略字段；连接、凭据、self_id、队列路径和 session 模式仍需重启。环境变量继续覆盖 YAML。

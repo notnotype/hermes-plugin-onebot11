@@ -15,6 +15,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -24,7 +25,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -122,9 +123,28 @@ _REQUIRED_HERMES_HOOKS = frozenset(
     {"pre_gateway_dispatch", "pre_llm_call", "pre_tool_call"}
 )
 _CONTROL_PLANE_KINDS = frozenset({"long_running", "system_error_notice"})
-_TURN_START_ACK_TEXT = (
-    "收到，我先查一下已有资料；有现成答案我会直接回复，需要进一步验证的部分再后台处理。"
-)
+_TOOL_PROGRESS_LABELS = {
+    "read_file": "正在读取项目文件",
+    "search_files": "正在搜索项目内容",
+    "web_search": "正在搜索网页资料",
+    "web_extract": "正在读取网页资料",
+    "browser_navigate": "正在打开网页",
+    "browser_snapshot": "正在读取网页界面",
+    "browser_get_images": "正在读取网页图片",
+    "browser_vision": "正在分析网页图片",
+    "vision_analyze": "正在分析图片",
+    "delegate_task": "正在后台委派项目任务",
+    "terminal": "正在执行项目命令",
+    "process": "正在管理项目进程",
+    "write_file": "正在写入项目文件",
+    "patch": "正在修改项目文件",
+    "execute_code": "正在执行代码",
+    "image_generate": "正在生成图片",
+    "send_message": "正在发送消息",
+    "cronjob": "正在安排任务",
+    "clarify": "正在等待补充信息",
+}
+_MAX_LONG_RUNNING_NOTICES = 3
 _CURRENT_CALLER: contextvars.ContextVar[CallerContext | None] = contextvars.ContextVar(
     "onebot11_current_caller", default=None
 )
@@ -155,6 +175,33 @@ _TOOL_HANDLERS: dict[str, Any] = {
     "qq_get_group_info": handle_get_group_info,
     "qq_get_group_member_info": handle_get_group_member_info,
 }
+
+_MEDIA_COPY_COMMAND_RE = re.compile(r"(?:^|[;&|])\s*(?:sudo\s+)?(?:cp|mv|install|rsync|copy|robocopy)\b", re.IGNORECASE)
+_MEDIA_HANDOFF_ERROR = "媒体文件必须由项目 repository-research adapter 生成并复制；子代理不能用 terminal 或 file 工具手工写入 Hermes 媒体根"
+
+
+def _mentions_media_root(value: str) -> bool:
+    normalized = str(value or "").replace("\\", "/").casefold()
+    return any(
+        marker in normalized
+        for marker in ("cache/images", "image_cache", "browser_screenshots")
+    )
+
+
+def terminal_writes_media_root(command: str) -> str | None:
+    """阻止子代理绕过项目 adapter 手工复制或重命名媒体文件。"""
+    normalized = str(command or "").replace("\\", "/").casefold()
+    if not _MEDIA_COPY_COMMAND_RE.search(normalized) or not _mentions_media_root(normalized):
+        return None
+    return _MEDIA_HANDOFF_ERROR
+
+
+def file_tool_writes_media_root(path: str) -> str | None:
+    """阻止子代理用 Hermes file 工具直接写入受控媒体根。"""
+    if not _mentions_media_root(path):
+        return None
+    return _MEDIA_HANDOFF_ERROR
+
 
 
 @dataclass(frozen=True)
@@ -536,7 +583,8 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._control_plane_sent_scopes: set[str] = set()
         self._long_running_notice_tasks: dict[str, asyncio.Task[None]] = {}
         self._long_running_notice_events: dict[str, Any] = {}
-        self._turn_start_ack_sent: set[str] = set()
+        self._long_running_notice_counts: dict[str, int] = {}
+        self._long_running_notice_started_at: dict[str, float] = {}
         self._outbound_gate = asyncio.Lock()
         self._aux_event_count = 0
         self._adapter_epoch = 0
@@ -755,6 +803,7 @@ class OneBot11Adapter(BasePlatformAdapter):
             max_inflight=self._ws_max_inflight,
         )
         await self._ws.start()
+        await self._recover_internal_completion_triggers()
         await self._dispatcher.recover()
         if self.trigger_config.llm_enabled:
             pending_chats = await asyncio.to_thread(self._queue.pending_chat_ids)
@@ -821,7 +870,8 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._control_plane_sent_scopes.clear()
         self._long_running_notice_tasks.clear()
         self._long_running_notice_events.clear()
-        self._turn_start_ack_sent.clear()
+        self._long_running_notice_counts.clear()
+        self._long_running_notice_started_at.clear()
         self._bindings.clear()
 
     def _policy_config_signature(self) -> tuple[object, ...] | None:
@@ -886,6 +936,8 @@ class OneBot11Adapter(BasePlatformAdapter):
             "trigger_cooldown",
             "require_mention",
             "question_trigger_enabled",
+            "question_bot_words",
+            "question_interest_words",
             "memory_trigger_enabled",
             "memory_trigger_words",
             "trigger_debounce_seconds",
@@ -1951,16 +2003,21 @@ class OneBot11Adapter(BasePlatformAdapter):
         return f"{scope}:control:{kind}"
 
     def _schedule_long_running_notice(self, event: Any, lease_id: str) -> None:
-        """为一个活动群 turn 安排一次性长时间处理提示（保存 event 供重置复用）。"""
+        """为活动群 turn 安排最多三次有界长任务进度提示。"""
         delay = float(self.policy_snapshot.long_running_notice_seconds)
         normalized_lease_id = str(lease_id or "").strip()
         if self._closed or delay <= 0 or not normalized_lease_id:
+            return
+        if self._long_running_notice_counts.get(normalized_lease_id, 0) >= _MAX_LONG_RUNNING_NOTICES:
             return
         current = self._long_running_notice_tasks.get(normalized_lease_id)
         if current is not None and not current.done():
             return
         try:
+            loop = asyncio.get_running_loop()
             self._long_running_notice_events[normalized_lease_id] = event
+            self._long_running_notice_counts.setdefault(normalized_lease_id, 0)
+            self._long_running_notice_started_at.setdefault(normalized_lease_id, loop.time())
             task = asyncio.create_task(
                 self._send_long_running_notice_after_delay(
                     event,
@@ -1974,7 +2031,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         self._long_running_notice_tasks[normalized_lease_id] = task
 
     def _reset_long_running_notice(self, chat_id: str) -> None:
-        """中间正文成功发送后重置当前活动 turn 的长时间处理计时器。"""
+        """中间正文成功发送后重置计时器，但不重置本 turn 的总次数上限。"""
         normalized = str(chat_id or "").strip()
         if self._closed or not normalized:
             return
@@ -1986,11 +2043,15 @@ class OneBot11Adapter(BasePlatformAdapter):
             return
         current = self._long_running_notice_tasks.pop(lease_id, None)
         if current is not None and not current.done():
-            # 只有取消一个仍在等待的计时器才重新排程；提示已经发出后
-            # （task 已完成）不再重建，避免同一 turn 反复出现"仍在处理中"。
+            # 只取消仍在等待的计时器；已经发送的次数保留，避免中间正文不断
+            # 重置计时器时突破同一 turn 的三次上限。
             current.cancel()
             event = self._long_running_notice_events.get(lease_id)
-            if event is not None:
+            if (
+                event is not None
+                and self._long_running_notice_counts.get(lease_id, 0)
+                < _MAX_LONG_RUNNING_NOTICES
+            ):
                 self._schedule_long_running_notice(event, lease_id)
 
     async def _send_long_running_notice_after_delay(
@@ -1999,51 +2060,63 @@ class OneBot11Adapter(BasePlatformAdapter):
         lease_id: str,
         delay: float,
     ) -> None:
-        """等待指定时间后发送一次控制面提示，不改变业务出站阶段。"""
+        """按固定间隔发送最多三次状态提示，不改变业务出站阶段。"""
         try:
-            await asyncio.sleep(max(0.0, float(delay)))
-            if self._closed or lease_id in self._fenced_leases:
-                return
-            if not self._lease_is_current(lease_id):
-                return
-            metadata = dict(getattr(event, "metadata", None) or {})
-            target = metadata.get("onebot11_target")
-            if not isinstance(target, Mapping):
-                return
-            chat_id = str(target.get("chat_id") or "")
-            if not chat_id or not self._chat_access_allowed("group", chat_id):
-                return
-            # 控制面通知不需要 Hermes turn binding：lease 与访问策略已在
-            # 上方校验，直接走 OneBot API 发送，避免 worker 线程 binding
-            # 恢复失败导致提示永远发不出去。
-            result = await self._send_notice_message(
-                chat_id,
-                "仍在处理中，请稍候…",
-                reply_to=str(metadata.get("onebot11_anchor_message_id") or "") or None,
-                lease_id=lease_id,
-            )
-            if not result.success:
-                logger.info(
-                    "OneBot11 长时间处理提示未发送: lease=%s error=%s",
-                    lease_id,
-                    result.error,
+            loop = asyncio.get_running_loop()
+            for _ in range(_MAX_LONG_RUNNING_NOTICES):
+                await asyncio.sleep(max(0.0, float(delay)))
+                if self._closed or lease_id in self._fenced_leases:
+                    return
+                if not self._lease_is_current(lease_id):
+                    return
+                completed = self._long_running_notice_counts.get(lease_id, 0)
+                if completed >= _MAX_LONG_RUNNING_NOTICES:
+                    return
+                metadata = dict(getattr(event, "metadata", None) or {})
+                target = metadata.get("onebot11_target")
+                if not isinstance(target, Mapping):
+                    return
+                chat_id = str(target.get("chat_id") or "")
+                if not chat_id or not self._chat_access_allowed("group", chat_id):
+                    return
+                notice_index = completed + 1
+                started_at = self._long_running_notice_started_at.get(lease_id, loop.time())
+                elapsed_seconds = max(1, round(loop.time() - started_at))
+                content = (
+                    f"后台任务已运行约 {elapsed_seconds} 秒，仍在执行；"
+                    "完成后会继续回复。"
                 )
-                self._audit.record(
-                    "long_running_notice",
-                    {
-                        "chat_id": chat_id,
-                        "lease_id": lease_id,
-                        "sent": False,
-                        "error": str(result.error or "")[:200],
-                    },
+                result = await self._send_notice_message(
+                    chat_id,
+                    content,
+                    reply_to=str(metadata.get("onebot11_anchor_message_id") or "") or None,
+                    lease_id=lease_id,
                 )
-            else:
+                if not result.success:
+                    logger.info(
+                        "OneBot11 长时间处理提示未发送: lease=%s error=%s",
+                        lease_id,
+                        result.error,
+                    )
+                    self._audit.record(
+                        "long_running_notice",
+                        {
+                            "chat_id": chat_id,
+                            "lease_id": lease_id,
+                            "sent": False,
+                            "notice_index": notice_index,
+                            "error": str(result.error or "")[:200],
+                        },
+                    )
+                    return
+                self._long_running_notice_counts[lease_id] = notice_index
                 self._audit.record(
                     "long_running_notice",
                     {
                         "chat_id": chat_id,
                         "lease_id": lease_id,
                         "sent": True,
+                        "notice_index": notice_index,
                     },
                 )
         except asyncio.CancelledError:
@@ -2058,6 +2131,12 @@ class OneBot11Adapter(BasePlatformAdapter):
             current = self._long_running_notice_tasks.get(lease_id)
             if current is asyncio.current_task():
                 self._long_running_notice_tasks.pop(lease_id, None)
+                if self._long_running_notice_counts.get(lease_id, 0) >= _MAX_LONG_RUNNING_NOTICES:
+                    self._long_running_notice_events.pop(lease_id, None)
+                    self._long_running_notice_counts.pop(lease_id, None)
+                    self._long_running_notice_started_at.pop(lease_id, None)
+
+
 
     async def _send_notice_message(
         self,
@@ -2103,9 +2182,11 @@ class OneBot11Adapter(BasePlatformAdapter):
             )
 
     async def _cancel_long_running_notice(self, lease_id: str) -> None:
-        """取消一个 turn 的一次性长时间提示。"""
+        """取消一个 turn 尚未完成的有界长任务提示。"""
         normalized = str(lease_id)
         self._long_running_notice_events.pop(normalized, None)
+        self._long_running_notice_counts.pop(normalized, None)
+        self._long_running_notice_started_at.pop(normalized, None)
         task = self._long_running_notice_tasks.pop(normalized, None)
         if task is None or task is asyncio.current_task():
             return
@@ -2117,6 +2198,8 @@ class OneBot11Adapter(BasePlatformAdapter):
         tasks = list(self._long_running_notice_tasks.values())
         self._long_running_notice_tasks.clear()
         self._long_running_notice_events.clear()
+        self._long_running_notice_counts.clear()
+        self._long_running_notice_started_at.clear()
         for task in tasks:
             task.cancel()
         if tasks:
@@ -2146,6 +2229,118 @@ class OneBot11Adapter(BasePlatformAdapter):
         if not any(root == candidate or root in candidate.parents for root in allowed_roots):
             return None
         return str(candidate)
+
+    def _manifest_media_paths(self) -> frozenset[str]:
+        """读取已通过收口校验的仓库调研 manifest 媒体路径。"""
+        evidence_root = (self._hermes_home / "evidence").resolve(strict=False)
+        if not evidence_root.is_dir():
+            return frozenset()
+        approved: set[str] = set()
+        try:
+            manifests = sorted(
+                (
+                    (manifest_path, manifest_path.stat().st_mtime_ns)
+                    for manifest_path in evidence_root.rglob("repository-research-run.json")
+                ),
+                key=lambda item: item[1],
+                reverse=True,
+            )
+        except OSError:
+            return frozenset()
+        # 只读取最近一次 adapter 运行回执；旧 manifest 不能继续授权 MEDIA。
+        for manifest_path, _mtime_ns in manifests[:1]:
+            try:
+                resolved_manifest = manifest_path.resolve(strict=True)
+                if not (
+                    resolved_manifest == evidence_root
+                    or evidence_root in resolved_manifest.parents
+                ):
+                    continue
+                if resolved_manifest.stat().st_size > 1_048_576:
+                    continue
+                payload = json.loads(resolved_manifest.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, Mapping):
+                continue
+            if payload.get("schema") != "nbook.repository-research-run/v1":
+                continue
+            result = payload.get("result")
+            cleanup = payload.get("cleanup")
+            evidence = payload.get("evidence")
+            if not (
+                isinstance(result, Mapping)
+                and result.get("status") == "passed"
+                and isinstance(cleanup, Mapping)
+                and cleanup.get("browser") in {"closed", "killed"}
+                and cleanup.get("service") in {"graceful", "forced"}
+                and cleanup.get("portClosed") is True
+                and cleanup.get("ownedTempRootsRemoved") is True
+                and cleanup.get("sharedCachePreserved") is True
+                and isinstance(evidence, Mapping)
+            ):
+                continue
+            media_files = evidence.get("mediaFiles")
+            if not isinstance(media_files, list):
+                continue
+            for raw_path in media_files[:4]:
+                if not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
+                    continue
+                safe_path = self._validate_manifest_media_path(raw_path)
+                if safe_path is not None:
+                    approved.add(safe_path)
+        return frozenset(approved)
+
+    def _validate_manifest_media_path(self, raw_path: str) -> str | None:
+        """校验 manifest 中的绝对图片路径、魔数和受控根目录。"""
+        safe_path = self.validate_media_delivery_path(raw_path)
+        if safe_path is None:
+            return None
+        path = Path(safe_path)
+        if path.suffix.casefold() not in {".png", ".jpg", ".jpeg", ".gif", ".webp"}:
+            return None
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return None
+        if len(data) > self._api.max_media_bytes:
+            return None
+        return safe_path if matches_image_magic(data, "", path.name) else None
+
+    def filter_media_delivery_paths(self, media_files: Any) -> list[tuple[str, bool]]:
+        """只允许 manifest.evidence.mediaFiles 中的安全路径进入 MEDIA 出站。"""
+        approved = self._manifest_media_paths()
+        safe_media: list[tuple[str, bool]] = []
+        for item in media_files or []:
+            try:
+                raw_path, is_voice = item
+            except (TypeError, ValueError):
+                continue
+            safe_path = self.validate_media_delivery_path(str(raw_path))
+            if safe_path is not None and safe_path in approved:
+                safe_media.append((safe_path, bool(is_voice)))
+            else:
+                logger.warning(
+                    "OneBot11 拒绝非 manifest 媒体路径: basename=%s",
+                    Path(str(raw_path)).name[:128],
+                )
+        return safe_media
+
+    def filter_local_delivery_paths(self, file_paths: Any) -> list[str]:
+        """阻止裸本地路径绕过 MEDIA manifest 合同进入原生附件出站。"""
+        approved = self._manifest_media_paths()
+        safe_paths: list[str] = []
+        for raw_path in file_paths or []:
+            safe_path = self.validate_media_delivery_path(str(raw_path))
+            if safe_path is not None and safe_path in approved:
+                safe_paths.append(safe_path)
+            else:
+                logger.warning(
+                    "OneBot11 拒绝非 manifest 裸媒体路径: basename=%s",
+                    Path(str(raw_path)).name[:128],
+                )
+        return safe_paths
+
 
     def _supports_channel_prompt(self) -> bool:
         """检测当前 Hermes 的 MessageEvent 是否支持临时 channel_prompt。"""
@@ -2358,7 +2553,9 @@ class OneBot11Adapter(BasePlatformAdapter):
                         chat_type="group",
                         text=message.text,
                         mentioned_self=mentioned_self,
-                        has_context=bool(before.get("summary") or int(before.get("pending", 0)) > 0),
+                        has_context=bool(
+                            before.get("summary") or int(before.get("pending", 0)) > 0
+                        ),
                         revision=int(status.get("revision", 0)),
                         now=now,
                         last_trigger_at=previous_trigger_at,
@@ -2370,6 +2567,13 @@ class OneBot11Adapter(BasePlatformAdapter):
                     )
                     if action.kind == "schedule":
                         await self._apply_trigger_action_locked(chat_id, action)
+                        self._audit_selector_event(
+                            "candidate_scheduled",
+                            chat_id,
+                            reason=action.reason,
+                            candidate_type=action.candidate_type,
+                            state=state,
+                        )
                         if state.mode == "debounce":
                             queued_reaction_message = message
                 if decision.triggered or action.kind == "direct":
@@ -2392,6 +2596,185 @@ class OneBot11Adapter(BasePlatformAdapter):
         if should_notify:
             await self._dispatcher.notify(chat_id)
 
+    @staticmethod
+    def _is_async_completion_event(event: MessageEvent) -> bool:
+        """只识别 Hermes 明确标记的内部异步委派完成事件。"""
+        if not bool(getattr(event, "internal", False)):
+            return False
+        metadata = getattr(event, "metadata", None) or {}
+        if not str(metadata.get("gateway_session_id") or "").strip():
+            return False
+        text = str(getattr(event, "text", "") or "").lstrip()
+        return text.startswith(
+            (
+                "[ASYNC DELEGATION COMPLETE — ",
+                "[ASYNC DELEGATION BATCH COMPLETE — ",
+            )
+        )
+
+    @staticmethod
+    def _is_persisted_async_completion(message: QueueMessage) -> bool:
+        """识别重启前已入队、但尚未创建 anchor 的内部 completion。"""
+        metadata = message.metadata
+        if not str(metadata.get("gateway_session_id") or "").strip():
+            return False
+        if bool(metadata.get("onebot11_internal_completion")):
+            return True
+        text = str(message.text or "").lstrip()
+        return text.startswith(
+            (
+                "[ASYNC DELEGATION COMPLETE — ",
+                "[ASYNC DELEGATION BATCH COMPLETE — ",
+            )
+        )
+
+    def _restricted_completion_authority(
+        self,
+        *,
+        user_id: str,
+        chat_type: str,
+        chat_id: str,
+    ) -> CallerContext:
+        """为内部 completion 建立不含 OneBot 工具的最小权限快照。"""
+        return CallerContext(
+            user_id=str(user_id),
+            chat_type=str(chat_type),
+            chat_id=str(chat_id),
+            role="user",
+            allowed_tools=frozenset(),
+            self_id=self.self_id,
+            adapter_epoch=self._adapter_epoch,
+        )
+
+    def _completion_authority_for_message(self, message: QueueMessage) -> CallerContext:
+        """恢复内部 completion 时绝不信任原用户或持久化权限快照。"""
+        return self._restricted_completion_authority(
+            user_id=message.user_id,
+            chat_type=message.chat_type,
+            chat_id=message.chat_id,
+        )
+
+    async def _enqueue_internal_completion(self, event: MessageEvent) -> None:
+        """将内部 completion 原子入队并创建无 OneBot 工具的恢复 anchor。"""
+        source = event.source
+        chat_id = str(source.chat_id)
+        caller = self._restricted_completion_authority(
+            user_id=str(source.user_id or ""),
+            chat_type="group",
+            chat_id=chat_id,
+        )
+        metadata = dict(event.metadata or {})
+        metadata["onebot11_mentioned_self"] = False
+        metadata["onebot11_internal_completion"] = True
+        completion_media, _ = self.extract_media(str(event.text or ""))
+        authorized_media = self.filter_media_delivery_paths(completion_media)
+        if authorized_media:
+            metadata["onebot11_completion_media_paths"] = [
+                path for path, is_voice in authorized_media if not is_voice
+            ]
+        metadata["onebot11_authority"] = {
+            "role": caller.role,
+            "allowed_tools": [],
+            "self_id": caller.self_id,
+        }
+        message_id = self._stable_message_id(
+            event.message_id,
+            chat_id=chat_id,
+            text=event.text,
+            metadata=metadata,
+        )
+        message_key = self._stable_message_key(
+            event.message_id,
+            chat_type="group",
+            chat_id=chat_id,
+            text=event.text,
+            metadata=metadata,
+        )
+        message = QueueMessage(
+            chat_id=chat_id,
+            chat_type="group",
+            message_id=message_id,
+            user_id=str(source.user_id or caller.user_id),
+            user_name=str(source.user_name or source.user_id or caller.user_id),
+            text=event.text,
+            raw_text=event.text,
+            metadata=metadata,
+            message_key=message_key,
+        )
+        trigger = TriggerRequest.create(
+            chat_id,
+            message_key,
+            "completion_recovery",
+            caller.user_id,
+            str(source.user_name or caller.user_id),
+            anchor_kind="recovery",
+            authority_role=caller.role,
+            authority_tools=caller.allowed_tools,
+            authority_self_id=caller.self_id,
+        )
+        async with self._trigger_lock_for(chat_id):
+            state = self._trigger_states.get(chat_id)
+            if state is not None:
+                state.invalidate_judgement()
+            result = await asyncio.to_thread(
+                self._queue.enqueue,
+                message,
+                trigger,
+            )
+        self._cancel_llm_judgement(chat_id)
+        self._schedule_clear_queued_reaction(chat_id)
+        if result.trigger_request_id:
+            await self._dispatcher.notify(chat_id)
+
+    async def _recover_internal_completion_triggers(self) -> None:
+        """重启时为旧内部 completion 补齐缺失的 durable anchor。"""
+        try:
+            pending_chat_ids = await asyncio.to_thread(self._queue.pending_chat_ids)
+        except QueueError:
+            return
+        for chat_id in pending_chat_ids:
+            normalized = str(chat_id)
+            if not self._chat_access_allowed("group", normalized):
+                continue
+            try:
+                status = await asyncio.to_thread(self._queue.status, normalized)
+                if (
+                    status.get("paused")
+                    or int(status.get("pending_trigger_requests", 0) or 0) > 0
+                    or int(status.get("uncertain", 0) or 0) > 0
+                    or int(status.get("failed", 0) or 0) > 0
+                ):
+                    continue
+                messages = await asyncio.to_thread(
+                    self._queue.peek,
+                    normalized,
+                    include_backoff=True,
+                )
+            except QueueError:
+                continue
+            completion = next(
+                (message for message in messages if self._is_persisted_async_completion(message)),
+                None,
+            )
+            if completion is None:
+                continue
+            authority = self._completion_authority_for_message(completion)
+            request_id = await asyncio.to_thread(
+                self._queue.create_trigger,
+                normalized,
+                "completion_recovery",
+                completion.user_id,
+                completion.user_name,
+                str(completion.message_key),
+                anchor_kind="recovery",
+                authority_role=authority.role,
+                authority_tools=authority.allowed_tools,
+                authority_self_id=authority.self_id,
+                triggered_at=time.time(),
+            )
+            if request_id:
+                await self._dispatcher.notify(normalized)
+
     async def handle_message(self, event: MessageEvent) -> None:
         """群消息入队并按触发结果 dispatch；私聊沿用 Hermes 直接 turn。"""
         source = event.source
@@ -2410,8 +2793,10 @@ class OneBot11Adapter(BasePlatformAdapter):
                 },
             )
             return
+        if source.chat_type == "group" and self._is_async_completion_event(event):
+            await self._enqueue_internal_completion(event)
+            return
         caller = self._caller_for_event(source)
-        event.metadata = dict(event.metadata or {})
         event.metadata["onebot11_caller_context"] = _serializable_caller(caller)
         if source.chat_type == "dm":
             event_token = _CURRENT_EVENT.set(event)
@@ -2570,6 +2955,32 @@ class OneBot11Adapter(BasePlatformAdapter):
             },
         )
         return True
+    def _audit_selector_event(
+        self,
+        event: str,
+        chat_id: str,
+        *,
+        reason: str = "",
+        candidate_type: str = "",
+        state: LayeredTriggerState | None = None,
+    ) -> None:
+        """记录不含正文、凭据和模型输入的 selector 生命周期事件。"""
+        payload: dict[str, Any] = {
+            "chat_id": str(chat_id),
+            "reason": str(reason or "")[:96],
+            "candidate_type": str(candidate_type or "")[:32],
+        }
+        if state is not None:
+            snapshot = state.snapshot()
+            payload.update(
+                {
+                    "mode": str(snapshot.get("mode") or "")[:32],
+                    "level": str(snapshot.get("level") or "")[:32],
+                    "arbitrations": int(snapshot.get("arbitrations", 0) or 0),
+                }
+            )
+        self._audit.record(event, payload)
+
 
     def _schedule_trigger_timer(self, chat_id: str) -> None:
         """为一个群保留唯一 timer，负责 debounce、wait 和 engaged 到期。"""
@@ -2586,7 +2997,16 @@ class OneBot11Adapter(BasePlatformAdapter):
         current = asyncio.current_task()
         if previous is not None and not previous.done() and previous is not current:
             previous.cancel()
-        task = asyncio.create_task(self._run_trigger_timer(normalized))
+        try:
+            task = asyncio.create_task(self._run_trigger_timer(normalized))
+        except RuntimeError:
+            self._audit_selector_event(
+                "selector_skipped",
+                normalized,
+                reason="event_loop_unavailable",
+                state=state,
+            )
+            return
         self._trigger_timer_tasks[normalized] = task
 
     async def _run_trigger_timer(self, chat_id: str) -> None:
@@ -2616,6 +3036,13 @@ class OneBot11Adapter(BasePlatformAdapter):
                 if action.reason in {"wait_expired", "engaged_expired"}:
                     self._schedule_clear_queued_reaction(chat_id)
                 if action.kind == "judge":
+                    self._audit_selector_event(
+                        "selector_started",
+                        chat_id,
+                        reason=action.reason,
+                        candidate_type=action.candidate_type,
+                        state=state,
+                    )
                     await self._start_llm_judgement(chat_id, action)
                 elif action.kind in {"schedule", "wait"}:
                     await self._apply_trigger_action(chat_id, action)
@@ -3499,14 +3926,21 @@ class OneBot11Adapter(BasePlatformAdapter):
                         "decision": decision_name,
                         "anchor_seq": anchor_seq,
                         "duration_ms": int((time.monotonic() - started_at) * 1000),
+                        "failure": "",
                         "provider": self.trigger_config.llm_provider,
                         "model": self.trigger_config.llm_model,
-                        "concurrency_waited": concurrency_waited,
-                        "concurrency_wait_ms": concurrency_wait_ms,
-                        "model_call_started": True,
+                        "concurrency_waited": bool(concurrency_waited),
+                        "concurrency_wait_ms": int(concurrency_wait_ms),
+                        "model_call_started": bool(model_call_started),
                     },
                 )
-            if notify:
+                self._audit_selector_event(
+                    "selector_finished",
+                    normalized,
+                    reason=decision_name,
+                    candidate_type=candidate_type,
+                    state=self._trigger_states.get(normalized),
+                )
                 await self._dispatcher.notify(normalized)
         except asyncio.CancelledError:
             if not self._closed:
@@ -3631,7 +4065,14 @@ class OneBot11Adapter(BasePlatformAdapter):
                 "OneBot11 anchor authority self_id 属于其他机器人",
             )
             raise PermissionError("OneBot11 durable anchor authority self_id 不匹配")
-        if trigger.anchor_kind not in {"operator", "admin_flush"}:
+        is_sandboxed_completion = (
+            trigger.reason == "completion_recovery"
+            and trigger.anchor_kind == "recovery"
+            and trigger.authority_role == "user"
+            and not trigger.authority_tools
+            and all(self._is_persisted_async_completion(message) for message in lease.messages)
+        )
+        if trigger.anchor_kind not in {"operator", "admin_flush"} and not is_sandboxed_completion:
             message_authority = self._authority_for_queued_message(anchor_message)
             trigger_tools = frozenset(
                 tool
@@ -3678,37 +4119,23 @@ class OneBot11Adapter(BasePlatformAdapter):
             for message in lease.messages
         )
         media_dir = self._new_media_dir() if has_images else self._media_dir
+        completion_media_paths: list[str] = []
+        if is_sandboxed_completion:
+            completion_candidates: list[tuple[str, bool]] = []
+            for message in lease.messages:
+                raw_paths = message.metadata.get("onebot11_completion_media_paths")
+                if isinstance(raw_paths, list):
+                    completion_candidates.extend(
+                        (str(path), False) for path in raw_paths if isinstance(path, str)
+                    )
+            approved_completion = self.filter_media_delivery_paths(completion_candidates)
+            seen_completion: set[str] = set()
+            for path, _is_voice in approved_completion:
+                if path not in seen_completion:
+                    seen_completion.add(path)
+                    completion_media_paths.append(path)
         handed_off = False
         try:
-            # 客服群开启中间反馈时，先发送确定性的中文回执，再进入媒体、模型
-            # 和工具循环；这条控制面消息不进入 Hermes transcript。
-            if self.show_interim_group and lease.lease_id not in self._turn_start_ack_sent:
-                self._turn_start_ack_sent.add(lease.lease_id)
-                try:
-                    ack_result = await self._send_notice_message(
-                        lease.chat_id,
-                        _TURN_START_ACK_TEXT,
-                        reply_to=reply_id,
-                        lease_id=lease.lease_id,
-                    )
-                except Exception as exc:
-                    # 首条回执是体验增强，不得把 OneBot 控制面故障升级成
-                    # Hermes turn 启动失败；业务 turn 仍继续执行。
-                    ack_result = SendResult(
-                        False,
-                        error=f"首条回执发送异常: {type(exc).__name__}",
-                        error_kind="unknown",
-                    )
-                _safe_audit(
-                    self,
-                    "turn_start_ack",
-                    {
-                        "chat_id": lease.chat_id,
-                        "lease_id": lease.lease_id,
-                        "sent": bool(ack_result.success),
-                        "error_kind": ack_result.error_kind,
-                    },
-                )
             reaction_message_id = await self._set_processing_reaction(lease, enabled=True)
             if reaction_message_id is not None:
                 self._processing_reaction_message_ids[lease.lease_id] = reaction_message_id
@@ -3831,6 +4258,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                     "onebot11_summary_mode": summary_mode,
                     "onebot11_defer_completion": True,
                     "onebot11_managed_context": True,
+                    "onebot11_completion_media_paths": list(completion_media_paths),
                 },
             }
             if summary_prompt and summary_mode == "channel_prompt":
@@ -3883,7 +4311,6 @@ class OneBot11Adapter(BasePlatformAdapter):
                 _CURRENT_EVENT.reset(event_token)
         finally:
             if not handed_off:
-                self._turn_start_ack_sent.discard(lease.lease_id)
                 self._lease_session_keys.pop(lease.lease_id, None)
                 await self._clear_processing_reaction(lease.lease_id)
                 self._cleanup_media(
@@ -4824,7 +5251,6 @@ class OneBot11Adapter(BasePlatformAdapter):
                         exc_info=True,
                     )
             self._unknown_leases.discard(lease_id)
-            self._turn_start_ack_sent.discard(lease_id)
             self._outbound_started.discard(lease_id)
             self._outbound_successful.discard(lease_id)
             self._outbound_known_failure.discard(lease_id)
@@ -4927,6 +5353,49 @@ class OneBot11Adapter(BasePlatformAdapter):
             _CURRENT_CALLER.reset(caller_token)
             _CURRENT_EVENT.reset(event_token)
 
+    async def _send_completion_media(self, event: MessageEvent) -> None:
+        """在子代理 completion 的主模型回执后补发当前 manifest 授权图片。"""
+        metadata = event.metadata or {}
+        raw_paths = metadata.get("onebot11_completion_media_paths")
+        source = getattr(event, "source", None)
+        if source is None or not isinstance(raw_paths, list):
+            return
+        candidates = [
+            (path, False)
+            for path in raw_paths
+            if isinstance(path, str) and path.strip()
+        ]
+        approved = self.filter_media_delivery_paths(candidates)
+        if not approved:
+            return
+        images = [(f"file://{quote(path)}", "") for path, _is_voice in approved]
+        try:
+            results = await self.send_multiple_images(
+                str(source.chat_id),
+                images,
+                metadata=dict(metadata),
+            )
+        except Exception as exc:
+            self._audit.record(
+                "completion_media_delivery_failed",
+                {
+                    "chat_id": str(source.chat_id),
+                    "count": len(images),
+                    "error_kind": type(exc).__name__,
+                },
+            )
+            return
+        successful = sum(1 for result in results if result.success)
+        self._audit.record(
+            "completion_media_delivery",
+            {
+                "chat_id": str(source.chat_id),
+                "count": len(images),
+                "successful": successful,
+                "failed": len(images) - successful,
+            },
+        )
+
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """按真实 Hermes/QQ 出站结果完成 queue lease。"""
         metadata = event.metadata or {}
@@ -4936,6 +5405,7 @@ class OneBot11Adapter(BasePlatformAdapter):
         try:
             if lease_id:
                 if deferred:
+                    await self._send_completion_media(event)
                     self._pending_completions[lease_id] = (
                         outcome,
                         lease_id in self._unknown_leases,
@@ -4990,10 +5460,60 @@ class OneBot11Adapter(BasePlatformAdapter):
         *,
         mode: str = "all",
         preview_max_len: int = 40,
-    ) -> None:
-        """OneBot 不发送 Hermes 工具进度，避免永久消息污染最终回复。"""
-        del event, mode, preview_max_len
-        return None
+    ) -> str | None:
+        """把结构化工具事件转换成不含参数的中文进度摘要。
+
+        OneBot 11 的消息是永久气泡，不能把命令、文件路径、URL、参数或
+        工具正文直接复制到 QQ。这里故意只返回固定语义标签；``preview``
+        和 ``args`` 即使由 Hermes 传入，也不进入输出或审计。连续相同
+        标签在短窗口内去重，避免同一工具的重复 start 事件刷屏。
+        """
+        del preview_max_len
+        if str(mode or "all").casefold() in {"off", "log"}:
+            return None
+        tool_name = str(getattr(event, "tool_name", "") or "").strip().casefold()
+        if not tool_name:
+            return None
+        if not self._tool_progress_allowed():
+            return None
+        line = _TOOL_PROGRESS_LABELS.get(tool_name, "正在处理项目任务")
+        now = time.monotonic()
+        last_line = getattr(self, "_last_tool_progress_line", None)
+        last_at = float(getattr(self, "_last_tool_progress_at", 0.0) or 0.0)
+        if line == last_line and now - last_at <= 2.0:
+            return None
+        self._last_tool_progress_line = line
+        self._last_tool_progress_at = now
+        return line
+
+    def _tool_progress_allowed(self) -> bool:
+        """按当前 OneBot 目标的中间消息策略决定是否展示工具进度。"""
+        current_event = _CURRENT_EVENT.get()
+        metadata = getattr(current_event, "metadata", None)
+        target: ChatTarget | None = None
+        if isinstance(metadata, Mapping):
+            raw_target = metadata.get("onebot11_target")
+            if isinstance(raw_target, Mapping):
+                chat_type = str(raw_target.get("chat_type") or "")
+                chat_id = str(raw_target.get("chat_id") or "")
+                if chat_type and chat_id:
+                    target = ChatTarget(chat_type, chat_id)
+        if target is None:
+            caller = _CURRENT_CALLER.get()
+            if caller is not None and caller.chat_type and caller.chat_id:
+                target = ChatTarget(caller.chat_type, caller.chat_id)
+        if target is None or self._interim_allowed(target):
+            return True
+        _safe_audit(
+            self,
+            "interim_hidden",
+            {
+                "chat_type": target.chat_type,
+                "chat_id": target.chat_id,
+                "reason": "工具进度按配置隐藏",
+            },
+        )
+        return False
 
     def _delivery_summary_for(self, lease_id: str | None) -> DeliverySummary | None:
         """读取或创建 managed turn 的出站结算对象。"""
@@ -6090,6 +6610,70 @@ class OneBot11Adapter(BasePlatformAdapter):
                 return False
         return True
 
+    def _delegated_binding_is_authorized(
+        self,
+        binding: TurnBinding | None,
+        *,
+        expected_caller: CallerContext | None = None,
+    ) -> bool:
+        """校验后台 child 继承的父 lineage，不要求父 lease 或 binding 仍在 store。"""
+        if not isinstance(binding, TurnBinding):
+            return False
+        if not binding.session_id or not binding.turn_id:
+            return False
+        if expected_caller is not None and expected_caller != binding.caller:
+            return False
+        caller = binding.caller
+        if (
+            not caller.self_id
+            or caller.self_id != self.self_id
+            or caller.adapter_epoch is None
+            or caller.adapter_epoch != self._adapter_epoch
+            or binding.lease_id != caller.lease_id
+            or not self._chat_access_allowed(
+                caller.chat_type,
+                caller.chat_id,
+                caller.user_id,
+            )
+        ):
+            return False
+
+        current_event = _CURRENT_EVENT.get()
+        metadata = getattr(current_event, "metadata", None) or {}
+        if not isinstance(metadata, Mapping) or not metadata.get(
+            "onebot11_managed_context"
+        ):
+            return True
+        raw_target = metadata.get("onebot11_target")
+        if not isinstance(raw_target, Mapping):
+            return False
+        if (
+            str(raw_target.get("chat_type") or "") != caller.chat_type
+            or str(raw_target.get("chat_id") or "") != caller.chat_id
+        ):
+            return False
+        raw_epoch = metadata.get("onebot11_adapter_epoch")
+        if raw_epoch is not None:
+            try:
+                if isinstance(raw_epoch, bool) or int(raw_epoch) != self._adapter_epoch:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        if metadata.get("onebot11_queue_turn") is True:
+            raw_generation = metadata.get("onebot11_reset_generation")
+            try:
+                if (
+                    raw_generation is None
+                    or isinstance(raw_generation, bool)
+                    or int(raw_generation)
+                    != self._conversation_reset_generations.get(caller.chat_id, 0)
+                ):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return True
+
+
     def _log_binding_diagnostic(
         self,
         metadata: Mapping[str, Any] | None,
@@ -6483,25 +7067,42 @@ class OneBot11Adapter(BasePlatformAdapter):
                         },
                         ensure_ascii=False,
                     )
-                binding = self._resolve_binding(session_id, turn_id)
+                resolved_binding = self._resolve_binding(session_id, turn_id)
                 context_binding = _CURRENT_BINDING.get()
                 context_caller = _CURRENT_CALLER.get()
-                if (
-                    binding is None
-                    or (
-                        context_binding is not None
-                        and context_binding != binding
-                    )
-                    or (
-                        context_caller is not None
-                        and context_caller != binding.caller
-                    )
-                ):
-                    binding = None
+                if delegated_child:
+                    binding = context_binding
+                    if (
+                        binding is None
+                        or (
+                            resolved_binding is not None
+                            and resolved_binding != binding
+                        )
+                        or not self._delegated_binding_is_authorized(
+                            binding,
+                            expected_caller=context_caller,
+                        )
+                    ):
+                        binding = None
+                else:
+                    binding = resolved_binding
+                    if (
+                        binding is None
+                        or (
+                            context_binding is not None
+                            and context_binding != binding
+                        )
+                        or (
+                            context_caller is not None
+                            and context_caller != binding.caller
+                        )
+                    ):
+                        binding = None
             else:
                 binding = self._binding_from_context()
             if binding is None:
                 return json.dumps({"status": "permission_error", "error": "当前 turn 身份绑定不存在"}, ensure_ascii=False)
+
             if (
                 binding.caller.adapter_epoch is not None
                 and binding.caller.adapter_epoch != self._adapter_epoch
@@ -6515,7 +7116,7 @@ class OneBot11Adapter(BasePlatformAdapter):
                     {"status": "permission_error", "error": "OneBot11 adapter 已关闭"},
                     ensure_ascii=False,
                 )
-            if binding.lease_id and not self._lease_is_current(binding.lease_id):
+            if binding.lease_id and not delegated_child and not self._lease_is_current(binding.lease_id):
                 self._audit.record(
                     "permission_denied",
                     {
@@ -7189,10 +7790,10 @@ def _pre_llm_call_hook(session_id: str = "", turn_id: str = "", platform: Any = 
     if not adapter._chat_access_allowed(caller.chat_type, caller.chat_id, caller.user_id):
         _clear_current_turn_binding(adapter)
         return {"context": "OneBot11 caller is no longer authorized; all OneBot11 tools must be denied."}
-    if caller.lease_id and not adapter._lease_is_current(caller.lease_id):
+    if caller.lease_id and not delegated_child and not adapter._lease_is_current(caller.lease_id):
         _clear_current_turn_binding(adapter)
         return {"context": "OneBot11 caller lease unavailable; all OneBot11 tools must be denied."}
-    if caller.lease_id and not adapter._lease_matches_target(
+    if caller.lease_id and not delegated_child and not adapter._lease_matches_target(
         caller.lease_id, caller.chat_type, caller.chat_id
     ):
         _clear_current_turn_binding(adapter)
@@ -7203,8 +7804,19 @@ def _pre_llm_call_hook(session_id: str = "", turn_id: str = "", platform: Any = 
     if delegated_child:
         if context_binding is None:
             return {"context": "OneBot11 delegated child lacks parent turn binding; all tools must be denied."}
-        # delegated child 可能只带自己的 session/turn 坐标，没有原始 event
-        # 的 ContextVar；确认父 binding 后显式保留 OneBot lineage。
+        if exact_binding is not None and exact_binding != context_binding:
+            _clear_current_turn_binding(adapter)
+            return {"context": "OneBot11 delegated child turn binding conflicts with parent binding; all tools must be denied."}
+        if not adapter._delegated_binding_is_authorized(
+            context_binding,
+            expected_caller=caller,
+        ):
+            _clear_current_turn_binding(adapter)
+            return {"context": "OneBot11 delegated child parent binding unavailable or invalid; all tools must be denied."}
+        # Child coordinates are never registered as a new OneBot identity;
+        # retain only the verified parent lineage in this child ContextVar.
+        _CURRENT_BINDING.set(context_binding)
+        _CURRENT_CALLER.set(caller)
         _CURRENT_ONEBOT_CONTEXT.set(True)
         return {
             "context": role_prompt(
@@ -7381,20 +7993,26 @@ def _pre_tool_call_hook(
             "message": f"权限错误: OneBot11 当前禁止调用 {normalized_tool_name}",
         }
     try:
-        binding = exact_binding or adapter._resolve_binding(
-            normalized_session_id,
-            normalized_turn_id,
-        )
-        if binding is None and delegated_child:
-            # Hermes delegate_task 子代理使用自己的 session/turn 坐标，但
-            # 仍运行在父 OneBot turn 的 context 中；继承父 binding 后再
-            # 执行一次 delegated-child 的工具限制，不能把子代理坐标
-            # 当成新的 OneBot 身份。
-            binding = _CURRENT_BINDING.get()
-        if binding is None:
-            return {"action": "block", "message": "OneBot11 current turn binding unavailable"}
         context_binding = _CURRENT_BINDING.get()
         current_caller = _CURRENT_CALLER.get()
+        if delegated_child:
+            binding = context_binding
+            if (
+                binding is None
+                or (exact_binding is not None and exact_binding != binding)
+                or not adapter._delegated_binding_is_authorized(
+                    binding,
+                    expected_caller=current_caller,
+                )
+            ):
+                return {"action": "block", "message": "OneBot11 current turn binding unavailable"}
+        else:
+            binding = exact_binding or adapter._resolve_binding(
+                normalized_session_id,
+                normalized_turn_id,
+            )
+        if binding is None:
+            return {"action": "block", "message": "OneBot11 current turn binding unavailable"}
         if context_binding is not None and context_binding != binding:
             return {
                 "action": "block",
@@ -7409,6 +8027,21 @@ def _pre_tool_call_hook(
         # 这里对 OneBot turn 的 terminal 命令做统一兜底，禁止写安全敏感配置。
         if normalized_tool_name == "terminal":
             raw_command = (args or {}).get("command")
+            if isinstance(raw_command, str) and delegated_child:
+                media_error = terminal_writes_media_root(raw_command)
+                if media_error:
+                    _safe_audit(
+                        adapter,
+                        "permission_denied",
+                        {
+                            "tool": normalized_tool_name,
+                            "user_id": binding.caller.user_id,
+                            "chat_type": binding.caller.chat_type,
+                            "chat_id": binding.caller.chat_id,
+                            "reason": media_error,
+                        },
+                    )
+                    return {"action": "block", "message": f"权限错误: {media_error}"}
             if isinstance(raw_command, str):
                 config_error = terminal_writes_sensitive_config(raw_command)
                 if config_error:
@@ -7432,6 +8065,21 @@ def _pre_tool_call_hook(
             # 白名单文件，必须在这里同样 fail-closed，防止 write_file/patch
             # 绕过 terminal 兜底。
             raw_path = (args or {}).get("path")
+            if isinstance(raw_path, str) and delegated_child:
+                media_error = file_tool_writes_media_root(raw_path)
+                if media_error:
+                    _safe_audit(
+                        adapter,
+                        "permission_denied",
+                        {
+                            "tool": normalized_tool_name,
+                            "user_id": binding.caller.user_id,
+                            "chat_type": binding.caller.chat_type,
+                            "chat_id": binding.caller.chat_id,
+                            "reason": media_error,
+                        },
+                    )
+                    return {"action": "block", "message": f"权限错误: {media_error}"}
             config_error = (
                 file_tool_writes_sensitive_config(str(raw_path))
                 if isinstance(raw_path, str)
@@ -7484,7 +8132,7 @@ def _pre_tool_call_hook(
             and binding.caller.adapter_epoch != adapter._adapter_epoch
         ):
             return {"action": "block", "message": "权限错误: 当前 adapter epoch 已失效"}
-        if binding.lease_id and not adapter._lease_is_current(binding.lease_id):
+        if binding.lease_id and not delegated_child and not adapter._lease_is_current(binding.lease_id):
             _safe_audit(
                 adapter,
                 "permission_denied",
@@ -7702,7 +8350,16 @@ def _require_hermes_hook_capabilities(ctx: Any) -> Any:
 
 
 def register(ctx: Any) -> None:
-    """注册平台、全角色工具和权限 hooks。"""
+    """注册平台、全角色工具、权限 hooks 和通用仓库调研 Skill。"""
+    register_skill = getattr(ctx, "register_skill", None)
+    if callable(register_skill):
+        register_skill(
+            "repository-research",
+            Path(__file__).resolve().parent / "skills" / "repository-research" / "SKILL.md",
+            "跨项目高级仓库调研与运行证据 SOP",
+        )
+    else:
+        logger.warning("Hermes context 不支持 register_skill；repository-research capability unavailable")
     register_hook = _require_hermes_hook_capabilities(ctx)
     ctx.register_platform(
         name="onebot11",

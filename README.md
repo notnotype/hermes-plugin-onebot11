@@ -6,12 +6,12 @@
 
 - **私聊**：和机器人一对一聊天,每条消息都会回复。
 - **群聊**：整群共享一个 Hermes session；允许的消息先进入持久 SQLite 队列。每个 durable TurnAnchor 只消费自己边界内的批次，同群仍保持单活动 turn 并按 anchor 顺序串行处理；@、关键词、`always` 或分层 LLM trigger 才会创建 anchor。
-- **连续对话**：成功回复后进入最多 60 秒的活跃窗口；窗口内普通消息统一交给低成本旁路模型判断是否回复（没有特例词），单窗口最多仲裁 2 次。debounce 是自适应的：群消息间隔超过 5 秒（不活跃）时立即判断，间隔小于 5 秒（活跃）时按 trailing 节流合并。
+ - **连续对话**：成功回复后进入最多 60 秒的活跃窗口；窗口内普通消息统一交给低成本旁路模型判断是否回复（没有特例词），单窗口最多仲裁 2 次。debounce 默认 2 秒：群消息间隔超过 2 秒（不活跃）时立即判断，间隔小于 2 秒（活跃）时按 trailing 节流合并。
 - **群级旁路命令**：`/context`、`/ctx` 在入队前返回有界队列/lease/policy 诊断；超级管理员可以发送 `/new [title]`、`/reset` 或 `/clear` 重置当前群的 shared session。它们都不会作为普通群消息交给 Agent。
 - **处理指示器**：问句/记忆候选进入 selector 判断时给候选消息添加 👀（表示“bot 正在看这条消息”），判断结束（触发、忽略、超时或 wait 到期）后移除；任何触发方式进入回复阶段后，给触发消息添加 💬（表示“正在回复这一条”），Hermes turn 收尾时自动移除。两种指示器都是 best-effort，失败或结果未知不影响回复、队列 ack 或 Agent 完成，也不重放设置请求；没有真实消息 ID 或 QQ 框架不支持该扩展时按 best-effort 跳过。
-- **中间正文**：Hermes ReAct 过程中产生的 AI 中间评论（commentary/工具进度/状态提示）默认在群聊隐藏、在私聊展示，可用 `show_interim_group` / `show_interim_dm` 配置。群聊开启时，适配器会在 turn 进入 Hermes 前先发送一次中文“收到、正在查资料”回执；这条回执不进入 session transcript，发送失败也不阻塞 Agent。最终回复不受影响，永远发送。
+- **中间正文**：Hermes ReAct 过程中产生的 AI 中间评论（commentary/工具进度/状态提示）默认在群聊隐藏、在私聊展示，可用 `show_interim_group` / `show_interim_dm` 配置。生产群建议保持 `show_interim_group: false`，避免展示内部进度和工具过程；适配器不发送泛化的“收到、正在查资料”自动回执。长任务超过 `long_running_notice_seconds` 后，适配器最多发送三次有界状态提示；完成、取消、失效或发送失败即停止。最终回复不受影响，永远发送。
 - **回复格式**：默认把 Markdown 转成 OneBot 可读的纯文本；同一 turn 内重复的本地图片/URL/相同内容只投递一次。Markdown 图片逃生口 `[[onebot11:markdown-image]]...[[/onebot11:markdown-image]]` 目前只去掉 marker 并按纯文本发送，不访问其中的外部 URL。
-- **运行时配置**：超级管理员可以发送 `/onebot reload` 热更新白名单、角色工具、trigger、cooldown、reaction、一次性长时间提示延迟和显示策略；HTTP/WS 地址、token、机器人 QQ 号、队列路径和 session 模式仍需重启。reload 后 active turn 保留创建时的权限快照，并清理旧确认令牌。
+- **运行时配置**：超级管理员可以发送 `/onebot reload` 热更新白名单、角色工具、trigger、cooldown、reaction、最多三次长任务提示的延迟和显示策略；HTTP/WS 地址、token、机器人 QQ 号、队列路径和 session 模式仍需重启。reload 后 active turn 保留创建时的权限快照，并清理旧确认令牌。
 - **上下文**：队列有条数、字节数和单条消息上限，确认后形成滚动摘要，并保留最近消息原文；每条消息还带 `seq`、真实 `message_id`、去重 `message_key`、用户、role、reply 和媒体标记。当前批次作为普通 user message，摘要优先通过 Hermes `channel_prompt` 临时注入，不重复写入 shared session transcript。旧 Hermes 不支持时退回有界文本模式并记录审计。
 - **图片与消息段**：兼容 array/CQ 字符串，支持图片、reply、文件、语音、视频、转发和未知段标记；入站图片下载有 host、端口、类型、魔数和大小限制，出站图片使用受限 `base64://` segment，适配 Hermes 宿主机与 LLBot 容器路径隔离。
 - **工具与管理**：提供当前群/私聊范围内的查询工具，以及撤回、禁言、踢人、全员禁言工具。写操作只生成预览，必须由同一超级管理员在同一目标群发送短期确认命令。
@@ -82,8 +82,8 @@ hermes plugins install notnotype/hermes-plugin-onebot11
 | `ONEBOT11_QUEUE_DB` | Hermes home | SQLite 队列路径；未配置时使用 Hermes home 下的 `onebot11/queue.sqlite3` |
 | `ONEBOT11_HOME_CHANNEL` | 空 | 定时任务目标 ID；必须同时在 `platforms.onebot11.extra.home_channel_type` 指定 `group` 或 `dm` |
 | `ONEBOT11_HOME_CHANNEL_TYPE` | 空 | 定时任务目标类型：`group` 或 `dm`；不会根据 QQ 号形状猜测 |
-| `ONEBOT11_LLM_TRIGGER_PROVIDER` | YAML 可替代 | 旁路 provider；启用时必须明确配置 |
-| `ONEBOT11_LLM_TRIGGER_MODEL` | YAML 可替代 | 旁路 model；启用时必须明确配置 |
+| `ONEBOT11_LLM_TRIGGER_PROVIDER` | `deepseek` | 旁路 provider；启用时可用默认官方 provider，仍需 API key 环境变量 |
+| `ONEBOT11_LLM_TRIGGER_MODEL` | `deepseek-v4-flash` | 旁路 model；启用时使用该官方模型 |
 | `ONEBOT11_LLM_TRIGGER_BASE_URL` | 空 | 自定义 provider 的 HTTP/HTTPS OpenAI-compatible 地址 |
 | `ONEBOT11_LLM_TRIGGER_API_KEY_ENV` | 空 | API key 的环境变量名，不是密钥值 |
 | `ONEBOT11_LLM_TRIGGER_GROUPS` | 空 | 允许调用 selector 的群号列表 |
@@ -132,7 +132,7 @@ platforms:
         input_bytes: 12000
         concurrency: 2
         max_failures: 3
-        trigger_debounce_seconds: 5
+        trigger_debounce_seconds: 2
         engaged_idle_seconds: 60
         engaged_max_seconds: 300
         engaged_max_arbitrations: 2
@@ -152,9 +152,12 @@ platforms:
             input_bytes: 20000
             wait_messages: 2             # waiting 攒满 2 条新消息立即判
         short_rule_max_chars: 0          # 0=关闭；>0 时 shallow 档短消息本地 ignore
+        # 问句旁路门控：兴趣词非空时筛选相关主题；bot 词可选
+        question_bot_words: []            # 空 = 不要求提到 bot，允许其他成员的相关问句
+        question_interest_words: [AI, 人工智能, 大模型, LLM, GPT, Claude, Gemini, Agent, MCP, 机器学习, 深度学习, 资料, 搜索, 研究, 论文, 教程, 文档, 信息, 知识, 技术, 代码, 编程, 开发, 项目]
       processing_reaction_enabled: true
       processing_reaction_emoji_id: "128172"  # LLBot 的 💬，表示正在回复
-      show_interim_group: true    # 群聊展示 Hermes 中间正文（commentary/进度）
+      show_interim_group: false   # 群聊隐藏 Hermes 中间正文（commentary/进度）；最终回复仍发送
       show_interim_dm: true       # 私聊展示 Hermes 中间正文
       roles:
         user:
@@ -198,7 +201,7 @@ roles:
 启动、`validate_config` 和 `/onebot reload` 都使用同一解析路径；文件不存在则回退到
 config.yaml，行为不变。文件必须是合法 YAML mapping，未知键会直接拒绝启动（fail-closed）。
 
-LLM trigger 默认关闭，启用时必须同时配置明确的 `provider`、`model` 和群 allowlist；每群最多一个判断任务，使用 5 秒 debounce 和全局并发上限。判断由插件自有 Node helper 通过固定版本 `@earendil-works/pi-ai` 发起，不经过 Hermes auxiliary，不回退 Hermes 主 Agent，也不主动切换 provider。`api_key_env` 只保存环境变量名，密钥值不会进入 YAML、命令行、日志或 SQLite。Node、依赖缺失、超时、非法 JSON 或模型失败都按不触发处理，消息继续留在 pending。
+ LLM trigger 默认关闭；启用时可使用官方 `deepseek` / `deepseek-v4-flash` 默认值，但仍必须配置群 allowlist 和 `api_key_env` 对应的进程环境变量；自定义 provider 仍需明确填写 `provider`、`model`、`base_url` 和 `api_key_env`。每群最多一个判断任务，使用 2 秒 debounce 和全局并发上限。判断由插件自有 Node helper 通过固定版本 `@earendil-works/pi-ai` 发起，不经过 Hermes auxiliary，不回退 Hermes 主 Agent，也不主动切换 provider。`api_key_env` 只保存环境变量名，密钥值不会进入 YAML、命令行、日志或 SQLite。Node、依赖缺失、超时、非法 JSON 或模型失败都按不触发处理，消息继续留在 pending。
 旁路模型只接受 `{"decision":"trigger","anchor_seq":123}`、`{"decision":"wait","anchor_seq":null}` 或 `{"decision":"ignore","anchor_seq":null}`；`trigger` 必须选择真实 pending 消息的 seq，权限完全继承该消息。非法结果、超时或模型失败按不触发处理，并按持久化退避等待后续判断。
 
 #### Engage 分级预算
@@ -209,7 +212,7 @@ LLM trigger 默认关闭，启用时必须同时配置明确的 `provider`、`mo
 - `normal`（默认）：现状 60s/300s、2 次仲裁、超时 30s、输入 12KB。
 - `shallow`（省 token）：连续 2 次 ignore 后降级。窗口 30s/120s、1 次仲裁、超时 12s、输入 6KB。开启 `short_rule_max_chars` 后，shallow 档无信号的短消息（≤ N 字、非问句、无回指、未引用 bot、bot 未提问）本地判 ignore，不进 selector。
 
-`bot_asked` 只由成功回复文本决定：回复以问句或明确的请求短语（"复现一下/发我/贴一下"等，只检查尾部 80 字）收尾时，bot 下一条同用户消息获得 deep 预算。他人插话不享受 deep，回落 normal。重启后所有档位回到 idle/normal，不持久化。
+问句候选先经过本地显著性门槛：问号、明确求助/检索短语，或命中配置主题且包含较强疑问结构才进入 selector；“大家吃饭了吗”这类普通闲聊问句不调用 LLM。像“有没有大佬解惑一下”“求解”这类省略主题的求助句，只有在存在同群摘要或同批上下文时才进入 selector，由模型结合前文判断。`is_question` 仍保留为宽松共享识别，仅用于 bot 回复是否在提问等内部状态。显著问句再通过 `question_interest_words` 限定主题范围；`question_bot_words` 非空时再要求命中 bot 词、引用 bot 或 bot 刚向同一用户提问。`question_bot_words` 为空表示不要求显式关联 bot，其他群成员的相关问句也会进入 selector。两组都为空时保持兼容行为；只配置 bot 词而没有兴趣词会 fail-closed。@、显式关键词等硬触发不受此门控影响。
 `media_orphan_ttl_seconds` 到期后由下一次 adapter 启动或 turn 收尾清理遗留媒体目录。
 `processing_reaction_enabled` 默认开启；它使用 LLBot 的 `set_msg_emoji_like` 扩展，只作用于群聊真实消息 ID。回复阶段的 💬 使用 `processing_reaction_emoji_id`（默认 `128172`）；selector 判断阶段的 👀 使用固定 ID `128064`（LLBot/QQ 已验证支持；`9203` 即 ⏳ 与 `8971` 在 QQ reaction API 上显示异常）。添加或移除 reaction 的未知结果不会重放 Agent turn，也不会阻断队列 ack。
 

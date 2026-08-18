@@ -39,6 +39,7 @@ from gateway.platforms.base import (  # noqa: E402
     ProcessingOutcome,
     SendResult,
 )
+from gateway.stream_events import ToolCallChunk  # noqa: E402
 
 import adapter as adapter_module  # noqa: E402
 from adapter import OneBot11Adapter, check_requirements, register, validate_config  # noqa: E402
@@ -596,6 +597,217 @@ async def test_worker_binding丢失event_metadata时仍按当前活动lease恢�
         adapter_module._CURRENT_EVENT.reset(event_token)
         adapter._dispatcher._active.pop("888", None)
         await adapter.disconnect()
+
+
+def test_delegated_child父lease结束后仍可执行项目工具但不能越权(monkeypatch):
+    """后台子代理不应被父 QQ lease 的正常收尾误杀。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    caller = replace(
+        adapter._caller_for_event(
+            SimpleNamespace(user_id="123", chat_type="group", chat_id="888")
+        ),
+        role="super_admin",
+        lease_id="parent-lease",
+    )
+    binding = adapter_module.TurnBinding(
+        "parent-session",
+        "parent-turn",
+        caller,
+        "parent-lease",
+    )
+    adapter._bindings.bind(binding)
+    # 模拟父 turn wrapper 收尾：child 仍持有 ContextVar lineage，但 store 已清理。
+    adapter._bindings.discard_if_matches(binding)
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    monkeypatch.setattr(adapter_module, "_is_delegated_child_turn", lambda _kwargs: True)
+    monkeypatch.setattr(adapter, "_lease_is_current", lambda _lease_id: False)
+    monkeypatch.setattr(adapter, "_chat_access_allowed", lambda *_args: True)
+
+    binding_token = adapter_module._CURRENT_BINDING.set(binding)
+    caller_token = adapter_module._CURRENT_CALLER.set(caller)
+    context_token = adapter_module._CURRENT_ONEBOT_CONTEXT.set(True)
+    try:
+        assert adapter_module._pre_tool_call_hook(
+            tool_name="terminal",
+            session_id="child-session",
+            turn_id="child-turn",
+            args={"command": "pwd"},
+        ) is None
+        blocked_qq = adapter_module._pre_tool_call_hook(
+            tool_name="qq_get_message",
+            session_id="child-session",
+            turn_id="child-turn",
+            args={},
+        )
+        assert blocked_qq is not None
+        assert blocked_qq["action"] == "block"
+        blocked_send = adapter_module._pre_tool_call_hook(
+            tool_name="send_message",
+            session_id="child-session",
+            turn_id="child-turn",
+            args={},
+        )
+        assert blocked_send is not None
+        assert blocked_send["action"] == "block"
+    finally:
+        adapter_module._CURRENT_ONEBOT_CONTEXT.reset(context_token)
+        adapter_module._CURRENT_CALLER.reset(caller_token)
+        adapter_module._CURRENT_BINDING.reset(binding_token)
+        adapter._bindings.clear()
+        asyncio.run(adapter.disconnect())
+
+
+def test_delegated_child_pre_llm跳过父租约但保留父lineage(monkeypatch):
+    """父 lease 和 binding store 清理后，child 仍须验证继承的父身份。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    caller = replace(
+        adapter._caller_for_event(
+            SimpleNamespace(user_id="123", chat_type="group", chat_id="888")
+        ),
+        role="super_admin",
+        lease_id="parent-lease",
+    )
+    binding = adapter_module.TurnBinding(
+        "parent-session",
+        "parent-turn",
+        caller,
+        "parent-lease",
+    )
+    adapter._bindings.bind(binding)
+    adapter._bindings.discard_if_matches(binding)
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    monkeypatch.setattr(adapter_module, "_is_delegated_child_turn", lambda _kwargs: True)
+    monkeypatch.setattr(adapter, "_lease_is_current", lambda _lease_id: False)
+    monkeypatch.setattr(adapter, "_chat_access_allowed", lambda *_args: True)
+    binding_token = adapter_module._CURRENT_BINDING.set(binding)
+    caller_token = adapter_module._CURRENT_CALLER.set(caller)
+    context_token = adapter_module._CURRENT_ONEBOT_CONTEXT.set(True)
+    try:
+        result = adapter_module._pre_llm_call_hook(
+            session_id="child-session",
+            turn_id="child-turn",
+            platform="subagent",
+        )
+        assert result is not None
+        assert adapter_module._CURRENT_BINDING.get() == binding
+    finally:
+        adapter_module._CURRENT_ONEBOT_CONTEXT.reset(context_token)
+        adapter_module._CURRENT_CALLER.reset(caller_token)
+        adapter_module._CURRENT_BINDING.reset(binding_token)
+        adapter._bindings.clear()
+        asyncio.run(adapter.disconnect())
+
+
+@pytest.mark.parametrize("invalid_identity", ["self_id", "adapter_epoch", "access"])
+def test_delegated_child身份变化后fail_closed(monkeypatch, invalid_identity):
+    """self_id、epoch 或白名单变化不能让旧 child 继续获得权限。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    caller = replace(
+        adapter._caller_for_event(
+            SimpleNamespace(user_id="123", chat_type="group", chat_id="888")
+        ),
+        role="super_admin",
+        lease_id="parent-lease",
+    )
+    if invalid_identity == "self_id":
+        caller = replace(caller, self_id="other-bot")
+    elif invalid_identity == "adapter_epoch":
+        caller = replace(caller, adapter_epoch=adapter._adapter_epoch + 1)
+    else:
+        monkeypatch.setattr(adapter, "_chat_access_allowed", lambda *_args: False)
+    binding = adapter_module.TurnBinding(
+        "parent-session",
+        "parent-turn",
+        caller,
+        "parent-lease",
+    )
+    adapter._bindings.bind(binding)
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    monkeypatch.setattr(adapter_module, "_is_delegated_child_turn", lambda _kwargs: True)
+    monkeypatch.setattr(adapter, "_lease_is_current", lambda _lease_id: False)
+    binding_token = adapter_module._CURRENT_BINDING.set(binding)
+    caller_token = adapter_module._CURRENT_CALLER.set(caller)
+    context_token = adapter_module._CURRENT_ONEBOT_CONTEXT.set(True)
+    try:
+        blocked = adapter_module._pre_tool_call_hook(
+            tool_name="terminal",
+            session_id="child-session",
+            turn_id="child-turn",
+            args={"command": "pwd"},
+        )
+        assert blocked is not None
+        assert blocked["action"] == "block"
+    finally:
+        adapter_module._CURRENT_ONEBOT_CONTEXT.reset(context_token)
+        adapter_module._CURRENT_CALLER.reset(caller_token)
+        adapter_module._CURRENT_BINDING.reset(binding_token)
+        adapter._bindings.clear()
+        asyncio.run(adapter.disconnect())
+
+
+def test_delegated_child不能借用其他群binding(monkeypatch):
+    """child 坐标命中另一个群的 binding 时必须拒绝跨群串用。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    parent_caller = replace(
+        adapter._caller_for_event(
+            SimpleNamespace(user_id="123", chat_type="group", chat_id="888")
+        ),
+        role="super_admin",
+        lease_id="parent-lease",
+    )
+    other_caller = replace(parent_caller, chat_id="999", lease_id="other-lease")
+    parent_binding = adapter_module.TurnBinding(
+        "parent-session",
+        "parent-turn",
+        parent_caller,
+        "parent-lease",
+    )
+    other_binding = adapter_module.TurnBinding(
+        "child-session",
+        "child-turn",
+        other_caller,
+        "other-lease",
+    )
+    adapter._bindings.bind(parent_binding)
+    adapter._bindings.bind(other_binding)
+    monkeypatch.setattr(adapter_module, "_get_live_adapter", lambda: adapter)
+    monkeypatch.setattr(adapter_module, "_is_delegated_child_turn", lambda _kwargs: True)
+    monkeypatch.setattr(adapter, "_lease_is_current", lambda _lease_id: False)
+    monkeypatch.setattr(adapter, "_chat_access_allowed", lambda *_args: True)
+    binding_token = adapter_module._CURRENT_BINDING.set(parent_binding)
+    caller_token = adapter_module._CURRENT_CALLER.set(parent_caller)
+    context_token = adapter_module._CURRENT_ONEBOT_CONTEXT.set(True)
+    try:
+        blocked = adapter_module._pre_tool_call_hook(
+            tool_name="terminal",
+            session_id="child-session",
+            turn_id="child-turn",
+            args={"command": "pwd"},
+        )
+        assert blocked is not None
+        assert blocked["action"] == "block"
+    finally:
+        adapter_module._CURRENT_ONEBOT_CONTEXT.reset(context_token)
+        adapter_module._CURRENT_CALLER.reset(caller_token)
+        adapter_module._CURRENT_BINDING.reset(binding_token)
+        adapter._bindings.clear()
+        asyncio.run(adapter.disconnect())
 
 
 async def test出站binding缺失或session_turn不匹配时不访问OneBot(monkeypatch):
@@ -1850,6 +2062,71 @@ async def test_LLM候选入队不会在群触发锁上死锁(monkeypatch):
         )
         assert adapter._trigger_states["888"].mode == "debounce"
         assert adapter._queue.status("888")["pending"] == 1
+    finally:
+        await adapter.disconnect()
+
+async def test_上下文求助使用入队前pending状态进入selector(monkeypatch):
+    """第一条省略主题的求助不唤醒，已有群消息后同句进入 selector。"""
+    adapter = OneBot11Adapter(
+        PlatformConfig(
+            enabled=True,
+            extra={
+                "http_api": "http://127.0.0.1:3000",
+                "self_id": "1",
+                "llm_trigger": {
+                    "enabled": True,
+                    "provider": "test-provider",
+                    "model": "test-model",
+                    "groups": ["888"],
+                    "question_interest_words": ["AI", "项目"],
+                },
+            },
+        )
+    )
+    caller = adapter_module.CallerContext(
+        user_id="123",
+        chat_type="group",
+        chat_id="888",
+        role="user",
+        allowed_tools=adapter_module.READ_ONLY_TOOLS,
+        self_id="1",
+    )
+    first = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="context-before",
+        user_id="123",
+        user_name="小明",
+        text="正在配置 AI provider",
+        message_key="group:context-before",
+    )
+    second = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="context-help",
+        user_id="456",
+        user_name="小红",
+        text="有没有大佬解惑一下",
+        message_key="group:context-help",
+    )
+    try:
+        await adapter._enqueue_group_message(
+            first,
+            mentioned_self=False,
+            caller=caller,
+            user_name="小明",
+        )
+        state = adapter._trigger_states["888"]
+        assert state.mode == "idle"
+        assert state.llm_calls == 0
+        await adapter._enqueue_group_message(
+            second,
+            mentioned_self=False,
+            caller=caller,
+            user_name="小红",
+        )
+        assert state.mode == "debounce"
+        assert state.last_candidate_type == "question"
     finally:
         await adapter.disconnect()
 
@@ -3997,7 +4274,105 @@ async def test_deferred_completion不提前清理媒体(monkeypatch):
         assert not media_dir.exists()
     finally:
         await adapter.disconnect()
+async def test_内部completion媒体即使主模型省略MEDIA也会补发(monkeypatch, tmp_path):
+    """completion 文本未被主模型复述时，adapter 仍只补发当前 manifest 媒体。"""
+    hermes_home = tmp_path / "hermes-home"
+    cache_root = hermes_home / "cache" / "images"
+    evidence_root = hermes_home / "evidence" / "run-1"
+    cache_root.mkdir(parents=True)
+    evidence_root.mkdir(parents=True)
+    image_path = cache_root / "tutorial-step.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\ncompletion-media")
+    (evidence_root / "repository-research-run.json").write_text(
+        json.dumps({
+            "schema": "nbook.repository-research-run/v1",
+            "result": {"status": "passed"},
+            "cleanup": {
+                "browser": "closed",
+                "service": "forced",
+                "portClosed": True,
+                "ownedTempRootsRemoved": True,
+                "sharedCachePreserved": True,
+            },
+            "evidence": {"mediaFiles": [str(image_path)]},
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    sent: list[tuple[str, list[tuple[str, str]], dict]] = []
 
+    async def fake_send_multiple_images(chat_id, images, metadata=None, human_delay=0.0):
+        del human_delay
+        sent.append((str(chat_id), list(images), dict(metadata or {})))
+        return [SendResult(True, message_id=str(index + 1)) for index, _image in enumerate(images)]
+
+    monkeypatch.setattr(adapter, "send_multiple_images", fake_send_multiple_images)
+    event = SimpleNamespace(
+        source=adapter.build_source(
+            chat_id="888",
+            chat_name="888",
+            chat_type="group",
+            user_id="123",
+            user_name="小明",
+            role_authorized=True,
+        ),
+        metadata={
+            "onebot11_lease_id": "completion-lease",
+            "onebot11_defer_completion": True,
+            "onebot11_completion_media_paths": [str(image_path)],
+        },
+        media_urls=[],
+    )
+    try:
+        await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+        assert len(sent) == 1
+        assert sent[0][0] == "888"
+        assert sent[0][1][0][0].startswith("file://")
+        assert sent[0][1][0][0].endswith("tutorial-step.png")
+    finally:
+        await adapter.disconnect()
+
+async def test_内部completion从MEDIA文本提取授权媒体(monkeypatch):
+    """completion 入队前只保留媒体门禁返回的完整路径。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    path = "/opt/data/cache/images/run/tutorial-step.png"
+    monkeypatch.setattr(
+        adapter,
+        "filter_media_delivery_paths",
+        lambda values: [(path, False) for _raw, _voice in values],
+    )
+    async def fake_notify(_chat_id: str) -> bool:
+        return True
+    monkeypatch.setattr(adapter._dispatcher, "notify", fake_notify)
+    event = MessageEvent(
+        text="[ASYNC DELEGATION COMPLETE — deleg_media]\nMEDIA:" + path,
+        message_type="text",
+        source=adapter.build_source(
+            chat_id="888",
+            chat_name="888",
+            chat_type="group",
+            user_id="123",
+            user_name="小明",
+            role_authorized=True,
+        ),
+        internal=True,
+        metadata={"gateway_session_id": "session-parent"},
+    )
+    try:
+        await adapter.handle_message(event)
+        queued = adapter._queue.peek("888")
+        assert queued[0].metadata["onebot11_completion_media_paths"] == [path]
+    finally:
+        await adapter.disconnect()
 
 async def test_群聊at机器人放行(monkeypatch):
     """@ 了机器人的群消息正常进入会话。"""
@@ -4299,6 +4674,99 @@ async def test_send_image_file使用base64segment并保留reply(monkeypatch, fak
         assert segments[2] == {"type": "text", "data": {"text": "图片说明"}}
     finally:
         await adapter.disconnect()
+async def test_validate_media_delivery_path拒绝仓库证据并接受Hermes媒体缓存(
+    monkeypatch, tmp_path
+):
+    """MEDIA 只能引用 Hermes 媒体缓存，不能直接发送仓库 evidence 源文件。"""
+    hermes_home = tmp_path / "hermes-home"
+    cache_root = hermes_home / "cache" / "images"
+    cache_root.mkdir(parents=True)
+    source_path = tmp_path / "repo" / "evidence" / "evidence-settings-mobile.png"
+    source_path.parent.mkdir(parents=True)
+    payload = b"\x89PNG\r\n\x1a\nmedia-contract"
+    source_path.write_bytes(payload)
+    cache_path = cache_root / "run-mobile.png"
+    cache_path.write_bytes(payload)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    try:
+        assert adapter.validate_media_delivery_path(str(source_path)) is None
+        assert adapter.validate_media_delivery_path(str(cache_path)) == str(cache_path.resolve())
+    finally:
+        await adapter.disconnect()
+
+
+async def test_filter_media_delivery_paths只接受manifest中的安全媒体(
+    monkeypatch, tmp_path
+):
+    """MEDIA 和裸路径都不能把缓存内未获 manifest 授权的文件带出。"""
+    hermes_home = tmp_path / "hermes-home"
+    cache_root = hermes_home / "cache" / "images"
+    evidence_root = hermes_home / "evidence" / "run-1"
+    cache_root.mkdir(parents=True)
+    evidence_root.mkdir(parents=True)
+    approved_path = cache_root / "approved.png"
+    unapproved_path = cache_root / "unapproved.png"
+    payload = b"\x89PNG\r\n\x1a\napproved"
+    approved_path.write_bytes(payload)
+    unapproved_path.write_bytes(payload)
+    old_root = hermes_home / "evidence" / "old-run"
+    old_root.mkdir(parents=True)
+    old_path = cache_root / "old-approved.png"
+    old_path.write_bytes(payload)
+    old_manifest = old_root / "repository-research-run.json"
+    old_manifest.write_text(
+        json.dumps({
+            "schema": "nbook.repository-research-run/v1",
+            "result": {"status": "passed"},
+            "cleanup": {
+                "browser": "closed",
+                "service": "forced",
+                "portClosed": True,
+                "ownedTempRootsRemoved": True,
+                "sharedCachePreserved": True,
+            },
+            "evidence": {"mediaFiles": [str(old_path)]},
+        }),
+        encoding="utf-8",
+    )
+    os.utime(old_manifest, ns=(1, 1))
+    (evidence_root / "repository-research-run.json").write_text(
+        json.dumps(
+            {
+                "schema": "nbook.repository-research-run/v1",
+                "result": {"status": "passed"},
+                "cleanup": {
+                    "browser": "closed",
+                    "service": "forced",
+                    "portClosed": True,
+                    "ownedTempRootsRemoved": True,
+                    "sharedCachePreserved": True,
+                },
+                "evidence": {"mediaFiles": [str(approved_path)]},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    try:
+        assert adapter.filter_media_delivery_paths(
+            [(str(approved_path), False), (str(unapproved_path), False), (str(old_path), False)]
+        ) == [(str(approved_path.resolve()), False)]
+        assert adapter.filter_local_delivery_paths(
+            [str(approved_path), str(unapproved_path), str(old_path)]
+        ) == [str(approved_path.resolve())]
+    finally:
+        await adapter.disconnect()
 
 
 async def test_send默认转换为纯文本并记录marker不可用(monkeypatch, fake_http_server):
@@ -4382,10 +4850,10 @@ async def test_控制面通知同一turn只发送一次并兼容系统错误meta
         await adapter.disconnect()
 
 
-async def test_长时间运行提示只发送一次且不污染业务marker(
+async def test_长时间运行提示最多发送三次且不污染业务marker(
     monkeypatch, fake_http_server
 ):
-    """活动 turn 超过延迟后只发送一次控制面提示。"""
+    """活动 turn 超过延迟后最多发送三次有界状态提示。"""
     base, calls = fake_http_server
     adapter = _make_adapter(
         monkeypatch,
@@ -4422,19 +4890,50 @@ async def test_长时间运行提示只发送一次且不污染业务marker(
     )
     try:
         adapter._schedule_long_running_notice(event, "long-running-lease")
-        await asyncio.sleep(0.05)
-        adapter._schedule_long_running_notice(event, "long-running-lease")
-        await asyncio.sleep(0)
-        assert len(calls) == 1
-        assert calls[0]["params"]["message"][1]["data"]["text"] == (
-            "仍在处理中，请稍候…"
-        )
+        await asyncio.sleep(0.08)
+        sent_texts = [
+            segment.get("data", {}).get("text", "")
+            for call in calls
+            for segment in call["params"].get("message", [])
+            if segment.get("type") == "text"
+        ]
+        assert len(sent_texts) == 3
+        assert all("后台任务已运行约" in text for text in sent_texts)
         assert adapter._outbound_started == set()
         assert adapter.SUPPORTS_MESSAGE_EDITING is False
         assert adapter.format_tool_event({"kind": "tool"}) is None
     finally:
         adapter._bindings.clear()
         await adapter.disconnect()
+async def test_中间正文重置不突破长任务提示上限(monkeypatch, fake_http_server):
+    """达到三条提示后，中间正文重置计时器不能重新排程。"""
+    base, _calls = fake_http_server
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API=base,
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_LONG_RUNNING_NOTICE_SECONDS="0.01",
+    )
+    await adapter.connect()
+    adapter._chat_types["888"] = "group"
+    adapter._targets["888"] = adapter_module.ChatTarget("group", "888")
+    adapter._dispatcher._active["888"] = SimpleNamespace(
+        lease=SimpleNamespace(lease_id="reset-cap-lease")
+    )
+    adapter._long_running_notice_counts["reset-cap-lease"] = 3
+    adapter._long_running_notice_events["reset-cap-lease"] = SimpleNamespace(metadata={})
+    pending_task = asyncio.create_task(asyncio.sleep(60))
+    adapter._long_running_notice_tasks["reset-cap-lease"] = pending_task
+    try:
+        adapter._reset_long_running_notice("888")
+        await asyncio.sleep(0)
+        assert pending_task.done()
+        assert "reset-cap-lease" not in adapter._long_running_notice_tasks
+        assert adapter._long_running_notice_counts["reset-cap-lease"] == 3
+    finally:
+        adapter._dispatcher._active.pop("888", None)
+        await adapter.disconnect()
+
 
 
 async def test_中间正文发送后重置长时间提示计时器(monkeypatch, fake_http_server):
@@ -5037,6 +5536,217 @@ async def test_直接handle_message仍执行访问策略(monkeypatch):
     await adapter.handle_message(event)
     assert called is False
     await adapter.disconnect()
+async def test_内部completion绕过普通群触发直接创建恢复trigger(monkeypatch):
+    """Hermes 异步 completion 不能因没有 @ 机器人而永久停在 pending。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    notifications: list[str] = []
+
+    async def fake_notify(chat_id: str) -> bool:
+        notifications.append(str(chat_id))
+        return True
+
+    monkeypatch.setattr(adapter._dispatcher, "notify", fake_notify)
+    event = MessageEvent(
+        text="[ASYNC DELEGATION BATCH COMPLETE — deleg_test]\\n截图任务结果",
+        message_type="text",
+        source=adapter.build_source(
+            chat_id="888",
+            chat_name="888",
+            chat_type="group",
+            user_id="123",
+            user_name="小明",
+            role_authorized=True,
+        ),
+        internal=True,
+        metadata={"gateway_session_id": "session-parent"},
+    )
+    await adapter.handle_message(event)
+
+    status = adapter._queue.status("888")
+    assert status["pending"] == 1
+    assert status["pending_trigger_requests"] == 1
+    assert notifications == ["888"]
+    trigger = adapter._queue.recover_trigger_requests({"888"})[0]
+    assert trigger.reason == "completion_recovery"
+    assert trigger.anchor_kind == "recovery"
+    await adapter.disconnect()
+
+
+async def test_重启为已入队内部completion补建trigger(monkeypatch, tmp_path):
+    """旧 Hermes 已把 completion 入队但进程重启时仍必须自动唤醒。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_QUEUE_DB=str(tmp_path / "queue.sqlite3"),
+    )
+    message = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="",
+        user_id="123",
+        user_name="小明",
+        text="[ASYNC DELEGATION COMPLETE — deleg_old]\\n未完成截图",
+        metadata={"gateway_session_id": "session-parent", "onebot11_images": []},
+        message_key="hash:old-completion",
+    )
+    adapter._queue.enqueue(message)
+    notifications: list[str] = []
+
+    async def fake_notify(chat_id: str) -> bool:
+        notifications.append(str(chat_id))
+        return True
+
+    monkeypatch.setattr(adapter._dispatcher, "notify", fake_notify)
+    await adapter._recover_internal_completion_triggers()
+
+    status = adapter._queue.status("888")
+    assert status["pending"] == 1
+    assert status["pending_trigger_requests"] == 1
+    assert notifications == ["888"]
+    trigger = adapter._queue.recover_trigger_requests({"888"})[0]
+    assert trigger.reason == "completion_recovery"
+    await adapter.disconnect()
+
+async def test_内部completion不提升原用户权限且重复事件只保留一个trigger(monkeypatch):
+    """内部回流只能使用原消息快照，重复投递不得制造第二个 anchor。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_SUPER_ADMINS="999",
+    )
+    notifications: list[str] = []
+
+    async def fake_notify(chat_id: str) -> bool:
+        notifications.append(str(chat_id))
+        return True
+
+    monkeypatch.setattr(adapter._dispatcher, "notify", fake_notify)
+    source = adapter.build_source(
+        chat_id="888",
+        chat_name="888",
+        chat_type="group",
+        user_id="123",
+        user_name="普通用户",
+        role_authorized=True,
+    )
+    metadata = {
+        "gateway_session_id": "session-parent",
+        "onebot11_authority": {
+            "role": "super_admin",
+            "allowed_tools": sorted(adapter.role_tools["super_admin"]),
+            "self_id": "1",
+        },
+    }
+    for _ in range(2):
+        await adapter.handle_message(
+            MessageEvent(
+                text="[ASYNC DELEGATION COMPLETE — deleg_duplicate]\\n结果",
+                message_type="text",
+                source=source,
+                internal=True,
+                metadata=dict(metadata),
+            )
+        )
+
+    status = adapter._queue.status("888")
+    assert status["pending"] == 1
+    assert status["pending_trigger_requests"] == 1
+    assert notifications == ["888", "888"]
+    trigger = adapter._queue.recover_trigger_requests({"888"})[0]
+    assert trigger.authority_role == "user"
+    assert trigger.authority_tools == frozenset()
+    await adapter.disconnect()
+async def test_缺失completion权限快照仍以最小权限恢复(monkeypatch, tmp_path):
+    """重启恢复的 completion 不得从当前超级管理员身份继承工具。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_SUPER_ADMINS="123",
+        ONEBOT11_QUEUE_DB=str(tmp_path / "queue.sqlite3"),
+    )
+    adapter._queue.enqueue(
+        QueueMessage(
+            chat_id="888",
+            chat_type="group",
+            message_id="",
+            user_id="123",
+            user_name="管理员",
+            text="[ASYNC DELEGATION COMPLETE — deleg_missing]\\n结果",
+            metadata={"gateway_session_id": "session-parent"},
+            message_key="hash:missing-authority-completion",
+        )
+    )
+    notifications: list[str] = []
+
+    async def fake_notify(chat_id: str) -> bool:
+        notifications.append(str(chat_id))
+        return True
+
+    monkeypatch.setattr(adapter._dispatcher, "notify", fake_notify)
+    await adapter._recover_internal_completion_triggers()
+    trigger = adapter._queue.recover_trigger_requests({"888"})[0]
+    assert trigger.authority_role == "user"
+    assert trigger.authority_tools == frozenset()
+    assert notifications == ["888"]
+    await adapter.disconnect()
+async def test_legacy_completion恢复turn跳过用户authority比对(monkeypatch, tmp_path):
+    """旧 Hermes completion 缺少标记时仍只按受限 recovery anchor 执行。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+        ONEBOT11_QUEUE_DB=str(tmp_path / "queue.sqlite3"),
+    )
+    adapter._processing_reaction_enabled = False
+    adapter.show_interim_group = False
+    message = QueueMessage(
+        chat_id="888",
+        chat_type="group",
+        message_id="",
+        user_id="123",
+        user_name="普通用户",
+        text="[ASYNC DELEGATION COMPLETE — deleg_legacy]\\n结果",
+        metadata={"gateway_session_id": "session-parent", "onebot11_images": []},
+        message_key="hash:legacy-completion",
+    )
+    adapter._queue.enqueue(
+        message,
+        adapter_module.TriggerRequest.create(
+            "888",
+            message.message_key,
+            "completion_recovery",
+            "123",
+            "普通用户",
+            anchor_kind="recovery",
+            authority_role="user",
+            authority_tools=(),
+            authority_self_id="1",
+        ),
+    )
+    captured: list[object] = []
+
+    async def capture_handle(_adapter, event) -> None:
+        captured.append(event)
+
+    monkeypatch.setattr(BasePlatformAdapter, "handle_message", capture_handle)
+    lease = adapter._queue.claim("888")
+    assert lease is not None
+    try:
+        await adapter._start_queue_turn(lease)
+        assert captured
+        assert captured[0].metadata["onebot11_caller_context"]["role"] == "user"
+        assert captured[0].metadata["onebot11_caller_context"]["allowed_tools"] == []
+    finally:
+        adapter._queue.release(lease, reason="test cleanup")
+        await adapter.disconnect()
+
 
 
 async def test_未开始OneBot请求的turn成功也release(monkeypatch):
@@ -5364,8 +6074,8 @@ async def test_群聊中间正文可配置为展示(monkeypatch, fake_http_serve
         await adapter.disconnect()
 
 
-async def test_队列turn在Hermes启动前发送即时确认(monkeypatch, fake_http_server):
-    """客服群 turn 必须先收到适配器确认，再进入 Hermes 工具/模型循环。"""
+async def test_队列turn在Hermes启动前不发送自动确认(monkeypatch, fake_http_server):
+    """客服群 turn 不应由适配器额外发送泛化收到回执。"""
     base, calls = fake_http_server
     adapter = _make_adapter(
         monkeypatch,
@@ -5410,19 +6120,14 @@ async def test_队列turn在Hermes启动前发送即时确认(monkeypatch, fake_
     observed: list[str] = []
 
     async def capture_handle(_adapter, _event) -> None:
-        assert calls, "Hermes handoff 前必须已经完成即时回执"
-        assert "收到" not in _event.text
+        assert calls == []
         observed.append("hermes")
 
     monkeypatch.setattr(BasePlatformAdapter, "handle_message", capture_handle)
     try:
         await adapter._start_queue_turn(lease)
         assert observed == ["hermes"]
-        assert calls
-        assert calls[0]["path"] == "/send_group_msg"
-        first_message = calls[0]["params"]["message"]
-        assert first_message[0]["type"] == "reply"
-        assert "收到" in first_message[1]["data"]["text"]
+        assert calls == []
     finally:
         await adapter.disconnect()
 
@@ -5874,6 +6579,26 @@ async def test_delegated_child只允许项目工具且拒绝QQ(monkeypatch):
                 turn_id="child-turn",
                 args={"command": "rg -n TODO ."},
             ) is None
+            blocked_media = adapter_module._pre_tool_call_hook(
+                tool_name="terminal",
+                session_id="child-session",
+                turn_id="child-turn",
+                args={"command": "cp /tmp/settings-desktop.png /opt/data/cache/images/settings-desktop.png"},
+            )
+            assert blocked_media == {
+                "action": "block",
+                "message": "权限错误: 媒体文件必须由项目 repository-research adapter 生成并复制；子代理不能用 terminal 或 file 工具手工写入 Hermes 媒体根",
+            }
+            blocked_file = adapter_module._pre_tool_call_hook(
+                tool_name="write_file",
+                session_id="child-session",
+                turn_id="child-turn",
+                args={"path": "/opt/data/cache/images/settings-mobile.png", "content": "not-a-png"},
+            )
+            assert blocked_file == {
+                "action": "block",
+                "message": "权限错误: 媒体文件必须由项目 repository-research adapter 生成并复制；子代理不能用 terminal 或 file 工具手工写入 Hermes 媒体根",
+            }
             blocked = adapter_module._pre_tool_call_hook(
                 tool_name="qq_get_message",
                 session_id="child-session",
@@ -6549,6 +7274,7 @@ def test_register注册平台与工具():
             self.platform_kwargs = None
             self.tools: list[dict] = []
             self.hooks: dict[str, object] = {}
+            self.skills: list[tuple[str, object, str]] = []
 
         def register_platform(self, **kwargs):
             self.platform_kwargs = kwargs
@@ -6559,7 +7285,23 @@ def test_register注册平台与工具():
         def register_hook(self, name, callback):
             self.hooks[name] = callback
 
+        def register_skill(self, name, path, description):
+            self.skills.append((name, path, description))
+
     ctx = FakeCtx()
+    register(ctx)
+    assert len(ctx.skills) == 1
+    name, skill_path, description = ctx.skills[0]
+    assert name == "repository-research"
+    assert skill_path.exists()
+    text = skill_path.read_text(encoding="utf-8")
+    assert "name: repository-research" in text
+    assert "ONEBOT11_" not in text
+    assert "qq_" not in text
+    assert "NeuroBook" not in text
+    assert description
+
+    assert ctx.platform_kwargs is not None
     register(ctx)
     assert ctx.platform_kwargs["name"] == "onebot11"
     assert ctx.platform_kwargs["cron_deliver_env_var"] == "ONEBOT11_HOME_CHANNEL"
@@ -6758,3 +7500,43 @@ async def test_selector_queued_reaction_移除失败重试一次(monkeypatch):
         assert "888" not in adapter._queued_reaction_message_ids
     finally:
         await adapter.disconnect()
+
+
+def test_工具进度输出中文且脱敏(monkeypatch):
+    """结构化工具事件只展示安全摘要，不泄露命令、路径或凭据。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    event = ToolCallChunk(
+        tool_name="terminal",
+        preview="cat /srv/neuro-book/.env API_KEY=sk-live-very-secret-value",
+        args={
+            "command": "cat /srv/neuro-book/.env API_KEY=sk-live-very-secret-value",
+        },
+    )
+    rendered = adapter.format_tool_event(event, mode="all", preview_max_len=80)
+    assert rendered is not None
+    assert rendered.startswith("正在执行")
+    assert "/srv/neuro-book" not in rendered
+    assert "sk-live-very-secret-value" not in rendered
+    assert ".env" not in rendered
+    asyncio.run(adapter.disconnect())
+
+
+def test_工具进度连续相同内容去重(monkeypatch):
+    """相同工具摘要连续到达时只保留一次展示。"""
+    adapter = _make_adapter(
+        monkeypatch,
+        ONEBOT11_HTTP_API="http://127.0.0.1:3000",
+        ONEBOT11_SELF_ID="1",
+    )
+    event = ToolCallChunk(
+        tool_name="read_file",
+        preview="README.md",
+        args={"path": "README.md"},
+    )
+    assert adapter.format_tool_event(event) is not None
+    assert adapter.format_tool_event(event) is None
+    asyncio.run(adapter.disconnect())

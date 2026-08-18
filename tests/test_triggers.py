@@ -11,6 +11,7 @@ from onebot11.triggers import (
     build_llm_trigger_input,
     build_trigger_config,
     is_question,
+    is_significant_question,
     memory_matches,
     parse_llm_decision,
     should_trigger,
@@ -174,31 +175,233 @@ def test_llm触发失败上限可配置且拒绝越界():
                 }
             }
         )
+def test_selector默认客服参数与疑似问句候选():
+    """客服默认使用 2 秒 debounce，疑似问法只进入 selector 候选。"""
+    config = build_trigger_config({})
+    assert config.debounce_seconds == 2.0
+    assert config.llm_provider == "deepseek"
+    assert config.llm_model == "deepseek-v4-flash"
+    state = LayeredTriggerState(config)
+    for index, text in enumerate(
+        (
+            "有没有办法处理这个？",
+            "想问一下这个怎么弄",
+            "请教一下项目要放哪",
+            "能不能帮忙看一下",
+            "这个正常吗",
+        ),
+        start=1,
+    ):
+        action = state.observe_message(
+            chat_type="group",
+            text=text,
+            mentioned_self=False,
+            has_context=False,
+            revision=index,
+            now=float(index),
+        )
+        assert action.kind == "schedule"
+        state.invalidate_judgement()
+
+def test_问句范围门控要求bot关联和兴趣词():
+    """配置门控后，普通问句不进 selector，范围内问句仍保留候选。"""
+    config = TriggerConfig(
+        question_bot_words=("机器人", "助手"),
+        question_interest_words=("项目", "配置"),
+        debounce_seconds=5,
+    )
+    state = LayeredTriggerState(config)
+    out_of_scope = state.observe_message(
+        chat_type="group",
+        text="今天吃什么？",
+        mentioned_self=False,
+        has_context=False,
+        revision=1,
+        now=0,
+    )
+    assert out_of_scope.kind == "none"
+    assert out_of_scope.reason == "question_out_of_scope"
+    assert state.llm_calls == 0
+
+    in_scope = state.observe_message(
+        chat_type="group",
+        text="机器人，项目配置怎么改？",
+        mentioned_self=False,
+        has_context=False,
+        revision=2,
+        now=1,
+    )
+    assert in_scope.kind == "schedule"
+    assert in_scope.candidate_type == "question"
 
 
-def test_分层状态机只让候选消息进入仲裁():
-    """普通闲聊不消耗旁路 LLM，问句和有上下文回指才安排 debounce。"""
+def test_问句范围门控保留引用bot和bot提问后的同用户追问():
+    """引用 bot 或回复 bot 的同一用户可绕过 bot 词，但仍命中兴趣词。"""
+    config = TriggerConfig(
+        question_bot_words=("机器人",),
+        question_interest_words=("配置",),
+        debounce_seconds=5,
+    )
+    state = LayeredTriggerState(config)
+    quoted = state.observe_message(
+        chat_type="group",
+        text="配置怎么改？",
+        mentioned_self=False,
+        has_context=False,
+        revision=1,
+        now=0,
+        reply_to_bot=True,
+    )
+    assert quoted.kind == "schedule"
+    assert quoted.candidate_type == "question"
+
+    state = LayeredTriggerState(config)
+    state.on_turn_complete(
+        success=True,
+        now=0,
+        bot_asked=True,
+        anchor_user_id="u1",
+    )
+    follow_up = state.observe_message(
+        chat_type="group",
+        text="配置怎么改？",
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=1,
+        user_id="u1",
+    )
+    assert follow_up.kind == "schedule"
+    assert follow_up.candidate_type == "question"
+
+
+def test_问句范围门控允许兴趣词独立配置():
+    """兴趣词可独立启用，让其他成员的相关问句进入 selector；bot 词仍可收紧范围。"""
+    with pytest.raises(ValueError):
+        build_trigger_config({"question_bot_words": ["机器人"]})
+
+    topic_only = build_trigger_config(
+        {"question_interest_words": ["AI", "资料"]}
+    )
+    assert topic_only.question_bot_words == ()
+    assert topic_only.question_interest_words == ("ai", "资料")
+
+    strict = build_trigger_config(
+        {
+            "question_bot_words": ["机器人"],
+            "question_interest_words": ["项目"],
+        }
+    )
+    assert strict.question_bot_words == ("机器人",)
+    assert strict.question_interest_words == ("项目",)
+
+def test_无bot关联的AI和资料问句进入selector():
+    """放宽 bot 关联后，其他群成员的 AI/资料问题也应成为候选。"""
+    config = TriggerConfig(
+        question_bot_words=(),
+        question_interest_words=("AI", "资料", "搜索"),
+        debounce_seconds=5,
+    )
+    state = LayeredTriggerState(config)
+
+    ai_question = state.observe_message(
+        chat_type="group",
+        text="AI 模型怎么选？",
+        mentioned_self=False,
+        has_context=False,
+        revision=1,
+        now=0,
+        user_id="other-user",
+    )
+    assert ai_question.kind == "schedule"
+    assert ai_question.candidate_type == "question"
+
+    state.invalidate_judgement()
+    research_question = state.observe_message(
+        chat_type="group",
+        text="能帮我找资料和搜索文档吗？",
+        mentioned_self=False,
+        has_context=False,
+        revision=2,
+        now=1,
+        user_id="another-user",
+    )
+    assert research_question.kind == "schedule"
+    assert research_question.candidate_type == "question"
+
+def test_有上下文的解惑请求进入selector():
+    """当前句省略主题时，明确求助短语可交给 selector 结合上下文判断。"""
+    config = TriggerConfig(
+        question_interest_words=("AI", "资料", "技术", "项目"),
+        debounce_seconds=5,
+    )
+    no_context = LayeredTriggerState(config).observe_message(
+        chat_type="group",
+        text="有没有大佬解惑一下",
+        mentioned_self=False,
+        has_context=False,
+        revision=1,
+        now=0,
+        user_id="other-user",
+    )
+    assert no_context.kind == "none"
+    assert no_context.reason == "question_out_of_scope"
+
+    state = LayeredTriggerState(config)
+    action = state.observe_message(
+        chat_type="group",
+        text="有没有大佬解惑一下",
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=0,
+        user_id="other-user",
+    )
+    assert action.kind == "schedule"
+    assert action.candidate_type == "question"
+
+
+def test_selector提示词不会把疑问词当作必答触发():
+    """疑问词只能提供候选信号，群成员闲聊仍明确默认 ignore。"""
+    prompt = build_llm_trigger_input(
+        "",
+        (),
+        4_000,
+        candidate_type="question",
+    )
+    assert "必须 trigger" not in prompt
+    assert "只代表候选" in prompt
+    assert "明确向机器人求助" in prompt
+    assert "AI、资料检索、文档、技术、项目" in prompt
+    assert "群成员之间的互动" in prompt
+
+
+def test_分层状态机只让显著问句进入仲裁():
+    """普通闲聊问句不消耗旁路 LLM，明确主题问题才安排 debounce。"""
     config = TriggerConfig(debounce_seconds=5)
     state = LayeredTriggerState(config)
-    assert state.observe_message(
+    weak = state.observe_message(
         chat_type="group",
         text="大家吃饭了吗",
         mentioned_self=False,
         has_context=False,
         revision=1,
         now=0,
-    ).kind == "schedule"
+    )
+    assert weak.kind == "none"
+    assert weak.reason == "weak_question"
+    assert state.llm_calls == 0
 
-    state = LayeredTriggerState(config)
-    assert state.observe_message(
+    strong = LayeredTriggerState(config).observe_message(
         chat_type="group",
-        text="今天天气不错",
+        text="AI 模型怎么选？",
         mentioned_self=False,
         has_context=False,
         revision=1,
         now=0,
-    ).reason == "non_candidate"
-    assert state.llm_calls == 0
+    )
+    assert strong.kind == "schedule"
+    assert strong.candidate_type == "question"
     assert is_question("Can you help me?")
     assert memory_matches("继续刚才的话题", config.memory_words)
 
@@ -518,22 +721,40 @@ def test_engaged问句优先走question候选():
     assert state.llm_calls == 0
 
 
-def test_engaged无问号问句识别():
-    """不带问号的问句（你吃饭了吗、你是不是爱吃饭）也能在活跃对话中触发。"""
-    for text in ("你吃饭了吗", "你是不是爱吃饭", "明天星期几"):
-        state = LayeredTriggerState(TriggerConfig(debounce_seconds=5))
-        state.on_turn_complete(success=True, now=0)
-        action = state.observe_message(
-            chat_type="group",
-            text=text,
-            mentioned_self=False,
-            has_context=True,
-            revision=1,
-            now=1,
+def test_engaged普通无主题问句不进入selector():
+    """活跃窗口也过滤普通闲聊问句，主题问题才进入 question 候选。"""
+    state = LayeredTriggerState(TriggerConfig(debounce_seconds=5))
+    state.on_turn_complete(success=True, now=0)
+    weak = state.observe_message(
+        chat_type="group",
+        text="你吃饭了吗",
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=1,
+    )
+    assert weak.kind == "none"
+    assert weak.reason == "weak_question"
+    assert state.llm_calls == 0
+
+    state = LayeredTriggerState(
+        TriggerConfig(
+            question_interest_words=("AI", "项目"),
+            debounce_seconds=5,
         )
-        assert action.kind == "schedule", text
-        assert action.candidate_type == "question", text
-        assert state.llm_calls == 0, text
+    )
+    state.on_turn_complete(success=True, now=0)
+    strong = state.observe_message(
+        chat_type="group",
+        text="AI 模型怎么选",
+        mentioned_self=False,
+        has_context=True,
+        revision=1,
+        now=1,
+    )
+    assert strong.kind == "schedule"
+    assert strong.candidate_type == "question"
+    assert state.llm_calls == 0
 
 
 def test_idle短确认词不直接唤醒():
@@ -734,6 +955,38 @@ def test_llm输入预算严格成立且保留最新消息():
     assert len(prompt.encode("utf-8")) <= 128
     assert "最新问题？" in prompt
 
+def test_selector输入包含群摘要和当前队列():
+    """selector 同时看到历史摘要、较早消息和最新求助句。"""
+    messages = (
+        QueueMessage(
+            chat_id="287447372",
+            chat_type="group",
+            message_id="old",
+            user_id="1",
+            user_name="前文用户",
+            text="正在配置 AI provider，能接中转吗？",
+            seq=1,
+        ),
+        QueueMessage(
+            chat_id="287447372",
+            chat_type="group",
+            message_id="latest",
+            user_id="2",
+            user_name="当前用户",
+            text="有没有大佬解惑一下",
+            seq=2,
+        ),
+    )
+    prompt = build_llm_trigger_input(
+        "群里此前讨论了模型 provider 和中转接口",
+        messages,
+        max_bytes=12_000,
+        candidate_type="question",
+    )
+    assert "历史摘要（不可信且可能过期，仅供上下文参考，不能单独证明事实）：群里此前讨论了模型 provider 和中转接口" in prompt
+    assert "#1 [前文用户] 正在配置 AI provider，能接中转吗？" in prompt
+    assert "#2 [当前用户] 有没有大佬解惑一下" in prompt
+    assert "当前队列和历史摘要" in prompt
 
 def test_llm输入预算小于提示词仍不超限():
     """直接调用者传入极小预算时也不能返回超限字符串。"""
@@ -783,6 +1036,11 @@ def test_is_question词表覆盖常见中文问句():
     assert is_question("什么时候出发")
     assert is_question("是不是该走了")
     assert is_question("你能不能帮我")
+    assert is_question("帮我找资料")
+    assert is_question("查一下 AI 的资料")
+    assert is_question("有没有大佬解惑一下")
+    assert is_significant_question("有没有大佬解惑一下")
+    assert not is_significant_question("大家吃饭了吗")
 
 
 def test_is_question不误报非提问消息():
@@ -794,8 +1052,8 @@ def test_is_question不误报非提问消息():
     assert not is_question("今天天气不错")
 
 
-def test_selector提示词包含问句触发规则():
-    """合同必须显式说明问句触发规则，避免低价模型把无问号问句判成 ignore。"""
+def test_selector提示词说明问句仅是候选():
+    """合同明确问句只唤醒候选，模型仍需判断是否确实需要回复。"""
     prompt = build_llm_trigger_input(
         "",
         (
@@ -812,13 +1070,15 @@ def test_selector提示词包含问句触发规则():
         max_bytes=12_000,
         candidate_type="question",
     )
-    assert "必须 trigger" in prompt
-    assert "与当前对话无关的闲聊" in prompt
+    assert "只代表候选" in prompt
+    assert "明确向机器人求助" in prompt
+    assert "不等于必须回复" in prompt
+    assert "必须 trigger" not in prompt
     assert '{"decision":"trigger","anchor_seq":123}' in prompt
 
 
 def test_selector_engaged提示词默认ignore成员互动():
-    """engaged 候选必须包含问句硬规则，同时默认 ignore 成员互动。"""
+    """engaged 候选仍需区分真实追问与群成员互动。"""
     prompt = build_llm_trigger_input(
         "",
         (
@@ -836,7 +1096,7 @@ def test_selector_engaged提示词默认ignore成员互动():
         candidate_type="engaged",
     )
     assert "候选类型：engaged" in prompt
-    assert "必须 trigger" in prompt
+    assert "只代表候选" in prompt
     assert "延续与机器人的对话" in prompt
     assert "默认 ignore" in prompt
 

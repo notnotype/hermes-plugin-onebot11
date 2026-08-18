@@ -26,6 +26,8 @@ def test摘要作为临时提示而不是批次正文():
     )
     assert parts.summary_prompt is not None
     assert "之前讨论过权限边界" in parts.summary_prompt
+    assert "不可信且可能过期" in parts.summary_prompt
+    assert "具体事实必须以当前队列消息" in parts.summary_prompt
     assert "之前讨论过权限边界" not in parts.batch_text
     assert "请继续" in parts.batch_text
     assert "message_id=1" in parts.batch_text

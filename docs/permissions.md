@@ -18,7 +18,7 @@
 
 群消息即使没有 @、关键词或 `always` trigger，也会先写入 SQLite 队列；这保证触发时能拿到上次触发以来的上下文。没有 trigger 不会启动 Agent turn。
 
-群 turn 认领后，若开启 `show_interim_group`，插件会先发送一次不进入 Hermes transcript 的中文收到回执，再使用 LLBot 的 `set_msg_emoji_like` 扩展给触发消息添加 `emoji_id=128172`（💬，表示正在回复这一条，可通过 `processing_reaction_emoji_id` 配置），Hermes turn 收尾时发送 `set=false` 移除。问句/记忆候选进入旁路 selector 判断时，先给候选消息添加 `emoji_id=128064`（👀，表示 bot 正在看这条消息），判断结束（触发、忽略、超时或 wait 到期）后移除。两个指示器都只作用于当前群的真实消息 ID；内部 hash、私聊消息或 lease 已失效时跳过。reaction 是 best-effort UI 提示，失败或结果未知不会阻断 Agent 回复、队列 ack，也不会重放 `set=true`。清理记录持久化在队列 SQLite 中，启动恢复最多有限次数地尝试 `unset`；达到上限后只在状态/审计中保留，不会无限刷屏。进程硬崩溃遗留的远端 💬/👀 不纳入清理承诺。emoji ID 说明：`9203`（⏳）与 `8971` 在 QQ reaction API 上显示异常，因此回复阶段默认使用实测可用的 `128172`（💬）。
+群 turn 认领后，适配器不会发送泛化的中文收到回执；若开启 `show_interim_group`，Hermes 自己产生的中间正文仍按群聊显示策略发送。长任务超过 `long_running_notice_seconds` 后，适配器最多发送三次有界状态提示，完成、取消、lease 失效或发送失败即停止；提示不进入 Hermes transcript，也不标记业务 `outbound_started`。随后使用 LLBot 的 `set_msg_emoji_like` 扩展给触发消息添加 `emoji_id=128172`（💬，表示正在回复这一条，可通过 `processing_reaction_emoji_id` 配置），Hermes turn 收尾时发送 `set=false` 移除。问句/记忆候选进入旁路 selector 判断时，先给候选消息添加 `emoji_id=128064`（👀，表示 bot 正在看这条消息），判断结束（触发、忽略、超时或 wait 到期）后移除。两个指示器都只作用于当前群的真实消息 ID；内部 hash、私聊消息或 lease 已失效时跳过。reaction 是 best-effort UI 提示，失败或结果未知不会阻断 Agent 回复、队列 ack，也不会重放 `set=true`。清理记录持久化在队列 SQLite 中，启动恢复最多有限次数地尝试 `unset`；达到上限后只在状态/审计中保留，不会无限刷屏。进程硬崩溃遗留的远端 💬/👀 不纳入清理承诺。emoji ID 说明：`9203`（⏳）与 `8971` 在 QQ reaction API 上显示异常，因此回复阶段默认使用实测可用的 `128172`（💬）。
 
 ## 角色与工具
 
@@ -81,6 +81,16 @@ send_message、cronjob 或再次委派。`trusted_user` 或 `user` 要开放 gen
 `read_file` 用于读取文件。只有实际修改、运行测试或执行 shell 工作才交给
 `delegate_task` 子代理。
 
+## 客服响应 SOP
+
+客服请求先分流为：纯功能解释、复用已有客服 evidence、需要新的问题调查或运行证据。先读取已有 evidence、项目文档和 Skill；它们都是待核对资料，可能过期、错误或与当前实现不一致，不能直接当作真相。已有结论只有经过当前版本核对后才能复用，不把旧结论改写成已验证事实。
+来源按可信度分层：当前 checkout 的代码和明确版本化规范是代码事实；本次运行的实际输出、审计、队列、日志和 manifest 是运行证据；用户提供的资料需要与当前代码或运行证据核对；历史文档、旧验收记录和无版本静态说明只能作为线索。文档与当前代码或运行证据冲突时，以当前代码或运行证据为准并说明差异；同级来源冲突且无法核实时不猜测，写明未知或未验证。
+凡结论无法由当前只读证据直接证实，涉及版本/commit、运行行为、外部系统、用户产物或来源冲突时，先发简短中文进度，再默认 delegate_task 给 child 独立求证。child 必须返回来源、版本/commit、验证方式和实际结果；失败或证据不足时只能报告未验证。
+同批次与当前产品问题无关的闲聊、价格、token 费用或图片话题静默忽略，不逐条回应。
+若结论依赖 NeuroBook 版本、commit、构建号或 provider 实现，而当前消息和已有 evidence 没有精确版本标识，必须先询问版本/构建号并暂停调研、网页搜索、adapter 启动和后台委派；版本补齐后再把它纳入验证证据。
+归档是按需的内部证据动作。需要新记录时，主 agent 只读不能直接写文件，必须委派 child 实际写入 `HERMES_HOME/evidence` 或规定的 documentation 路径，并重新读取或 stat 证明落盘；没有写入和复读证明，不得声称已归档。归档若被复用，记录 source_tier、验证方式和版本/commit 标识。用户可见回复只保留当前问题的结论、必要证据和下一步，不展示内部 triage、无关闲聊筛选、归档决策、权限快照或中间推理。
+## 只读与媒体交付
+
 只读不限制 QQ 群管理写工具：撤回、禁言、踢人、全员禁言仍由 super_admin + 当前群 +
 `/onebot confirm` 确认令牌把关。主 agent 的 `read_file` 不能读取 `.env`、
 `auth.json`、`auth.lock` 等凭据文件，避免密钥进入模型上下文；
@@ -101,9 +111,8 @@ send_message、cronjob 或再次委派。`trusted_user` 或 `user` 要开放 gen
 
 Hermes 在 ReAct 过程中产生的 AI 中间评论（commentary）、工具进度和状态提示会直调 adapter 的
 `send()`；OneBot 插件用 `_send_with_retry`（最终回复）与直调 `send()`（中间消息）区分二者。
-默认私聊展示中间正文；群聊默认隐藏（避免刷屏），但可设置 `show_interim_group: true`
-开启（长任务如"生成一张图片"时能实时看到进度）。`show_interim_group` / `show_interim_dm`
-配置热更新生效。最终回复始终发送，不受该配置影响；
+生产群建议保持 `show_interim_group: false`，避免把内部进度和工具过程刷到群里；需要实时进度时才显式开启。
+默认私聊展示中间正文；`show_interim_group` / `show_interim_dm` 配置热更新生效。最终回复始终发送，不受该配置影响；
 Hermes cron 或系统通知若直发到群，也会按群聊中间正文规则处理，请按需配置。
 
 ## 运行时 reload
@@ -114,7 +123,7 @@ configuration loader 读取已经合并过的 `platforms.onebot11.extra`，再�
 所以如果某个白名单字段由环境变量提供，YAML reload 不能覆盖它。
 
 可热更新：`allowed_groups`、DM 白名单/策略、`super_admins`、`trusted_users`、
-`roles.*.tools`、关键词/always/LLM trigger、cooldown、reaction、一次性长时间提示延迟
+`roles.*.tools`、关键词/always/LLM trigger、cooldown、reaction、最多三次长任务提示的延迟
 和纯文本显示配置。
 不可热更新：HTTP/WS 地址、token、self_id、队列数据库路径、session 模式以及其它
 连接/协议边界；这些变化会返回“需要重启”并保留旧 snapshot。解析失败也保留旧
@@ -190,7 +199,7 @@ cron 和 standalone sender 的 plugin media 不在本轮可靠性合同内。
 群消息的触发顺序是“硬触发优先，候选消息再仲裁”：
 
 - @、关键词、`always` 和管理员命令直接创建持久 trigger，不调用 LLM。
-- 空闲状态只把问句或带有“之前/上次/刚才/继续”等回指词、且当前群已有摘要或最近原文的消息送入候选。
+- 空闲状态先用本地显著性门槛筛选：问号、明确求助/检索短语，或“主题词 + 强疑问词”才进入候选；普通闲聊问句（如“大家吃饭了吗”）直接静默，不调用 LLM。像“有没有大佬解惑一下”“求解”这类省略主题的求助句，只有存在同群摘要或同批上下文时才交给 selector，并要求模型结合前文判断。显著问句再由 `question_interest_words` 限定 AI、人工智能、大模型、资料、搜索、研究、论文、文档、技术、代码、编程、项目等主题。`question_bot_words` 非空时再要求问句命中 bot 词、引用 bot 或 bot 刚向同一用户提问；为空则允许其他群成员的相关问句进入 selector。只配置 bot 词而没有兴趣词直接拒绝配置，两组都为空时保持兼容行为。`is_question` 的宽松识别只供内部 bot 问句状态使用，不等于会调用 LLM。@、显式关键词等硬触发不受此门控影响。
 - 候选消息使用 5 秒 trailing debounce；每群最多一个判断任务，冷却期间不创建判断。
 - 旁路模型必须显式配置 provider、model 和群 allowlist。判断由插件自有 Node/pi-ai helper 发起，不经过 Hermes auxiliary，不调用主 Agent 作为隐式 fallback，也不主动切换 provider。`api_key_env` 只保存环境变量名，密钥值只从进程环境读取。
 - 启用旁路判断需要 Node.js ≥22.19 和插件目录中的 `npm ci --omit=dev`；Node、依赖、provider/model、超时或模型结果异常时按 `ignore`，消息保留在 pending。

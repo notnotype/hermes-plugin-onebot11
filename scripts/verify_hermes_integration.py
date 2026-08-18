@@ -91,6 +91,7 @@ class _RegistrationContext:
         self.platforms: list[dict] = []
         self.tools: list[dict] = []
         self.hooks: list[tuple[str, object]] = []
+        self.skills: list[tuple[str, Path, str]] = []
 
     def register_platform(self, **kwargs: object) -> None:
         """记录平台注册参数。"""
@@ -103,6 +104,10 @@ class _RegistrationContext:
     def register_hook(self, name: str, callback: object) -> None:
         """记录 hook 注册参数。"""
         self.hooks.append((name, callback))
+
+    def register_skill(self, name: str, path: Path, description: str) -> None:
+        """记录插件 Skill 注册参数。"""
+        self.skills.append((name, path, description))
 
 
 async def _smoke(
@@ -139,6 +144,32 @@ async def _smoke(
         raise AssertionError(f"hook 注册数量错误: {len(context.hooks)}")
     if "on_session_reset" not in {name for name, _callback in context.hooks}:
         raise AssertionError("缺少 on_session_reset hook")
+    if len(context.skills) != 1:
+        raise AssertionError(f"插件 Skill 注册数量错误: {len(context.skills)}")
+    skill_name, skill_path, skill_description = context.skills[0]
+    if skill_name != "repository-research" or not skill_path.is_file():
+        raise AssertionError("repository-research Skill 未注册或路径不存在")
+    skill_text = skill_path.read_text(encoding="utf-8")
+    if "name: repository-research" not in skill_text or not skill_description:
+        raise AssertionError("repository-research Skill frontmatter 或描述无效")
+    if "manifest.evidence.mediaFiles" not in skill_text or "manifest.evidence.files" not in skill_text:
+        raise AssertionError("repository-research Skill 未声明唯一媒体路径来源")
+    if "vision_analyze" not in skill_text or "--annotate" not in skill_text:
+        raise AssertionError("repository-research Skill 未声明视觉分析与受控标注流程")
+    for required_contract in (
+        "任务分流与版本门槛",
+        "暂停调研和委派",
+        "同批次中与当前产品问题无关的闲聊",
+        "客服归档合同",
+        "实际写入 HERMES_HOME/evidence",
+        "不得声称已归档",
+        "可能过期、错误或与当前实现不一致",
+        "来源按可信度分层",
+        "默认 delegate_task 给 child 独立求证",
+        "source_tier",
+    ):
+        if required_contract not in skill_text:
+            raise AssertionError(f"repository-research Skill 缺少客服合同: {required_contract}")
     queue_db = hermes_home / "onebot11" / "integration.sqlite3"
     config = PlatformConfig(
         enabled=True,
@@ -413,7 +444,7 @@ async def _smoke(
     print(
         "Hermes integration smoke passed: "
         f"tools={len(context.tools)} hooks={len(context.hooks)} "
-        "pi_ai_trigger=True reconnect=True slash_commands=True"
+        "plugin_skill=True pi_ai_trigger=True reconnect=True slash_commands=True"
     )
 
 

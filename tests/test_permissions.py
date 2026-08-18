@@ -242,6 +242,68 @@ def test_子代理继承shell但不继承OneBot和编排权限():
     ) is not None
 
 
+def test_子代理截图提示只允许manifest媒体事实来源():
+    """delegated child 不得把 stdout、evidence 或裸路径伪装成 MEDIA。"""
+    context = CallerContext(
+        user_id="1259901822",
+        chat_type="group",
+        chat_id="942513604",
+        role="user",
+        allowed_tools=frozenset(),
+        self_id="3101482118",
+    )
+    prompt = role_prompt(context, delegated_child=True)
+    assert "repository-research-adapter profile" in prompt
+    assert "严格执行其 command" in prompt
+    assert "manifest 是唯一事实来源" in prompt
+    assert "manifest.evidence.mediaFiles" in prompt
+    assert "每一行 MEDIA 必须逐字等于本次运行 manifest.evidence.mediaFiles 中的完整绝对路径" in prompt
+    assert "禁止凭 basename" in prompt
+    assert "禁止子代理用 terminal 的 cp/mv/install/rsync" in prompt
+    assert "runner stdout 都不能直接改写成 MEDIA:" in prompt
+    assert "mediaFiles 缺失或校验失败时不得输出 MEDIA:" in prompt
+    assert "vision_analyze" in prompt
+    assert "结构化 JSON" in prompt
+    assert "--annotate" in prompt
+    assert "不得输出 MEDIA:" in prompt
+
+def test_子代理提示不混入主agent只读门控():
+    """delegated child 只能看到项目执行合同，不能收到主 agent 的只读委派指令。"""
+    context = CallerContext(
+        user_id="1259901822",
+        chat_type="group",
+        chat_id="942513604",
+        role="user",
+        allowed_tools=frozenset(),
+        self_id="3101482118",
+    )
+    prompt = role_prompt(context, delegated_child=True)
+    assert "当前是 Hermes delegated child" in prompt
+    assert "当前是 Hermes 主 agent 的只读模式" not in prompt
+    assert "客服问题必须先查已有客服 evidence" not in prompt
+    assert "需要 terminal、process、" not in prompt
+    assert "如果任务涉及浏览器截图或高级仓库调研，必须先用 skill_view 读取 onebot11-platform:repository-research" in prompt
+
+
+def test_主agent提示保留版本和用户可见回执门控():
+    """主 agent 必须先做版本/分流判断，并隐藏内部归档和闲聊筛选。"""
+    context = CallerContext(
+        user_id="1259901822",
+        chat_type="group",
+        chat_id="942513604",
+        role="user",
+        allowed_tools=frozenset({"read_file", "search_files", "delegate_task"}),
+        self_id="3101482118",
+    )
+    prompt = role_prompt(context, main_agent_read_only=True)
+    assert "凡结论依赖 NeuroBook 版本" in prompt
+    assert "暂停调研和委派" in prompt
+    assert "同批次其他无关闲聊" in prompt
+    assert "最终用户可见回复只包含当前问题的结论" in prompt
+    assert "当前是 Hermes delegated child" not in prompt
+    assert "当前 child 直接调用 vision_analyze" not in prompt
+
+
 def test_search_files覆盖grep和glob说明():
     """权限提示明确告诉模型 search_files 是只读 Grep/Glob 替代。"""
     context = CallerContext(
@@ -346,7 +408,82 @@ def test_客服只读提示要求先复用经验并自动后台委派():
     assert "已有客服 evidence、项目 skill 和项目文档" in prompt
     assert "不要默认调用 skill_manage" in prompt
     assert "目录不可写时" in prompt
+    assert "不要声称自己拥有未出现在当前允许工具列表中的浏览器" in prompt
+    assert "不得声称截图已完成或服务已启动" in prompt
+    assert "缺少精确版本" in prompt
+    assert "暂停调研" in prompt
+    assert "归档是按需的内部证据动作" in prompt
+    assert "纯功能解释" in prompt
+    assert "同批次其他无关闲聊" in prompt
+    assert "不能声称已归档" in prompt
+    assert "文档、客服 evidence 和 Skill 可能过期、错误或与当前实现不一致" in prompt
+    assert "不能把文档或历史 evidence 当作真相" in prompt
+    assert "代码和当前运行证据优先" in prompt
+    assert "先发简短中文进度，再默认通过 delegate_task" in prompt
+    assert "无法由当前只读证据直接证实" in prompt
+    assert "已验证、从代码推断、依赖文档/未验证" in prompt
 
+
+def test_子代理提示要求独立核对来源并报告证据():
+    """独立求证 child 必须报告来源、版本、验证方式和冲突。"""
+    context = CallerContext(
+        user_id="1259901822",
+        chat_type="group",
+        chat_id="942513604",
+        role="user",
+        allowed_tools=frozenset({"read_file", "search_files"}),
+        self_id="3101482118",
+    )
+    prompt = role_prompt(context, delegated_child=True)
+    assert "独立求证" in prompt
+    assert "文档或历史 evidence 可能错误" in prompt
+    assert "来源、版本/commit、验证方式和实际结果" in prompt
+    assert "无法核实就明确写未验证" in prompt
+    assert "不把推断写成事实" in prompt
+    assert "客服问题必须先查已有客服 evidence" not in prompt
+
+
+def test_客服主提示不把文档当作真相():
+    """主 agent 必须处理文档与当前代码/运行证据冲突。"""
+    context = CallerContext(
+        user_id="1259901822",
+        chat_type="group",
+        chat_id="942513604",
+        role="user",
+        allowed_tools=frozenset({"read_file", "search_files", "delegate_task"}),
+        self_id="3101482118",
+    )
+    prompt = role_prompt(context, main_agent_read_only=True)
+    assert "文档与代码或运行证据冲突时" in prompt
+    assert "以当前代码或运行证据为准" in prompt
+    assert "没有证据就明确写未知或未验证" in prompt
+
+def test_客服媒体提示禁止裸路径改写为MEDIA():
+    """提示词必须要求 manifest 媒体根复制和复核，拒绝裸截图路径。"""
+    context = CallerContext(
+        user_id="1259901822",
+        chat_type="group",
+        chat_id="942513604",
+        role="user",
+        allowed_tools=frozenset({"read_file", "search_files", "delegate_task"}),
+        self_id="3101482118",
+    )
+    prompt = role_prompt(context, main_agent_read_only=True)
+    assert "读取项目 adapter 的 manifest" in prompt
+    assert "manifest 是媒体回传事实的唯一来源" in prompt
+    assert "只有 manifest.evidence.mediaFiles 中明确给出的安全绝对路径" in prompt
+    assert "重新检查 PNG 魔数、大小和 realpath" in prompt
+    assert "runner stdout、manifest.evidence.files、仓库路径、evidence 路径、截图文件名或任意裸路径都不是媒体授权来源" in prompt
+    assert "每一行 MEDIA 必须逐字等于本次运行 manifest.evidence.mediaFiles 的完整绝对路径" in prompt
+    assert "禁止凭 basename" in prompt
+    assert "禁止子代理用 terminal 的 cp/mv/install/rsync" in prompt
+    assert "不能改写成 MEDIA:" in prompt
+    assert "mediaFiles 缺失或为空" in prompt
+    assert "先调用 skill_view 查看 onebot11-platform:repository-research" in prompt
+    assert "严格执行 profile 的 command" in prompt
+    assert "禁止临时拼接 bun run dev、product:start、裸 Playwright 或后台 shell" in prompt
+    assert "视觉子代理调用 vision_analyze" in prompt
+    assert "--annotate" in prompt
 
 def test_terminal写敏感配置被拦截():
     """terminal 写 config.yaml/roles.yaml/.env 等必须被 OneBot 侧拒绝。"""

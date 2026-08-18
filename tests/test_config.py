@@ -258,6 +258,18 @@ def test主agent只读开关严格解析():
         parse_runtime_config(_extra(main_agent_read_only="sometimes"))
 
 
+
+def test群聊中间正文默认隐藏且私聊默认展示():
+    """未配置显示策略时，群聊隐藏中间正文而私聊保留展示。"""
+    runtime = parse_runtime_config(_extra())
+    assert runtime.show_interim_group is False
+    assert runtime.show_interim_dm is True
+
+
+def test群聊中间正文显式开启():
+    """生产需要时仍可显式开启群聊中间正文。"""
+    runtime = parse_runtime_config(_extra(show_interim_group=True))
+    assert runtime.show_interim_group is True
 def test显式空超级管理员工具与错误角色类型区分():
     """空工具集合是合法配置；列表角色和未知工具必须 fail-closed。"""
     runtime = parse_runtime_config(
